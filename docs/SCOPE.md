@@ -15,7 +15,7 @@ approximated and what a person has to look at.
 | `nxos` | Cisco NX-OS | `show running-config` | CLI configuration | 2 |
 | `aoscx` | HPE Aruba AOS-CX (10.x) | `show running-config` | CLI configuration | 1 (done) |
 | `aoss` | HPE Aruba AOS-S (ProCurve / ProVision, 16.x) | `show running-config` | CLI configuration | 1 (done) |
-| `comware` | HPE Comware (FlexFabric, 5130/5510...) | `display current-configuration` | CLI configuration | 3 |
+| `comware` | HPE Comware 7 (FlexFabric, 5130/5140/5510...) | `display current-configuration` | system-view commands | 1 (done) |
 
 Every reader writes to the model and every writer reads from it, so each new
 platform converts to and from all the others.
@@ -49,6 +49,18 @@ platform converts to and from all the others.
 * The out-of-band port is the `oobm` block; a layer 2 switch with a single default route gets `ip default-gateway`.
 * Time zones are a fixed offset in minutes (`time timezone 60`), read as `UTC+01:00`; IOS takes the same offset,
   a tz database zone (EOS, AOS-CX) does not convert to it and is reported.
+
+### Comware specifics
+
+* Blocks are separated by `#` and global lines are indented by one space; `undo` is Comware's `no`.
+* A trunk permits only VLAN 1 until told otherwise (`port trunk permit vlan 10 20 30 to 40`), and its native VLAN
+  is the PVID. The writer removes VLAN 1 with `undo port trunk permit vlan 1` when the source does not allow it.
+* A hybrid port untagged in a data VLAN and tagged in its voice VLAN (`voice-vlan 20 enable`) is an access port
+  with a voice VLAN, and the writer writes such ports that way.
+* `Bridge-Aggregation` is a layer 2 port-channel and `Route-Aggregation` a layer 3 one;
+  `link-aggregation mode dynamic` means LACP.
+* BPDU protection is global (`stp bpdu-protection`) and guards every edge port.
+* VRFs are VPN instances, the management VRF included: `M-GigabitEthernet0/0/0` is bound to one like any port.
 
 ## Port names
 

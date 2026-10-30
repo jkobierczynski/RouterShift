@@ -202,7 +202,8 @@ class _Reader:
             elif word == "distance" and args:
                 route.distance = int(args.pop(0))
             elif word == "name" and args:
-                route.name = unquote(args.pop(0))
+                route.name = unquote(" ".join(args))  # quoted, possibly with spaces; always last
+                args = []
             elif word == "vlan" and args:
                 route.interface = f"Vlan{args.pop(0)}"
             elif _is_address(word) and not route.next_hop:

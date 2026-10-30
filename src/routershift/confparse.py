@@ -64,8 +64,10 @@ def _banner(lines: List[str], i: int) -> Tuple[Banner, int]:
     return Banner(kind, i + 1, "\n".join(body)), j + 1
 
 
-def read(text: str) -> Tuple[List[Node], List[Banner]]:
-    """The top-level nodes of a configuration and its banners. Comments (``!``) and blank lines are left out."""
+def read(text: str, comment: str = "!", banner_word: str = "banner") -> Tuple[List[Node], List[Banner]]:
+    """The top-level nodes of a configuration and its banners. Comments and blank lines are left out; a comment at
+    the start of a line also ends the block before it (Comware separates blocks with ``#`` and indents global
+    lines by one space)."""
     lines = text.replace("\r\n", "\n").replace("\t", " ").split("\n")
     roots: List[Node] = []
     banners: List[Banner] = []
@@ -74,13 +76,15 @@ def read(text: str) -> Tuple[List[Node], List[Banner]]:
     while i < len(lines):
         raw = lines[i].rstrip()
         stripped = raw.strip()
-        if stripped.startswith("banner ") and _indent(raw) == 0:
+        if stripped.startswith(banner_word + " ") and _indent(raw) <= 1 and not (stack and stack[-1][0] < _indent(raw)):
             banner, i = _banner(lines, i)
             banners.append(banner)
             stack.clear()
             continue
         i += 1
-        if not stripped or stripped.startswith("!"):
+        if not stripped or stripped.startswith(comment):
+            if stripped and _indent(raw) == 0:
+                stack.clear()
             continue
         node = Node(i, stripped)
         depth = _indent(raw)
