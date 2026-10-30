@@ -10,7 +10,8 @@ import ipaddress
 from typing import Callable, List, Tuple
 
 from .. import acl as acl_text
-from ..model import AclAction, AclEntry, Device, Interface, InterfaceKind, LacpMode, StaticRoute, StpMode, SwitchportMode
+from .. import fhrp
+from ..model import AclAction, AclEntry, Device, FhrpGroup, Interface, InterfaceKind, LacpMode, StaticRoute, StpMode, SwitchportMode
 from ..names import PortMapper
 from ..parsers.comware import ranges
 from ..parsers.ioslike import _vlan_ids
@@ -35,7 +36,14 @@ class Writer:
             i.mode != SwitchportMode.ROUTED for i in device.interfaces.values())
 
     def emit(self) -> str:
+        self.groups = {i.name: fhrp.plan(i, "comware", self.report, self.port(i.name))
+                       for i in self.device.interfaces.values() if i.fhrp}
+        groups = [g for gs in self.groups.values() for g in gs]
+        self.vrrp_v2 = any(g.version != 3 for g in groups)
         self.system()
+        if self.vrrp_v2:
+            self.out.append(f"{_IND}vrrp version 2")  # Comware 7 runs VRRPv3 unless told otherwise
+            self.block_end()
         self.vrfs()
         self.vlans()
         self.spanning_tree()
@@ -238,6 +246,8 @@ class Writer:
                 lines.append(f"packet-filter {v6}name {acl_text.safe_name(acl_name)} {direction}")
             elif acl_name:
                 add(Severity.REVIEW, "acl-missing", f"ACL {acl_name} is applied but not defined; left out")
+        for g in self.groups.get(iface.name, []):
+            lines += self._vrrp(g, fhrp.adder(self.report, name, g))
         if iface.helper_addresses:
             lines.append("dhcp select relay")
             lines += [f"dhcp relay server-address {helper}" for helper in iface.helper_addresses]
@@ -250,6 +260,23 @@ class Writer:
         if (iface.source_name or iface.name, name) in self.port.renumbered:
             add(Severity.APPROX, "port-renamed",
                 f"named {name} without a port map; check it against the cabling of the new device")
+
+    def _vrrp(self, g: FhrpGroup, add: fhrp.Add) -> List[str]:
+        pre = f"vrrp vrid {g.group}"
+        lines = [f"{pre} virtual-ip {a}" for a in [g.address] + g.secondary]
+        if g.priority is not None:
+            lines.append(f"{pre} priority {g.priority}")
+        if not g.preempts():
+            lines.append(f"undo {pre} preempt-mode")
+        if g.hello_ms is not None:
+            lines.append(f"{pre} timer advertise {fhrp.interval(g.hello_ms, 10, add, 1, 4095)}")
+        if g.version == 3 and self.vrrp_v2:
+            add(Severity.APPROX, "fhrp-version", "VRRPv3 written as VRRPv2: Comware runs one version for all groups")
+        if g.name:
+            add(Severity.APPROX, "fhrp-name", f"description '{g.name}' left out: Comware has none for a group")
+        if g.shutdown:
+            lines.append(f"{pre} shutdown")
+        return lines
 
     def _layer2(self, iface: Interface, add: Callable[[Severity, str, str], None]) -> List[str]:
         if iface.mode == SwitchportMode.ROUTED:

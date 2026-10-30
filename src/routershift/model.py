@@ -128,7 +128,32 @@ class Interface:
     acl6_out: str = ""
     stp_portfast: Optional[bool] = None
     stp_bpduguard: Optional[bool] = None
+    fhrp: List["FhrpGroup"] = field(default_factory=list)
     origin: Origin = field(default_factory=Origin)
+
+
+@dataclass
+class FhrpGroup:
+    """A first-hop redundancy group on an interface (IPv4)."""
+
+    # "hsrp", "vrrp", or "anycast": a gateway address every router of the pair answers on with a shared MAC, without
+    # an election (Arista VARP, AOS-CX active gateway)
+    protocol: str
+    group: int = 0  # anycast: 0
+    address: str = ""  # virtual IP, no prefix length
+    secondary: List[str] = field(default_factory=list)
+    priority: Optional[int] = None  # None: the default, 100
+    preempt: Optional[bool] = None  # None: the protocol's default (HSRP off, VRRP on)
+    hello_ms: Optional[int] = None  # HSRP hello / VRRP advertisement interval
+    hold_ms: Optional[int] = None  # HSRP only
+    version: Optional[int] = None  # None: the platform default (HSRP 1, VRRP 2)
+    name: str = ""  # HSRP name, VRRP description
+    shutdown: bool = False
+    mac: str = ""  # anycast: the shared virtual MAC, "xx:xx:xx:xx:xx:xx"
+    origin: Origin = field(default_factory=Origin)
+
+    def preempts(self) -> bool:
+        return self.preempt if self.preempt is not None else self.protocol != "hsrp"
 
 
 @dataclass

@@ -35,4 +35,9 @@ def test_converts_and_reads_back(source: str, target: str) -> None:
     bound = lambda dev: sorted((d, safe_name(getattr(i, d))) for i in dev.interfaces.values()  # noqa: E731
                                for d in ("acl_in", "acl_out", "acl6_in", "acl6_out") if getattr(i, d))
     assert bound(first) == bound(back)
+    # every gateway redundancy address arrives
+    virtual = lambda dev: sorted(a for i in dev.interfaces.values() for g in i.fhrp  # noqa: E731
+                                 for a in [g.address] + g.secondary)
+    assert virtual(first) == virtual(back)
+    assert all(g.address for i in back.interfaces.values() for g in i.fhrp)
     assert report.counts()

@@ -31,6 +31,7 @@ platform converts to and from all the others.
 | Link aggregation and LACP | `Interface.lag`, `lacp_mode` | 1 |
 | IPv4/IPv6 addressing, DHCP relay, VRFs | `Interface`, `Device.vrfs` | 1 |
 | Static routes | `StaticRoute` | 1 |
+| Gateway redundancy: HSRP, VRRP, anycast gateways (IPv4) | `FhrpGroup` | 2 (done) |
 | Spanning tree mode, edge ports, BPDU guard | `Device.stp_mode`, `Interface` | 2 |
 | OSPFv2 | `Ospf` | 2 |
 | BGP | `Bgp`, `BgpNeighbor` | 2 |
@@ -74,6 +75,23 @@ platform converts to and from all the others.
   for review, so the rule count and order stay visible.
 * Bindings: `ip access-group` / `ipv6 traffic-filter` (IOS, EOS), `apply access-list` (AOS-CX, `routed-in` on VLAN
   interfaces), `ip access-group` in the interface or VLAN (AOS-S), `packet-filter` (Comware).
+
+## Gateway redundancy
+
+* HSRP exists only on IOS. On every other target an HSRP group becomes a VRRP group with the same number (1-255;
+  group 0 or above 255 takes a free number), priority and virtual addresses. HSRP does not preempt by default and
+  VRRP does, so the writer states preemption explicitly. The report marks the change, because every router of a
+  group has to move at once.
+* Anycast gateways (Arista VARP `ip virtual-router address`, AOS-CX `active-gateway`) convert between EOS and AOS-CX
+  with their shared MAC. Elsewhere they become a VRRP group, flagged for review: one router forwards instead of both.
+* Intervals are kept in milliseconds and rounded to the target's unit (seconds on EOS and AOS-S, centiseconds on
+  Comware); a rounding is reported. The HSRP hold time has no VRRP equivalent.
+* VRRP version: Comware 7 runs VRRPv3 unless `vrrp version 2` is set, and IOS XE needs `fhrp version vrrp v3` and the
+  `vrrp N address-family ipv4` form for v3. The writers carry the version across; AOS-S runs VRRPv2 only.
+* AOS-S writes the group inside its VLAN, as `owner` when the virtual address is the VLAN's own, and switches on
+  `ip routing` and `router vrrp`.
+* Authentication, tracking, preempt delays and IPv6 groups are listed under "Not understood" for now (secrets
+  masked).
 
 ## Port names
 

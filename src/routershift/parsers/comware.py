@@ -25,7 +25,7 @@ from .. import acl as acl_text
 from .. import confparse
 from ..confparse import Node
 from ..errors import ParseError
-from ..model import (Acl, AclAction, AclEntry, Device, Interface, InterfaceKind, LacpMode, Origin, StaticRoute, StpMode, SwitchportMode,
+from ..model import (Acl, AclAction, AclEntry, Device, FhrpGroup, Interface, InterfaceKind, LacpMode, Origin, StaticRoute, StpMode, SwitchportMode,
                      Unparsed, Vlan)
 from .ioslike import _cidr, _is_address
 
@@ -113,6 +113,7 @@ class _Reader:
         self._link_type: Dict[str, str] = {}
         self._dynamic_lags: Set[str] = set()
         self._bpdu_protection = False
+        self._vrrp_version = 3  # the Comware 7 default
 
     def unparsed(self, node: Node, section: str = "") -> None:
         self.device.unparsed.append(Unparsed(node.line, node.text, section))
@@ -140,6 +141,7 @@ class _Reader:
             "stp": self.stp,
             "interface": self.interface,
             "acl": self.acl,
+            "vrrp": self.vrrp_version,
         }
         for node in roots:
             if node.text.startswith(_NOISE):
@@ -382,6 +384,44 @@ class _Reader:
 
     # interfaces ------------------------------------------------------------------------------------------------------
 
+    def vrrp_version(self, node: Node) -> bool:
+        if node.words[1:2] == ["version"] and node.words[2:] in (["2"], ["3"]):
+            self._vrrp_version = int(node.words[2])
+            return True
+        return False
+
+    def _vrrp(self, iface: Interface, w: List[str], preempt: bool = True) -> bool:
+        """vrrp vrid N virtual-ip|priority|preempt-mode|timer advertise|shutdown"""
+        if len(w) < 2 or not w[0].isdigit():
+            return False
+        number = int(w[0])
+        group = next((g for g in iface.fhrp if g.group == number), None)
+        if group is None:
+            group = FhrpGroup("vrrp", number)
+            iface.fhrp.append(group)
+        w = w[1:]
+        n = len(w)
+        if w[0] == "virtual-ip" and n == 2:
+            address = str(ipaddress.IPv4Address(w[1]))
+            if group.address:
+                group.secondary.append(address)
+            else:
+                group.address = address
+        elif w[0] == "preempt-mode":
+            group.preempt = preempt
+            return n == 1 or w[1:] == ["delay", "0"]
+        elif not preempt:
+            return False
+        elif w[0] == "priority" and n == 2:
+            group.priority = int(w[1])
+        elif w[:2] == ["timer", "advertise"] and n == 3:
+            group.hello_ms = int(w[2]) * 10  # centiseconds
+        elif w == ["shutdown"]:
+            group.shutdown = True
+        else:
+            return False
+        return True
+
     def interface(self, node: Node) -> bool:
         source = " ".join(node.words[1:])
         canon, kind, media = canonical(source)
@@ -472,6 +512,10 @@ class _Reader:
             if len(args) != 1:
                 return False
             setattr(iface, f"acl{'6' if v6 else ''}_{'in' if w[-1] == 'inbound' else 'out'}", args[0])
+        elif w[:2] == ["vrrp", "vrid"]:
+            return self._vrrp(iface, w[2:])
+        elif w[:3] == ["undo", "vrrp", "vrid"]:
+            return self._vrrp(iface, w[3:], preempt=False)
         elif w[:3] == ["vlan-type", "dot1q", "vid"] and n == 4:
             iface.encapsulation_vlan = int(w[3])
         elif w[0] == "speed" and n == 2:
@@ -491,6 +535,9 @@ class _Reader:
         return True
 
     def _finish(self) -> None:
+        for iface in self.device.interfaces.values():
+            for group in iface.fhrp:
+                group.version = self._vrrp_version
         for iface in self.device.interfaces.values():
             name = iface.name
             if iface.kind == InterfaceKind.LAG and iface.source_name.startswith("Route-Aggregation"):

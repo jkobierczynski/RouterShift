@@ -21,11 +21,12 @@ import ipaddress
 from typing import Callable, Dict, List, Optional, Tuple
 
 from .. import acl as acl_text
+from .. import fhrp
 from .. import confparse
 from ..confparse import Node
 from ..errors import ParseError
-from ..model import (Acl, Device, Interface, InterfaceKind, LacpMode, Origin, StaticRoute, StpMode, SwitchportMode,
-                     Unparsed, Vlan)
+from ..model import (Acl, Device, FhrpGroup, Interface, InterfaceKind, LacpMode, Origin, StaticRoute, StpMode,
+                     SwitchportMode, Unparsed, Vlan)
 from .ioslike import _is_address, _vlan_ids
 
 MGMT_VRF = "mgmt"
@@ -85,6 +86,7 @@ class _Reader:
             "spanning-tree": self.spanning_tree,
             "interface": self.interface,
             "access-list": self.acl,
+            "router": self.router,
         }
         for node in roots:
             if node.text.startswith(_NOISE):
@@ -232,6 +234,9 @@ class _Reader:
 
     # interfaces ------------------------------------------------------------------------------------------------------
 
+    def router(self, node: Node) -> bool:
+        return node.words == ["router", "vrrp", "enable"]  # implied by the groups
+
     def interface(self, node: Node) -> bool:
         source = " ".join(node.words[1:])
         canon, kind = canonical(source)
@@ -246,6 +251,9 @@ class _Reader:
                 self.device.vrfs.append(MGMT_VRF)
         self.device.interfaces[canon] = iface
         for child in node.children:
+            if child.words[0] == "vrrp" and child.words[2:] == ["address-family", "ipv4"]:
+                self._vrrp(iface, child)
+                continue
             try:
                 understood = self.interface_line(iface, child.words)
             except (ValueError, IndexError):
@@ -253,6 +261,55 @@ class _Reader:
             if not understood:
                 self.unparsed(child, node.text)
         return True
+
+    def _vrrp(self, iface: Interface, node: Node) -> None:
+        """vrrp N address-family ipv4, with its settings inside; a group is shut down until 'no shutdown'."""
+        group = FhrpGroup("vrrp", int(node.words[1]), shutdown=True, origin=Origin(node.line, node.text))
+        iface.fhrp.append(group)
+        for child in node.children:
+            w = child.words
+            n = len(w)
+            if w[0] == "address" and n == 3 and w[2] in ("primary", "secondary"):
+                address = str(ipaddress.IPv4Address(w[1]))
+                if w[2] == "primary":
+                    group.address = address
+                else:
+                    group.secondary.append(address)
+            elif w[0] == "priority" and n == 2:
+                group.priority = int(w[1])
+            elif w == ["no", "preempt"]:
+                group.preempt = False
+            elif w == ["preempt"]:
+                group.preempt = True
+            elif w[0] == "version" and n == 2 and w[1] in ("2", "3"):
+                group.version = int(w[1])
+            elif w[:2] == ["timers", "advertise"] and n == 3:
+                group.hello_ms = int(w[2])
+            elif w == ["shutdown"]:
+                group.shutdown = True
+            elif w == ["no", "shutdown"]:
+                group.shutdown = False
+            else:
+                self.unparsed(child, node.text)
+
+    def _active_gateway(self, iface: Interface, w: List[str]) -> bool:
+        """active-gateway ip mac M / active-gateway ip A [mac M]"""
+        group = next((g for g in iface.fhrp if g.protocol == "anycast"), None)
+        if group is None:
+            group = FhrpGroup("anycast")
+            iface.fhrp.append(group)
+        if w[0] == "mac" and len(w) == 2:
+            group.mac = fhrp.mac(w[1])
+            return True
+        address = str(ipaddress.IPv4Address(w[0]))
+        if group.address:
+            group.secondary.append(address)
+        else:
+            group.address = address
+        if w[1:2] == ["mac"] and len(w) == 3:
+            group.mac = fhrp.mac(w[2])
+            return True
+        return len(w) == 1
 
     def interface_line(self, iface: Interface, w: List[str]) -> bool:
         n = len(w)
@@ -318,6 +375,8 @@ class _Reader:
                                                          next_hop=w[1], vrf=iface.vrf or MGMT_VRF))
         elif w[:2] == ["encapsulation", "dot1q"] and n == 3:
             iface.encapsulation_vlan = int(w[2])
+        elif w[:2] == ["active-gateway", "ip"] and n >= 3:
+            return self._active_gateway(iface, w[2:])
         elif w[:2] == ["spanning-tree", "port-type"] and n == 3 and w[2] in ("admin-edge", "admin-network"):
             iface.stp_portfast = w[2] == "admin-edge"
         elif w == ["spanning-tree", "bpdu-guard"]:
