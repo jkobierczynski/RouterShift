@@ -3,10 +3,11 @@ from helpers import DATA
 
 from routershift import bgp as bgp_text
 from routershift import nat as nat_text
+from routershift import vpn as vpn_text
 from routershift import ospf as ospf_text
 from routershift.acl import safe_name
 from routershift.convert import PLATFORMS, convert, parse
-from routershift.model import AclAction, Device
+from routershift.model import AclAction, Device, InterfaceKind
 
 SAMPLES = {"ios": "ios_access.cfg", "eos": "eos_leaf.cfg", "aoscx": "aoscx_access.cfg", "aoss": "aoss_edge.cfg",
            "comware": "comware_access.cfg"}
@@ -27,7 +28,10 @@ def test_converts_and_reads_back(source: str, target: str) -> None:
     assert [u.text for u in back.unparsed if not u.section.startswith("a trunk without")] == []
     # VLANs and layer 3 addresses survive every conversion
     assert set(first.vlans) <= set(back.vlans)
-    addresses = lambda dev: sorted(a for i in dev.interfaces.values() for a in i.ipv4)  # noqa: E731
+    # (the AOS switches have no tunnel interfaces)
+    tunnels = target in vpn_text.SUPPORTED
+    addresses = lambda dev: sorted(a for i in dev.interfaces.values() for a in i.ipv4  # noqa: E731
+                                   if tunnels or i.kind != InterfaceKind.TUNNEL)
     assert addresses(first) == addresses(back)
     # every ACL arrives, with at least its convertible entries (more where a platform needs one port per entry),
     # and stays applied in the same direction
@@ -68,6 +72,31 @@ def test_converts_and_reads_back(source: str, target: str) -> None:
     else:
         assert not back.nat_rules
         assert not first.nat_rules or "do not do NAT" in report.to_text()
+    # IPsec connections keep their peers, protected traffic, algorithms, PFS, lifetimes and readable keys; EOS has
+    # route-based VPNs only, Comware is written with IKEv1 only, and the AOS switches have no IPsec
+    def vpn(dev: Device) -> list:
+        def key(address: str) -> str:
+            psk = dev.psks.get(address)
+            return psk.key if psk is not None and psk.key != vpn_text.PLACEHOLDER_KEY else ""
+        transform = lambda name: ((t.encryption, t.integrity, t.mode)  # noqa: E731
+                                  if (t := dev.ipsec_transforms.get(name)) else ())
+        ike = lambda p: sorted((q.encryption, q.integrity, q.dh_groups, q.lifetime)  # noqa: E731
+                               for q in vpn_text.policies_for(dev, p))
+        return sorted((p.profile, vpn_text.peers_of(dev, p), [key(a) for a in vpn_text.peers_of(dev, p)],
+                       safe_name(p.acl) if p.acl else "", [transform(t) for t in p.transforms], p.pfs_group,
+                       p.lifetime, p.ike_version, ike(p)) for p in dev.ipsec_peers
+                      if not (target == "eos" and not p.profile) and not (target == "comware" and p.ike_version != 1))
+    if tunnels:
+        assert vpn(first) == vpn(back)
+        ikev2 = {p.name for p in first.ipsec_peers if p.ike_version == 2} if target == "comware" else set()
+        tunnel = lambda dev: sorted(  # noqa: E731
+            (bool(i.tunnel_source), i.tunnel_destination, i.tunnel_mode,
+             i.tunnel_profile if i.tunnel_profile not in ikev2 else "")
+            for i in dev.interfaces.values() if i.kind == InterfaceKind.TUNNEL)
+        assert tunnel(first) == tunnel(back)
+    else:
+        assert not back.ipsec_peers
+        assert not first.ipsec_peers or "do not terminate IPsec" in report.to_text()
     # BGP keeps every neighbor with its settings (peer groups may be written out on their members), networks and
     # redistribution; AOS-S leaves it to a person
     if first.bgp is not None and target == "aoss":

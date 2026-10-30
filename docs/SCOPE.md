@@ -38,6 +38,7 @@ platform converts to and from all the others.
 | BGP: neighbors, peer groups, IPv4/IPv6 activation, networks, redistribution | `Bgp`, `BgpNeighbor` | 2 (done) |
 | Access lists (IPv4 and IPv6) and their interface bindings | `Acl`, `AclEntry`, `Interface.acl_in` ... | 2 (done) |
 | NAT: pools, dynamic source NAT and PAT, one-to-one and port forwarding rules, inside/outside interfaces | `NatPool`, `NatRule`, `Interface.nat` | 2 (done) |
+| Site-to-site IPsec VPN: IKE proposals, transform sets, crypto maps, IPsec profiles on tunnel interfaces, pre-shared keys | `IkePolicy`, `IpsecTransform`, `IpsecPeer`, `PreSharedKey`, `Interface.tunnel_*` | 2 (done) |
 | SNMP, local users | `Snmp`, `LocalUser` | 2 |
 | Route maps, prefix lists, AAA/TACACS/RADIUS, QoS, MLAG/VSX/vPC, VXLAN/EVPN | to come | 3+ |
 
@@ -148,6 +149,27 @@ platform converts to and from all the others.
   and left out. AOS-CX and AOS-S switches have no NAT: every rule is reported, to move to a router or firewall.
 * Destination NAT other than port forwarding, NAT for IPv6 (NAT64, NPTv6), route maps in NAT rules and NAT
   timeouts are listed under "Not understood" for now.
+
+## Site-to-site VPN (IPsec)
+
+* A connection is a crypto map entry (policy-based: a peer and an ACL for the traffic) or an IPsec profile used by
+  tunnel interfaces (route-based). Each keeps its peer, ACL, transform sets, PFS group, SA lifetime and IKE version;
+  IKE proposals keep their algorithms, Diffie-Hellman groups and lifetime.
+* IOS: `crypto isakmp policy`/`key`, `crypto ikev2 proposal`/`policy`/`keyring`/`profile`, `crypto ipsec
+  transform-set`/`profile`, `crypto map`, and `tunnel protection ipsec profile`. IKEv2 is written with one keyring
+  and one IKEv2 profile per connection.
+* EOS (`ip security`: IKE policies, SA policies, profiles) does route-based VPNs only, so crypto maps are reported.
+  EOS counts lifetimes in hours; other values are rounded and reported.
+* Comware 7: `ike proposal`/`keychain`/`profile`, `ipsec transform-set`/`policy`/`profile`, `ipsec apply policy`,
+  and `interface Tunnel N mode ipsec|gre`. PFS lives on the transform set there. Only IKEv1 is written for Comware so
+  far; IKEv2 connections are reported.
+* Algorithms a platform lacks are replaced by the next stronger one, with a note that the peer must change too.
+* Pre-shared keys in clear text are carried over. Encrypted keys (IOS type 6/7, Comware cipher, EOS type 7) cannot be
+  read on another device, so `CHANGE-ME` is written in their place and the report asks for the key. The report
+  never shows a key.
+* AOS-CX and AOS-S do not terminate IPsec: every connection and tunnel interface is reported.
+* Certificate authentication, DPD, NAT traversal settings, IPv6 IPsec, GRE tunnel options (keys, MTU) and IKEv2 on
+  Comware are listed under "Not understood" or reported for now.
 
 ## Port names
 

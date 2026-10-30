@@ -13,6 +13,7 @@ from .. import acl as acl_text
 from .. import bgp as bgp_text
 from .. import dhcp as dhcp_text
 from .. import nat as nat_text
+from .. import vpn as vpn_text
 from .. import fhrp
 from .. import ospf as ospf_text
 from ..model import Device, Interface, Ospf, InterfaceKind, LacpMode, StaticRoute, StpMode, SwitchportMode
@@ -61,6 +62,7 @@ class Writer:
         self.routes()
         self.dhcp()
         nat_text.skip_all(self.device, self.report, "AOS-CX")
+        vpn_text.skip_all(self.device, self.report, "AOS-CX")
         if self.device.bgp is not None:
             self.bgp()
         self.report.unparsed(self.device.unparsed)
@@ -178,6 +180,10 @@ class Writer:
         def add(severity: Severity, code: str, message: str) -> None:
             self.report.add("interface", label, severity, code, message)
 
+        if iface.kind == InterfaceKind.TUNNEL:
+            self.report.skip("interface", label, "tunnel",
+                             "tunnel interfaces are not converted for AOS-CX yet; configure it by hand")
+            return
         lines: List[str] = ["shutdown" if iface.shutdown else "no shutdown"]
         if iface.description:
             lines.append(f"description {iface.description}")

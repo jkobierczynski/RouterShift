@@ -21,9 +21,10 @@ from .. import fhrp
 from .. import ospf as ospf_text
 from .. import confparse, names
 from .. import dhcp as dhcp_text
+from .. import vpn as vpn_text
 from ..confparse import Node
 from ..errors import ParseError
-from ..model import (Acl, Device, DhcpPool, FhrpGroup, NatPool, NatRule, Interface, InterfaceKind, LacpMode, Origin, Ospf, OspfNetwork,
+from ..model import (Acl, Device, DhcpPool, FhrpGroup, IkePolicy, IpsecPeer, IpsecTransform, PreSharedKey, NatPool, NatRule, Interface, InterfaceKind, LacpMode, Origin, Ospf, OspfNetwork,
                      StaticRoute, StpMode, SwitchportMode, Unparsed, Vlan)
 
 # Lines that only describe the file or the software, not the device's behaviour.
@@ -69,6 +70,9 @@ class _Reader:
         self._vrrp_v3 = False  # IOS XE: fhrp version vrrp v3
         self._ospf_areas: List[Tuple[str, str, str]] = []  # interface, process ("" = the interface's VRF), area
         self._dhcp_excluded: Dict[str, List[Tuple[str, str]]] = {}  # VRF -> excluded ranges
+        self._ikev2_lifetime: Optional[int] = None
+        self._eos_sa: Dict[str, IpsecPeer] = {}  # EOS SA policy -> its PFS group and lifetime
+        self._eos_keys: Dict[str, str] = {}  # EOS profile -> shared key
 
     def unparsed(self, node: Node, section: str = "") -> None:
         self.device.unparsed.append(Unparsed(node.line, node.text, section))
@@ -107,6 +111,7 @@ class _Reader:
             "router": self.router,
             "dhcp": self.eos_dhcp,
             "service": lambda node: node.words == ["service", "dhcp"],
+            "crypto": self.crypto,
         }
         for node in roots:
             if node.text.startswith(_NOISE) or node.text == "end":
@@ -183,6 +188,8 @@ class _Reader:
             return self.route(node, w[2:], 4)
         if w[1:2] == ["access-list"] and len(w) >= 3:
             return self.acl(node, 4)
+        if w[1:] == ["security"]:
+            return self.eos_security(node)
         if w[1:3] == ["nat", "pool"] and len(w) == 8 and w[6] in ("netmask", "prefix-length"):
             length = w[7] if w[6] == "prefix-length" else str(ipaddress.ip_network(f"0.0.0.0/{w[7]}").prefixlen)
             first, last = str(ipaddress.IPv4Address(w[4])), str(ipaddress.IPv4Address(w[5]))
@@ -270,6 +277,282 @@ class _Reader:
         iface.nat = "outside"
         self.device.nat_rules.append(rule)
         return True
+
+    # IPsec ------------------------------------------------------------------------------------------------------------
+
+    def tunnel_line(self, iface: Interface, w: List[str]) -> bool:
+        """tunnel source|destination|mode; IOS 'tunnel protection ipsec profile P', EOS 'tunnel ipsec profile P'."""
+        if w[0] == "source" and len(w) >= 2:
+            rest = w[2:] if w[1] == "interface" else w[1:]  # EOS: tunnel source interface Ethernet1
+            iface.tunnel_source = w[1] if _is_address(w[1]) else names.canonical(" ".join(rest))[0]
+        elif w[0] == "destination" and len(w) == 2:
+            iface.tunnel_destination = str(ipaddress.IPv4Address(w[1]))
+        elif w[0] == "mode" and w[1:] in (["gre"], ["gre", "ip"], ["ipsec"], ["ipsec", "ipv4"]):
+            iface.tunnel_mode = w[1]
+        elif w[:3] == ["protection", "ipsec", "profile"] and len(w) == 4:
+            iface.tunnel_profile = w[3]
+        elif w[:2] == ["ipsec", "profile"] and len(w) == 3:
+            iface.tunnel_profile = w[2]
+        else:
+            return False
+        return True
+
+    def crypto(self, node: Node) -> bool:
+        w = node.words
+        origin = Origin(node.line, node.text)
+        if w[1:3] == ["isakmp", "policy"] and len(w) == 4:
+            policy = IkePolicy(w[3], 1, ["des"], ["sha1"], [1], origin=origin, authentication="rsa-sig")
+            self.device.ike_policies[w[3]] = policy
+            self._children(node, lambda c: self._isakmp_line(policy, c))
+            return True
+        if w[1:3] == ["isakmp", "key"] and len(w) in (6, 7, 8):
+            args = w[3:]
+            encrypted = args[0] in ("6", "7") and len(args) >= 4
+            if args[0] in ("0", "6", "7") and len(args) >= 4:
+                args = args[1:]
+            if args[1] != "address":
+                return False
+            address = str(ipaddress.IPv4Address(args[2]))
+            self.device.psks[address] = PreSharedKey(address, "" if encrypted else args[0], origin)
+            return True
+        if w[1:3] == ["ikev2", "proposal"] and len(w) == 4:
+            policy = IkePolicy(w[3], 2, origin=origin)
+            self.device.ike_policies[w[3]] = policy
+            self._children(node, lambda c: self._ikev2_proposal_line(policy, c))
+            return True
+        if w[1:3] == ["ikev2", "policy"] and len(w) == 4:
+            return all(c.words[0] in ("proposal", "match") for c in node.children)  # every proposal is offered
+        if w[1:3] == ["ikev2", "keyring"] and len(w) == 4:
+            for entry in node.children:
+                self._keyring_peer(entry)
+            return True
+        if w[1:3] == ["ikev2", "profile"] and len(w) == 4:
+            self._children(node, self._ikev2_profile_line)
+            return True
+        if w[1:3] == ["ipsec", "transform-set"] and len(w) >= 5:
+            transform = IpsecTransform(w[3], origin=origin)
+            self._esp(transform, w[4:])
+            self.device.ipsec_transforms[w[3]] = transform
+            self._children(node, lambda c: self._transform_mode(transform, c.words))
+            return True
+        if w[1:3] == ["ipsec", "profile"] and len(w) == 4:
+            peer = IpsecPeer(w[3], origin=origin)
+            self.device.ipsec_peers.append(peer)
+            self._children(node, lambda c: self._crypto_set(peer, c.words))
+            return True
+        if w[1] == "map" and len(w) == 5 and w[4] == "ipsec-isakmp":
+            peer = IpsecPeer(w[2], int(w[3]), origin=origin)
+            self.device.ipsec_peers.append(peer)
+            self._children(node, lambda c: self._crypto_set(peer, c.words))
+            return True
+        return False
+
+    def _children(self, node: Node, line: Callable[[Node], bool]) -> None:
+        for child in node.children:
+            try:
+                understood = line(child)
+            except (ValueError, IndexError):
+                understood = False
+            if not understood:
+                self.unparsed(child, node.text)
+
+    @staticmethod
+    def _transform_mode(transform: IpsecTransform, w: List[str]) -> bool:
+        if w[0] == "mode" and w[1:] in (["tunnel"], ["transport"]):
+            transform.mode = w[1]
+            return True
+        return False
+
+    def _ikev2_profile_line(self, node: Node) -> bool:
+        """The peer, its keys and pre-shared authentication; the peer and keys come from the map and the keyring."""
+        w = node.words
+        if w[:4] == ["match", "identity", "remote", "address"] and len(w) in (5, 6):
+            return True
+        if w[0] == "authentication" and w[1:] in (["local", "pre-share"], ["remote", "pre-share"]):
+            return True
+        if w[:2] == ["keyring", "local"] and len(w) == 3:
+            return True
+        if w[0] == "lifetime" and len(w) == 2:
+            self._ikev2_lifetime = int(w[1])
+            return True
+        return False
+
+    @staticmethod
+    def _isakmp_line(policy: IkePolicy, node: Node) -> bool:
+        w = node.words
+        if w[0] == "encryption" and len(w) in (2, 3):
+            policy.encryption = [vpn_text.read(vpn_text.IOS_ISAKMP_ENC, " ".join(w[1:]))]
+        elif w[0] == "hash" and len(w) == 2:
+            policy.integrity = [vpn_text.read(vpn_text.IOS_HASH, w[1])]
+        elif w[0] == "group" and len(w) == 2:
+            policy.dh_groups = [int(w[1])]
+        elif w[0] == "lifetime" and len(w) == 2:
+            policy.lifetime = int(w[1])
+        elif w[0] == "authentication" and len(w) == 2:
+            policy.authentication = w[1]
+        else:
+            return False
+        return True
+
+    @staticmethod
+    def _ikev2_proposal_line(policy: IkePolicy, node: Node) -> bool:
+        w = node.words
+        if w[0] == "encryption":
+            policy.encryption = [vpn_text.read(vpn_text.IOS_IKEV2_ENC, word) for word in w[1:]]
+        elif w[0] == "integrity":
+            policy.integrity = [vpn_text.read(vpn_text.IOS_IKEV2_INT, word) for word in w[1:]]
+        elif w[0] == "group":
+            policy.dh_groups = [int(word) for word in w[1:]]
+        elif w[0] == "prf":
+            pass  # follows the integrity algorithm
+        else:
+            return False
+        return True
+
+    def _keyring_peer(self, node: Node) -> None:
+        """peer NAME / address A [M] / pre-shared-key [local|remote] [0|6] KEY"""
+        address, key, encrypted = "", "", False
+        for child in node.children:
+            c = child.words
+            if c[0] == "address" and len(c) in (2, 3):
+                address = str(ipaddress.IPv4Address(c[1]))
+            elif c[0] == "pre-shared-key" and len(c) >= 2:
+                args = [a for a in c[1:] if a not in ("local", "remote")]
+                encrypted = args[0] == "6" and len(args) == 2
+                key = args[-1]
+            elif c[0] != "description":
+                self.unparsed(child, node.text)
+        if node.words[0] != "peer" or not address:
+            self.unparsed(node)
+            return
+        self.device.psks[address] = PreSharedKey(address, "" if encrypted else key, Origin(node.line, node.text))
+
+    def _esp(self, transform: IpsecTransform, words: List[str]) -> None:
+        """esp-aes 256 esp-sha256-hmac, esp-gcm 256, ..."""
+        n = 0
+        while n < len(words):
+            word = words[n]
+            if n + 1 < len(words) and words[n + 1].isdigit():
+                word, n = f"{word} {words[n + 1]}", n + 1
+            if word in vpn_text.IOS_ESP_ENC.values():
+                transform.encryption = vpn_text.read(vpn_text.IOS_ESP_ENC, word)
+            elif word in ("esp-aes 128", "esp-gcm 128"):
+                transform.encryption = vpn_text.read(vpn_text.IOS_ESP_ENC, word[:-4])
+            else:
+                transform.integrity = vpn_text.read(vpn_text.IOS_ESP_INT, word)
+            n += 1
+
+    def _crypto_set(self, peer: IpsecPeer, w: List[str]) -> bool:
+        if w[:2] == ["set", "peer"] and len(w) == 3 and not peer.peer:
+            peer.peer = str(ipaddress.IPv4Address(w[2]))
+        elif w[:2] == ["set", "transform-set"] and len(w) >= 3:
+            peer.transforms = w[2:]
+        elif w[:2] == ["set", "pfs"] and len(w) == 3 and w[2].startswith("group"):
+            peer.pfs_group = int(w[2][len("group"):])
+        elif w[:2] == ["set", "pfs"] and len(w) == 2:
+            peer.pfs_group = 2  # the IOS default group
+        elif w[:4] == ["set", "security-association", "lifetime", "seconds"] and len(w) == 5:
+            peer.lifetime = int(w[4])
+        elif w[:2] == ["set", "ikev2-profile"] and len(w) == 3:
+            peer.ike_version = 2
+        elif w[:2] == ["set", "isakmp-profile"] and len(w) == 3:
+            return False
+        elif w[:2] == ["match", "address"] and len(w) == 3 and not peer.profile:
+            peer.acl = w[2]
+        else:
+            return False
+        return True
+
+    def eos_security(self, node: Node) -> bool:
+        """ip security / ike policy, sa policy, profile."""
+        for child in node.children:
+            w = child.words
+            origin = Origin(child.line, child.text)
+            try:
+                if w[:2] == ["ike", "policy"] and len(w) == 3:
+                    policy = IkePolicy(w[2], 2, ["aes-128"], ["sha1"], [14], origin=origin)
+                    self.device.ike_policies[w[2]] = policy
+                    self._children(child, lambda c: self._eos_ike_line(policy, c.words))
+                elif w[:2] == ["sa", "policy"] and len(w) == 3:
+                    transform = IpsecTransform(w[2], "aes-128", "sha1", origin=origin)
+                    self.device.ipsec_transforms[w[2]] = transform
+                    sa = IpsecPeer(w[2])  # holds PFS and lifetime until the profiles take them
+                    self._eos_sa[w[2]] = sa
+                    self._children(child, lambda c: self._eos_sa_line(transform, sa, c.words))
+                elif w[0] == "profile" and len(w) == 2:
+                    peer = IpsecPeer(w[1], origin=origin, ike_version=2)
+                    self.device.ipsec_peers.append(peer)
+                    self._children(child, lambda c: self._eos_profile_line(peer, c.words))
+                elif w[:2] == ["key", "controller"]:
+                    self.unparsed(child, node.text)
+                else:
+                    self.unparsed(child, node.text)
+            except (ValueError, IndexError):
+                self.unparsed(child, node.text)
+        return True
+
+    @staticmethod
+    def _eos_ike_line(policy: IkePolicy, w: List[str]) -> bool:
+        if w[0] == "encryption" and len(w) == 2:
+            policy.encryption = [vpn_text.read(vpn_text.EOS_ENC, w[1])]
+        elif w[0] == "integrity" and len(w) == 2:
+            policy.integrity = [vpn_text.read(vpn_text.EOS_INT, w[1])]
+        elif w[0] == "dh-group" and len(w) == 2:
+            policy.dh_groups = [int(w[1])]
+        elif w[0] == "ike-lifetime" and len(w) == 2:
+            policy.lifetime = int(w[1]) * 3600
+        elif w[0] == "version" and len(w) == 2 and w[1] in ("1", "2"):
+            policy.version = int(w[1])
+        else:
+            return False
+        return True
+
+    @staticmethod
+    def _eos_sa_line(transform: IpsecTransform, sa: IpsecPeer, w: List[str]) -> bool:
+        if w[:2] == ["esp", "encryption"] and len(w) == 3:
+            transform.encryption = vpn_text.read(vpn_text.EOS_ESP_ENC, w[2])
+            if "gcm" in w[2]:
+                transform.integrity = ""
+        elif w[:2] == ["esp", "integrity"] and len(w) == 3:
+            transform.integrity = vpn_text.read(vpn_text.EOS_INT, w[2])
+        elif w[:2] == ["pfs", "dh-group"] and len(w) == 3:
+            sa.pfs_group = int(w[2])
+        elif w[:2] == ["sa", "lifetime"] and len(w) == 4 and w[3] == "hours":
+            sa.lifetime = int(w[2]) * 3600
+        else:
+            return False
+        return True
+
+    def _eos_profile_line(self, peer: IpsecPeer, w: List[str]) -> bool:
+        if w[0] == "ike-policy" and len(w) == 2:
+            peer.ike_policies = [w[1]]
+        elif w[0] == "sa-policy" and len(w) == 2:
+            peer.transforms = [w[1]]
+        elif w[0] == "shared-key" and len(w) in (2, 3):
+            self._eos_keys[peer.name] = "" if w[1] == "7" and len(w) == 3 else w[-1]
+        elif w[:2] in (["connection", "start"], ["connection", "add"]):
+            pass
+        else:
+            return False
+        return True
+
+    def _finish_vpn(self) -> None:
+        for policy in self.device.ike_policies.values():
+            if policy.version == 2 and policy.lifetime is None:
+                policy.lifetime = self._ikev2_lifetime
+        for peer in self.device.ipsec_peers:
+            sa = self._eos_sa.get(peer.transforms[0]) if peer.transforms else None
+            if sa is not None:
+                peer.pfs_group, peer.lifetime = sa.pfs_group, sa.lifetime
+            pinned = [self.device.ike_policies[n] for n in peer.ike_policies if n in self.device.ike_policies]
+            if pinned:  # EOS: the profile runs the IKE version of its policy
+                peer.ike_version = pinned[0].version
+            if peer.name in self._eos_keys:
+                for address in vpn_text.peers_of(self.device, peer):
+                    self.device.psks[address] = PreSharedKey(address, self._eos_keys[peer.name], peer.origin)
+        for iface in self.device.interfaces.values():
+            if iface.kind == InterfaceKind.TUNNEL and iface.tunnel_destination and not iface.tunnel_mode:
+                iface.tunnel_mode = "gre"
 
     # DHCP server ------------------------------------------------------------------------------------------------------
 
@@ -849,6 +1132,10 @@ class _Reader:
             iface.nat = w[2]
         elif w[:3] == ["ip", "nat", "source"] and n >= 5:
             return self.eos_nat(iface, w[3:])
+        elif w[:2] == ["crypto", "map"] and n == 3:
+            iface.crypto_map = w[2]
+        elif w[0] == "tunnel" and n >= 3:
+            return self.tunnel_line(iface, w[1:])
         elif w[:3] == ["dhcp", "server", "ipv4"] and n == 3:
             pass  # EOS: the interface serves the subnet it is in
         elif w[:2] == ["ip", "ospf"] and n >= 4 and w[-2] == "area" and n in (4, 5):
@@ -909,6 +1196,7 @@ class _Reader:
         return len(args) in (1, 2)
 
     def _finish(self) -> None:
+        self._finish_vpn()
         for pool in self.device.dhcp_pools:
             if pool.network:
                 pool.ranges = dhcp_text.subtract(pool.network, pool.ranges, self._dhcp_excluded.get(pool.vrf, []))

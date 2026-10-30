@@ -15,9 +15,11 @@ from .model import Unparsed
 
 
 # Words after which a configuration line carries a secret; the report shows "<removed>" instead.
-_SECRET_WORDS = {"community", "password", "secret", "key", "key-string", "md5", "sha", "auth", "priv"}
+_SECRET_WORDS = {"community", "password", "secret", "key", "key-string", "md5", "sha", "auth", "priv", "pre-shared-key",
+                 "shared-key"}
 # Words between a secret word and the secret: its form, or (SNMP) its access
-_SECRET_TYPES = {"ciphertext", "plaintext", "encrypted", "cipher", "hash", "simple", "read", "write", "text"}
+_SECRET_TYPES = {"ciphertext", "plaintext", "encrypted", "cipher", "hash", "simple", "read", "write", "text",
+                 "local", "remote"}
 # Commands where "authentication" itself is followed by a secret (HSRP: "standby 1 authentication cisco")
 _AUTH_COMMANDS = {"standby", "vrrp"}
 
@@ -59,6 +61,7 @@ _KIND_TITLES = [
     ("acl", "Access lists"),
     ("dhcp", "DHCP server"),
     ("nat", "NAT"),
+    ("vpn", "Site-to-site VPN (IPsec)"),
     ("management", "Management"),
     ("unparsed", "Not understood"),
 ]

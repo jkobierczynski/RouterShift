@@ -7,14 +7,15 @@
 from __future__ import annotations
 
 import ipaddress
-from typing import Callable, Dict, List, Tuple
+from typing import Callable, Dict, List, Set, Tuple
 
 from .. import acl as acl_text
 from .. import dhcp as dhcp_text
 from .. import fhrp
 from .. import nat as nat_text
+from .. import vpn as vpn_text
 from .. import ospf as ospf_text
-from ..model import (AclAction, AclEntry, BgpNeighbor, Device, FhrpGroup, Interface, InterfaceKind, LacpMode, NatRule,
+from ..model import (AclAction, AclEntry, BgpNeighbor, Device, FhrpGroup, IpsecPeer, Interface, InterfaceKind, LacpMode, NatRule,
                      Ospf, StaticRoute, StpMode, SwitchportMode)
 from ..names import PortMapper
 from ..parsers.comware import ranges
@@ -56,6 +57,7 @@ class Writer:
             self.ospf(p)
         self.dhcp()
         self.nat()
+        self.vpn()
         order = {InterfaceKind.LAG: 0}
         for iface in sorted(self.device.interfaces.values(), key=lambda i: order.get(i.kind, 1)):
             self.interface(iface)
@@ -266,13 +268,15 @@ class Writer:
         if iface.ospf_network:
             lines.append(f"ospf network-type {'p2p' if iface.ospf_network == 'point-to-point' else 'broadcast'}")
         lines += self._nat_interface(iface)
+        lines += self._tunnel(iface)
         if iface.helper_addresses:
             lines.append("dhcp select relay")
             lines += [f"dhcp relay server-address {helper}" for helper in iface.helper_addresses]
         if iface.stp_portfast:
             lines.append("stp edged-port")
         lines.append("shutdown" if iface.shutdown else "undo shutdown")
-        self.out.append(f"interface {name}")
+        mode = f" mode {iface.tunnel_mode}" if iface.kind == InterfaceKind.TUNNEL and iface.tunnel_mode else ""
+        self.out.append(f"interface {name}{mode}")
         self.out += [_IND + line for line in lines]
         self.block_end()
         if (iface.source_name or iface.name, name) in self.port.renumbered:
@@ -406,6 +410,129 @@ class Writer:
             elif "nat static enable" not in lines:
                 lines.append("nat static enable")
         return lines
+
+    def _tunnel(self, iface: Interface) -> List[str]:
+        lines = []
+        if iface.crypto_map and iface.crypto_map in self.ipsec_written:
+            lines.append(f"ipsec apply policy {iface.crypto_map}")
+        if iface.kind != InterfaceKind.TUNNEL:
+            return lines
+        if iface.tunnel_source:
+            source = iface.tunnel_source
+            lines.append(f"source {source if vpn_text.is_address(source) else self.port(source)}")
+        if iface.tunnel_destination:
+            lines.append(f"destination {iface.tunnel_destination}")
+        if iface.tunnel_profile and iface.tunnel_profile in self.ipsec_written:
+            lines.append(f"tunnel protection ipsec profile {iface.tunnel_profile}")
+        return lines
+
+    def vpn(self) -> None:
+        """IKEv1 proposals, one keychain, an IKE profile per connection, transform sets, policies and profiles."""
+        self.ipsec_written: Set[str] = set()
+        if not vpn_text.has_vpn(self.device):
+            return
+        numbers = {}
+        taken = {int(n) for n in self.device.ike_policies if n.isdigit()}
+        for policy in self.device.ike_policies.values():
+            label = vpn_text.policy_label(policy)
+            self.report.item("vpn", label)
+            if policy.version != 1:
+                self.report.skip("vpn", label, "vpn-ikev2", "IKEv2 is not written for Comware yet; configure it by hand")
+                continue
+            if policy.name.isdigit():
+                numbers[policy.name] = policy.name
+            else:
+                numbers[policy.name] = str(min(n for n in range(1, len(taken) + 2) if n not in taken))
+                taken.add(int(numbers[policy.name]))
+                self.report.add("vpn", label, Severity.APPROX, "vpn-renumbered",
+                                f"written as IKE proposal {numbers[policy.name]}; Comware numbers its proposals")
+            if policy.authentication != "pre-share":
+                self.report.add("vpn", label, Severity.REVIEW, "vpn-auth",
+                                f"authentication {policy.authentication} is not converted; pre-shared keys are written")
+            for attr in ("encryption", "integrity", "dh_groups"):
+                if len(getattr(policy, attr)) > 1:
+                    self.report.add("vpn", label, Severity.APPROX, "vpn-one-algorithm",
+                                    f"an IKE proposal takes one {attr.replace('_', ' ')}; the first is written")
+            lines = []
+            if policy.encryption:
+                lines.append("encryption-algorithm " + vpn_text.pick(vpn_text.COMWARE_ENC, policy.encryption[0],
+                                                                     self.report, label))
+            if policy.integrity:
+                lines.append("authentication-algorithm " + vpn_text.pick(vpn_text.COMWARE_IKE_INT,
+                                                                         policy.integrity[0], self.report, label))
+            if policy.dh_groups:
+                lines.append(f"dh group{policy.dh_groups[0]}")
+            if policy.lifetime is not None:
+                lines.append(f"sa duration {policy.lifetime}")
+            self.out.append(f"ike proposal {numbers[policy.name]}")
+            self.out += [_IND + line for line in lines]
+            self.block_end()
+        peers = []
+        for p in self.device.ipsec_peers:
+            if p.ike_version != 1:
+                self.report.skip("vpn", vpn_text.peer_label(p), "vpn-ikev2",
+                                 "IKEv2 is not written for Comware yet; configure this connection by hand")
+            else:
+                peers.append(p)
+        addresses = sorted({a for p in peers for a in vpn_text.peers_of(self.device, p)})
+        if addresses:
+            self.out.append("ike keychain KEYS")
+            for address in addresses:
+                key = vpn_text.key_for(self.device, address, self.report, f"IKE key {address}")
+                self.out.append(f"{_IND}pre-shared-key address {address} 255.255.255.255 key simple {key}")
+            self.block_end()
+        for p in peers:
+            self.out.append(f"ike profile {self._ike_profile(p)}")
+            self.out.append(f"{_IND}keychain KEYS")
+            self.out += [f"{_IND}match remote identity address {a} 255.255.255.255"
+                         for a in vpn_text.peers_of(self.device, p)]
+            proposals = [numbers[q.name] for q in vpn_text.policies_for(self.device, p) if q.name in numbers]
+            if proposals:
+                self.out.append(f"{_IND}proposal " + " ".join(proposals))
+            self.block_end()
+        pfs: Dict[str, int] = {}
+        for p in peers:
+            for name in p.transforms[:1]:
+                if pfs.setdefault(name, p.pfs_group) != p.pfs_group:
+                    self.report.add("vpn", vpn_text.peer_label(p), Severity.REVIEW, "vpn-pfs",
+                                    f"Comware sets PFS on transform set {name}, which another connection uses with "
+                                    f"a different group; copy the transform set for this one")
+        for transform in self.device.ipsec_transforms.values():
+            label = f"transform {transform.name}"
+            self.report.item("vpn", label)
+            lines = ["protocol esp", "esp encryption-algorithm " + vpn_text.pick(
+                vpn_text.COMWARE_ESP_ENC, transform.encryption, self.report, label)]
+            if transform.integrity:
+                lines.append("esp authentication-algorithm " + vpn_text.pick(
+                    vpn_text.COMWARE_ESP_INT, transform.integrity, self.report, label))
+            lines.append(f"encapsulation-mode {transform.mode}")
+            if pfs.get(transform.name):
+                lines.append(f"pfs dh-group{pfs[transform.name]}")
+            self.out.append(f"ipsec transform-set {transform.name}")
+            self.out += [_IND + line for line in lines]
+            self.block_end()
+        for p in peers:
+            label = vpn_text.peer_label(p)
+            self.report.item("vpn", label)
+            if p.acl and p.acl not in self.device.acls:
+                self.report.skip("vpn", label, "acl-missing", f"ACL {p.acl} is not defined; the policy is left out")
+                continue
+            lines = [f"transform-set {' '.join(p.transforms)}"] if p.transforms else []
+            if p.acl:
+                lines.append(f"security acl name {acl_text.safe_name(p.acl)}")
+            if p.peer:
+                lines.append(f"remote-address {p.peer}")
+            lines.append(f"ike-profile {self._ike_profile(p)}")
+            if p.lifetime is not None:
+                lines.append(f"sa duration time-based {p.lifetime}")
+            self.out.append(f"ipsec profile {p.name} isakmp" if p.profile else f"ipsec policy {p.name} {p.seq} isakmp")
+            self.out += [_IND + line for line in lines]
+            self.block_end()
+            self.ipsec_written.add(p.name)
+
+    @staticmethod
+    def _ike_profile(p: IpsecPeer) -> str:
+        return f"IKE-{p.name}" + (f"-{p.seq}" if not p.profile else "")
 
     def bgp(self) -> None:
         bgp = self.device.bgp
