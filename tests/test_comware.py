@@ -87,4 +87,6 @@ def test_comware_round_trip() -> None:
             other.shutdown, other.lag, other.lacp_mode, other.ipv4, other.vrf, other.stp_bpduguard), name
     assert [(r.prefix, r.vrf, r.next_hop, r.name) for r in back.static_routes] == [
         (r.prefix, r.vrf, r.next_hop, r.name) for r in first.static_routes]
+    for key in back.system.ntp_keys.values():  # an encrypted key comes back as the placeholder
+        key.key = "" if key.key == "CHANGE-ME" else key.key
     assert back.system == first.system

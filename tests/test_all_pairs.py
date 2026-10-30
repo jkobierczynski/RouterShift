@@ -3,6 +3,7 @@ from helpers import DATA
 
 from routershift import bgp as bgp_text
 from routershift import nat as nat_text
+from routershift import snmp as snmp_text
 from routershift import vpn as vpn_text
 from routershift import ospf as ospf_text
 from routershift.acl import safe_name
@@ -97,6 +98,24 @@ def test_converts_and_reads_back(source: str, target: str) -> None:
     else:
         assert not back.ipsec_peers
         assert not first.ipsec_peers or "do not terminate IPsec" in report.to_text()
+    # NTP keeps its servers, keys and trust; SNMP its communities, location and contact, notification hosts and v3
+    # users. Encrypted secrets come back as the placeholder. The AOS switches drop ACLs, groups and (AOS-S) VRFs and
+    # SNMPv3 hosts, which the report says.
+    plain = lambda value: "" if value in (snmp_text.PLACEHOLDER, vpn_text.PLACEHOLDER_KEY) else value  # noqa: E731
+    ntp = lambda dev: (sorted(dev.system.ntp_servers), dev.system.ntp_prefer if target != "aoss" else "",  # noqa: E731
+                       dev.system.ntp_server_keys,
+                       sorted((k.number, k.algorithm, plain(k.key), k.trusted) for k in dev.system.ntp_keys.values()),
+                       dev.system.ntp_authenticate or target == "aoss")
+    assert ntp(first) == ntp(back)
+    aos = target in ("aoscx", "aoss")
+    snmp = lambda dev: (  # noqa: E731
+        sorted((plain(c.name), c.access, "" if aos else safe_name(c.acl) if c.acl else "") for c in dev.snmp.communities),
+        dev.snmp.location, dev.snmp.contact,
+        sorted((h.address, h.version, plain(h.secret), h.informs, bool(h.vrf) and target != "aoss")
+               for h in dev.snmp.hosts if not (target == "aoss" and h.version == "3")),
+        sorted((u.name, "" if aos else u.group or u.name, u.auth, plain(u.auth_key), u.priv, plain(u.priv_key))
+               for u in dev.snmp.users))
+    assert snmp(first) == snmp(back)
     # BGP keeps every neighbor with its settings (peer groups may be written out on their members), networks and
     # redistribution; AOS-S leaves it to a person
     if first.bgp is not None and target == "aoss":

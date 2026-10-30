@@ -15,7 +15,8 @@ from .. import fhrp
 from .. import nat as nat_text
 from .. import vpn as vpn_text
 from .. import ospf as ospf_text
-from ..model import (AclAction, AclEntry, BgpNeighbor, Device, FhrpGroup, IpsecPeer, Interface, InterfaceKind, LacpMode, NatRule,
+from .. import snmp as snmp_text
+from ..model import (AclAction, AclEntry, BgpNeighbor, Device, FhrpGroup, IpsecPeer, SnmpGroup, Interface, InterfaceKind, LacpMode, NatRule,
                      Ospf, StaticRoute, StpMode, SwitchportMode)
 from ..names import PortMapper
 from ..parsers.comware import ranges
@@ -101,17 +102,107 @@ class Writer:
             rep.item("system", "name servers")
         if s.ntp_servers:
             self.out.append(f"{_IND}ntp-service enable")
-            self.out += [f"{_IND}ntp-service unicast-server {server}{vpn}" for server in s.ntp_servers]
+            for key in s.ntp_keys.values():
+                rep.item("system", f"ntp key {key.number}")
+                mode = {"md5": "md5", "sha1": "hmac-sha-1", "sha256": "hmac-sha-256"}[key.algorithm] \
+                    if key.algorithm in ("md5", "sha1", "sha256") else "hmac-sha-256"
+                self.out.append(f"{_IND}ntp-service authentication-keyid {key.number} authentication-mode {mode} "
+                                f"simple {snmp_text.ntp_key(key, rep)}")
+                if key.trusted:
+                    self.out.append(f"{_IND}ntp-service reliable authentication-keyid {key.number}")
+            if s.ntp_authenticate:
+                self.out.append(f"{_IND}ntp-service authentication enable")
+            for server in s.ntp_servers:
+                words = [f"{_IND}ntp-service unicast-server {server}{vpn}"]
+                if server in s.ntp_server_keys:
+                    words.append(f"authentication-keyid {s.ntp_server_keys[server]}")
+                if s.ntp_source:
+                    words.append(f"source {self.port(s.ntp_source)}")
+                if server == s.ntp_prefer:
+                    words.append("priority")
+                self.out.append(" ".join(words))
             rep.item("system", "ntp servers")
         for host in s.syslog_servers:
             self.out.append(f"{_IND}info-center loghost{vpn} {host}")
         if s.syslog_servers:
             rep.item("system", "syslog servers")
+        self.snmp()
         if s.banner_motd:
             delim = "%" if "%" not in s.banner_motd else "^"
             self.out += [f"{_IND}header motd {delim}", s.banner_motd, delim]
             rep.item("system", "banner motd")
         self.block_end()
+
+    _SNMP_AUTH = ["md5", "sha", "sha256", "sha384", "sha512"]
+    _SNMP_PRIV = ["des", "3des", "aes128", "aes192", "aes256"]
+
+    def snmp(self) -> None:
+        s = self.device.snmp
+        rep = self.report
+        if not snmp_text.has_snmp(self.device):
+            return
+        self.out.append(f"{_IND}snmp-agent")
+        versions = ["v2c"] if s.communities or any(h.version == "2c" for h in s.hosts) else []
+        versions = (["v1"] if any(h.version == "1" for h in s.hosts) else []) + versions
+        versions += ["v3"] if s.users or any(h.version == "3" for h in s.hosts) else []
+        if versions:
+            self.out.append(f"{_IND}snmp-agent sys-info version {' '.join(versions)}")
+        for c in s.communities:
+            label = snmp_text.community_label(self.device, c)
+            rep.item("management", label)
+            name = snmp_text.secret(c.name, rep, "management", label, "community")
+            line = f"{_IND}snmp-agent community {'read' if c.access == 'ro' else 'write'} simple {name}"
+            if c.acl and c.acl in self.device.acls:
+                line += f" acl name {acl_text.safe_name(c.acl)}"
+            elif c.acl:
+                rep.add("management", label, Severity.REVIEW, "acl-missing", f"ACL {c.acl} is not defined; left out")
+            self.out.append(line)
+        if s.location:
+            self.out.append(f"{_IND}snmp-agent sys-info location {s.location}")
+            rep.item("management", "snmp location")
+        if s.contact:
+            self.out.append(f"{_IND}snmp-agent sys-info contact {s.contact}")
+            rep.item("management", "snmp contact")
+        levels = {"noauth": "", "auth": " authentication", "priv": " privacy"}
+        groups = dict(s.groups)
+        for u in s.users:
+            if u.group not in groups:
+                groups[u.group or u.name] = SnmpGroup(u.group or u.name, snmp_text.level(u))
+        for g in groups.values():
+            views = (f" read-view {g.read_view}" if g.read_view else "") + \
+                (f" write-view {g.write_view}" if g.write_view else "")
+            if views:
+                rep.add("management", f"SNMPv3 group {g.name}", Severity.REVIEW, "snmp-view",
+                        "MIB views are not converted; define them by hand")
+            rep.item("management", f"SNMPv3 group {g.name}")
+            self.out.append(f"{_IND}snmp-agent group v3 {g.name}{levels[g.level]}{views}")
+        for u in s.users:
+            label = snmp_text.user_label(u)
+            rep.item("management", label)
+            keys = snmp_text.user_keys(u, rep)
+            words = [f"{_IND}snmp-agent usm-user v3 {u.name} {u.group or u.name} simple"]
+            if u.auth:
+                words.append(f"authentication-mode {snmp_text.pick(u.auth, self._SNMP_AUTH, rep, label)} {keys[0]}")
+            if u.priv:
+                priv = snmp_text.pick(u.priv, self._SNMP_PRIV, rep, label)
+                words.append(f"privacy-mode {'des56' if priv == 'des' else priv} {keys[1]}")
+            self.out.append(" ".join(words))
+        if s.traps or s.hosts:
+            self.out.append(f"{_IND}snmp-agent trap enable")
+        for h in s.hosts:
+            label = snmp_text.host_label(h)
+            rep.item("management", label)
+            secret = h.secret if h.version == "3" else snmp_text.secret(h.secret, rep, "management", label,
+                                                                        "community")
+            vpn = f" vpn-instance {h.vrf}" if h.vrf else ""
+            level = {"auth": " authentication", "priv": " privacy"}.get(h.level, "") if h.version == "3" else ""
+            self.out.append(f"{_IND}snmp-agent target-host {'inform' if h.informs else 'trap'} address udp-domain "
+                            f"{h.address}{vpn} params securityname {secret} v{h.version}{level}")
+        if s.source:
+            self.out.append(f"{_IND}snmp-agent trap source {self.port(s.source)}")
+        if s.vrf:
+            rep.add("management", "snmp vrf", Severity.REVIEW, "snmp-vrf",
+                    f"Comware has no agent VRF setting; set the VPN instance on each target host ({s.vrf})")
 
     def vrfs(self) -> None:
         # the management VRF too: Comware binds its management port to a VPN instance like any other interface

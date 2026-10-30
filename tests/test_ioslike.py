@@ -44,7 +44,7 @@ def test_parse_ios_access_switch() -> None:
     assert [(r.prefix, r.vrf, r.next_hop) for r in dev.static_routes] == [
         ("0.0.0.0/0", "", "10.99.0.1"), ("0.0.0.0/0", "Mgmt-vrf", "192.168.255.1")]
     assert dev.system.banner_motd == "Authorised access only."
-    assert any(u.text.startswith("snmp-server") for u in dev.unparsed)
+    assert [(c.name, c.access) for c in dev.snmp.communities] == [("s3cret", "ro")]
 
 
 def test_parse_eos_leaf() -> None:
@@ -67,7 +67,7 @@ def test_ios_to_eos() -> None:
     assert "ip route 0.0.0.0/0 10.99.0.1\n" in out
     assert "banner motd\nAuthorised access only.\nEOF\n" in out
     text = report.to_text()
-    assert "s3cret" not in text and "snmp-server community <removed> RO" in text
+    assert "s3cret" not in text and "community #1 (ro): exact" in text
     assert report.counts()["skipped"] >= 1
 
 
@@ -77,7 +77,7 @@ def test_eos_to_ios() -> None:
     assert "ip route vrf Mgmt-vrf 0.0.0.0 0.0.0.0 192.168.255.1\n" in out
     assert "ip route vrf PROD 10.200.0.0 255.255.0.0 Null0\n" in out
     assert " ip address 10.255.0.1 255.255.255.254\n" in out
-    assert "ntp server vrf Mgmt-vrf 10.0.0.123\n" in out
+    assert "ntp server vrf Mgmt-vrf 10.0.0.123 key 3 prefer\n" in out
     assert " mtu 9198\n" in out
     # members of a port-channel are configured like it on IOS
     member = out.split("description spine-02\n", 1)[1].split("!", 1)[0]

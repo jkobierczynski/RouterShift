@@ -28,7 +28,7 @@ from .. import ospf as ospf_text
 from .. import confparse
 from ..confparse import Node
 from ..errors import ParseError
-from ..model import (Acl, Device, DhcpPool, FhrpGroup, Interface, InterfaceKind, LacpMode, Origin, Ospf, StaticRoute,
+from ..model import (Acl, Device, DhcpPool, FhrpGroup, NtpKey, SnmpCommunity, SnmpHost, SnmpUser, Interface, InterfaceKind, LacpMode, Origin, Ospf, StaticRoute,
                      StpMode, SwitchportMode, Unparsed, Vlan)
 from .ioslike import _is_address, _vlan_ids
 
@@ -93,6 +93,8 @@ class _Reader:
             "access-list": self.acl,
             "router": self.router,
             "dhcp-server": self.dhcp_server,
+            "snmp-server": self.snmp,
+            "snmpv3": self.snmpv3,
         }
         for node in roots:
             if node.text.startswith(_NOISE):
@@ -150,10 +152,96 @@ class _Reader:
         if w[1:2] == ["vrf"] and len(w) == 3:
             self.device.system.service_vrf = w[2]
             return True
+        s = self.device.system
         if w[1:2] == ["server"] and len(w) >= 3:
-            self.device.system.ntp_servers.append(w[2])
-            return all(word in ("iburst", "prefer") for word in w[3:])
+            s.ntp_servers.append(w[2])
+            options = w[3:]
+            while options:
+                if options[0] == "prefer":
+                    s.ntp_prefer = w[2]
+                elif options[0] in ("key", "version") and len(options) >= 2:
+                    if options[0] == "key":
+                        s.ntp_server_keys[w[2]] = int(options[1])
+                    options = options[1:]
+                elif options[0] != "iburst":
+                    return False
+                options = options[1:]
+            return True
+        if w[1:] == ["authentication"]:
+            s.ntp_authenticate = True
+            return True
+        if w[1] == "authentication-key" and len(w) >= 5:
+            # ntp authentication-key 1 md5|sha1 [plaintext|ciphertext] KEY [trusted]
+            key = s.ntp_keys.setdefault(int(w[2]), NtpKey(int(w[2])))
+            args = w[4:]
+            if args[-1:] == ["trusted"]:
+                key.trusted, args = True, args[:-1]
+            key.algorithm = w[3]
+            encrypted = args[:1] == ["ciphertext"]
+            if args[:1] in (["plaintext"], ["ciphertext"]):
+                args = args[1:]
+            key.key = "" if encrypted else args[0]
+            return len(args) == 1 and w[3] in ("md5", "sha1")
+        if w[1] == "trusted-key" and len(w) == 3:
+            s.ntp_keys.setdefault(int(w[2]), NtpKey(int(w[2]))).trusted = True
+            return True
         return False
+
+    def snmp(self, node: Node) -> bool:
+        w = node.words
+        s = self.device.snmp
+        origin = Origin(node.line, node.text)
+        if w[1] == "vrf" and len(w) == 3:
+            s.vrf = w[2]
+            return True
+        if w[1] in ("system-location", "system-contact") and len(w) >= 3:
+            setattr(s, w[1][len("system-"):], node.text.split(None, 2)[2])
+            return True
+        if w[1] == "community" and len(w) == 3:
+            community = SnmpCommunity(w[2], origin=origin)
+            s.communities.append(community)
+            for child in node.children:
+                if child.words[:1] == ["access-level"] and child.words[1:] in (["ro"], ["rw"]):
+                    community.access = child.words[1]
+                else:
+                    self.unparsed(child, node.text)
+            return True
+        if w[1] == "host" and len(w) >= 7 and w[3] in ("trap", "inform") and w[4] == "version":
+            # snmp-server host A trap|inform version v2c [community NAME] [port N] [vrf V] / v3 user U
+            host = SnmpHost(str(ipaddress.ip_address(w[2])), w[5].lstrip("v"), informs=w[3] == "inform",
+                            origin=origin)
+            args = w[6:]
+            while len(args) >= 2:
+                if args[0] in ("community", "user"):
+                    host.secret = args[1]
+                elif args[0] == "vrf":
+                    host.vrf = args[1]
+                elif args[0] != "port":
+                    return False
+                args = args[2:]
+            s.hosts.append(host)
+            return not args and host.version in ("1", "2c", "3")
+        return False
+
+    def snmpv3(self, node: Node) -> bool:
+        """snmpv3 user U [auth md5|sha AUTH-PASS] [priv des|aes PRIV-PASS]; a pass is
+        'auth-pass plaintext|ciphertext KEY'."""
+        w = node.words
+        if w[1] != "user" or len(w) < 3:
+            return False
+        user = SnmpUser(w[2], origin=Origin(node.line, node.text))
+        args = w[3:]
+        for kind in ("auth", "priv"):
+            if args[:1] == [kind] and len(args) >= 5 and args[2] == f"{kind}-pass":
+                algorithm = "aes128" if args[1] == "aes" else args[1]
+                key = "" if args[3] == "ciphertext" else args[4]
+                if kind == "auth":
+                    user.auth, user.auth_key = algorithm, key
+                else:
+                    user.priv, user.priv_key = algorithm, key
+                args = args[5:]
+        self.device.snmp.users.append(user)
+        return not args
 
     def logging(self, node: Node) -> bool:
         args = self._service_vrf(node.words[1:])

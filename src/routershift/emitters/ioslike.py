@@ -15,8 +15,9 @@ from .. import dhcp as dhcp_text
 from .. import fhrp
 from .. import nat as nat_text
 from .. import ospf as ospf_text
+from .. import snmp as snmp_text
 from .. import vpn as vpn_text
-from ..model import (AclAction, Bgp, BgpNeighbor, Device, DhcpPool, IkePolicy, IpsecPeer, NatRule, FhrpGroup, Interface, InterfaceKind, LacpMode, Ospf,
+from ..model import (AclAction, Bgp, BgpNeighbor, Device, DhcpPool, IkePolicy, IpsecPeer, NatRule, SnmpGroup, FhrpGroup, Interface, InterfaceKind, LacpMode, Ospf,
                      StaticRoute, StpMode, SwitchportMode)
 from ..names import PortMapper
 from ..report import Report, Severity
@@ -981,13 +982,110 @@ class Writer:
 
     # services --------------------------------------------------------------------------------------------------------
 
+    _NTP_ALGORITHMS = {"ios": {"md5": "md5", "sha1": "hmac-sha1", "sha256": "hmac-sha2-256"},
+                       "eos": {"md5": "md5", "sha1": "sha1"}}
+
+    def _ntp(self, vrf: str) -> None:
+        s = self.device.system
+        for key in s.ntp_keys.values():
+            label = f"ntp key {key.number}"
+            self.report.item("system", label)
+            algorithms = self._NTP_ALGORITHMS[self.target]
+            algorithm = algorithms.get(key.algorithm)
+            if algorithm is None:
+                algorithm = algorithms["sha1"]
+                self.report.add("system", label, Severity.REVIEW, "ntp-algorithm",
+                                f"{key.algorithm} is not offered; sha1 is written, so the servers must use it too")
+            self.out.append(f"ntp authentication-key {key.number} {algorithm} {snmp_text.ntp_key(key, self.report)}")
+            if key.trusted:
+                self.out.append(f"ntp trusted-key {key.number}")
+        if s.ntp_authenticate:
+            self.out.append("ntp authenticate")
+        if s.ntp_source and s.ntp_servers:
+            self.out.append(f"ntp {'source' if self.ios else 'local-interface'} {self.port(s.ntp_source)}")
+        for server in s.ntp_servers:
+            words = ["ntp server"] + (["vrf", vrf] if vrf else []) + [server]
+            if server in s.ntp_server_keys:
+                words += ["key", str(s.ntp_server_keys[server])]
+            if server == s.ntp_prefer:
+                words.append("prefer")
+            self.out.append(" ".join(words))
+        if s.ntp_servers:
+            self.report.item("system", "ntp servers")
+
+    _SNMP_AUTH = {"ios": ["md5", "sha", "sha256"], "eos": ["md5", "sha", "sha256", "sha384", "sha512"]}
+    _SNMP_PRIV = {"ios": ["des", "3des", "aes128", "aes192", "aes256"], "eos": ["des", "aes128", "aes192", "aes256"]}
+
+    def _snmp(self) -> None:
+        s = self.device.snmp
+        rep = self.report
+        for c in s.communities:
+            label = snmp_text.community_label(self.device, c)
+            rep.item("management", label)
+            name = snmp_text.secret(c.name, rep, "management", label, "community")
+            words = ["snmp-server community", name, c.access.upper() if self.ios else c.access]
+            if c.acl and c.acl in self.device.acls:
+                words.append(acl_text.safe_name(c.acl))
+            elif c.acl:
+                rep.add("management", label, Severity.REVIEW, "acl-missing", f"ACL {c.acl} is not defined; left out")
+            self.out.append(" ".join(words))
+        if s.location:
+            self.out.append(f"snmp-server location {s.location}")
+            rep.item("management", "snmp location")
+        if s.contact:
+            self.out.append(f"snmp-server contact {s.contact}")
+            rep.item("management", "snmp contact")
+        groups = dict(s.groups)
+        for u in s.users:
+            if u.group not in groups:
+                groups[u.group or u.name] = SnmpGroup(u.group or u.name, snmp_text.level(u))
+        for g in groups.values():
+            words = [f"snmp-server group {g.name} v3 {g.level}"]
+            words += [f"read {g.read_view}"] if g.read_view else []
+            words += [f"write {g.write_view}"] if g.write_view else []
+            if g.read_view or g.write_view:
+                rep.add("management", f"SNMPv3 group {g.name}", Severity.REVIEW, "snmp-view",
+                        "MIB views are not converted; define them by hand")
+            rep.item("management", f"SNMPv3 group {g.name}")
+            self.out.append(" ".join(words))
+        for u in s.users:
+            label = snmp_text.user_label(u)
+            rep.item("management", label)
+            keys = snmp_text.user_keys(u, rep)
+            words = [f"snmp-server user {u.name} {u.group or u.name} v3"]
+            if u.auth:
+                auth = snmp_text.pick(u.auth, self._SNMP_AUTH[self.target], rep, label)
+                words.append(f"auth {'sha-2 256' if self.ios and auth == 'sha256' else auth} {keys[0]}")
+            if u.priv:
+                priv = snmp_text.pick(u.priv, self._SNMP_PRIV[self.target], rep, label)
+                if priv.startswith("aes"):
+                    priv = f"aes {priv[3:]}" if self.ios else "aes" if priv == "aes128" else priv
+                words.append(f"priv {priv} {keys[1]}")
+            self.out.append(" ".join(words))
+        if s.traps:
+            self.out.append("snmp-server enable traps")
+        for h in s.hosts:
+            label = snmp_text.host_label(h)
+            rep.item("management", label)
+            words = ["snmp-server host", h.address] + (["vrf", self.vrf(h.vrf)] if h.vrf else [])
+            words += ["informs"] if h.informs else ([] if self.ios else ["traps"])
+            words += ["version", h.version] + ([h.level] if h.version == "3" and h.level else [])
+            words.append(h.secret if h.version == "3" else snmp_text.secret(h.secret, rep, "management", label,
+                                                                            "community"))
+            self.out.append(" ".join(words))
+        if s.source:
+            self.out.append(f"snmp-server {'trap-source' if self.ios else 'local-interface'} {self.port(s.source)}")
+        if s.vrf and not self.ios:
+            self.out.append(f"snmp-server vrf {self.vrf(s.vrf)}")
+        elif s.vrf:
+            rep.add("management", "snmp vrf", Severity.REVIEW, "snmp-vrf",
+                    f"IOS has no agent VRF setting; SNMP answers in every VRF, including {s.vrf}")
+
     def services(self) -> None:
         s = self.device.system
         vrf = self.vrf(s.service_vrf) if s.service_vrf else ""
-        for server in s.ntp_servers:
-            self.out.append(f"ntp server vrf {vrf} {server}" if vrf else f"ntp server {server}")
-        if s.ntp_servers:
-            self.report.item("system", "ntp servers")
+        self._ntp(vrf)
+        self._snmp()
         for host in s.syslog_servers:
             if not vrf:
                 self.out.append(f"logging host {host}")

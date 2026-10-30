@@ -16,6 +16,7 @@ from .. import nat as nat_text
 from .. import vpn as vpn_text
 from .. import fhrp
 from .. import ospf as ospf_text
+from .. import snmp as snmp_text
 from ..model import Device, Interface, Ospf, InterfaceKind, LacpMode, StaticRoute, StpMode, SwitchportMode
 from ..names import PortMapper
 from ..report import Report, Severity
@@ -99,9 +100,25 @@ class Writer:
             self.out += [f"banner motd {delim}", s.banner_motd, delim]
             rep.item("system", "banner motd")
         via = f" vrf {self.vrf(s.service_vrf)}" if s.service_vrf else ""
+        for key in s.ntp_keys.values():
+            rep.item("system", f"ntp key {key.number}")
+            algorithm = key.algorithm
+            if algorithm not in ("md5", "sha1"):
+                algorithm = "sha1"
+                rep.add("system", f"ntp key {key.number}", Severity.REVIEW, "ntp-algorithm",
+                        f"{key.algorithm} is not offered; sha1 is written, so the servers must use it too")
+            self.out.append(f"ntp authentication-key {key.number} {algorithm} plaintext "
+                            f"{snmp_text.ntp_key(key, rep)}" + (" trusted" if key.trusted else ""))
+        if s.ntp_authenticate:
+            self.out.append("ntp authentication")
         if s.ntp_servers:
-            self.out += [f"ntp server {server} iburst" for server in s.ntp_servers]
+            for server in s.ntp_servers:
+                keyed = f" key {s.ntp_server_keys[server]}" if server in s.ntp_server_keys else ""
+                self.out.append(f"ntp server {server}{keyed} iburst" + (" prefer" if server == s.ntp_prefer else ""))
             self.out.append("ntp enable")
+            if s.ntp_source:
+                rep.add("system", "ntp servers", Severity.REVIEW, "ntp-source",
+                        f"NTP source interface {s.ntp_source} is not written; AOS-CX picks the source by VRF")
             if s.service_vrf:
                 self.out.append(f"ntp vrf {self.vrf(s.service_vrf)}")
             rep.item("system", "ntp servers")
@@ -115,7 +132,59 @@ class Writer:
             self.out.append(f"logging {host}{via}")
         if s.syslog_servers:
             rep.item("system", "syslog servers")
+        self.snmp()
         self.out.append("!")
+
+    _SNMP_AUTH = ["md5", "sha"]
+    _SNMP_PRIV = ["des", "aes128"]
+
+    def snmp(self) -> None:
+        s = self.device.snmp
+        rep = self.report
+        if snmp_text.has_snmp(self.device) and (s.vrf or self.device.system.service_vrf):
+            self.out.append(f"snmp-server vrf {self.vrf(s.vrf or self.device.system.service_vrf)}")
+        for c in s.communities:
+            label = snmp_text.community_label(self.device, c)
+            rep.item("management", label)
+            self.out.append(f"snmp-server community {snmp_text.secret(c.name, rep, 'management', label, 'community')}")
+            self.out.append(f"    access-level {c.access}")
+            if c.acl:
+                rep.add("management", label, Severity.REVIEW, "snmp-acl",
+                        f"ACL {c.acl} is not written for the community; restrict the managers by hand")
+        if s.location:
+            self.out.append(f"snmp-server system-location {s.location}")
+            rep.item("management", "snmp location")
+        if s.contact:
+            self.out.append(f"snmp-server system-contact {s.contact}")
+            rep.item("management", "snmp contact")
+        for g in s.groups.values():
+            rep.add("management", f"SNMPv3 group {g.name}", Severity.APPROX, "snmp-group",
+                    "AOS-CX has no SNMPv3 groups; its users get the access of an SNMPv3 user")
+        for u in s.users:
+            label = snmp_text.user_label(u)
+            rep.item("management", label)
+            keys = snmp_text.user_keys(u, rep)
+            words = [f"snmpv3 user {u.name}"]
+            if u.auth:
+                words.append(f"auth {snmp_text.pick(u.auth, self._SNMP_AUTH, rep, label)} auth-pass plaintext {keys[0]}")
+            if u.priv:
+                priv = snmp_text.pick(u.priv, self._SNMP_PRIV, rep, label)
+                words.append(f"priv {'aes' if priv == 'aes128' else priv} priv-pass plaintext {keys[1]}")
+            self.out.append(" ".join(words))
+        for h in s.hosts:
+            label = snmp_text.host_label(h)
+            rep.item("management", label)
+            words = [f"snmp-server host {h.address} {'inform' if h.informs else 'trap'} version v{h.version}"]
+            if h.version == "3":
+                words.append(f"user {h.secret}")
+            else:
+                words.append(f"community {snmp_text.secret(h.secret, rep, 'management', label, 'community')}")
+            if h.vrf:
+                words.append(f"vrf {self.vrf(h.vrf)}")
+            self.out.append(" ".join(words))
+        if s.source:
+            rep.add("management", "snmp source", Severity.REVIEW, "snmp-source",
+                    f"SNMP source interface {s.source} is not written; AOS-CX picks the source by VRF")
 
     def vrfs(self) -> None:
         for name in self.device.vrfs:
