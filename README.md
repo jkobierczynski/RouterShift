@@ -14,8 +14,37 @@ which does the same for firewall policies.
 
 ## Status
 
-Pre-alpha: the model and report exist; the first readers and writers (Cisco IOS
-and Arista EOS) are next.
+Pre-alpha. Cisco IOS / IOS XE and Arista EOS convert both ways for the system
+settings (hostname, domain, DNS, NTP, syslog, banner, spanning-tree mode), VLANs,
+interfaces (switchport access and trunk, voice VLAN, LAGs and LACP, SVIs,
+loopbacks, the management port, subinterfaces), IPv4 and IPv6 addressing, DHCP
+relay, VRFs and static routes. Everything else (BGP, OSPF, ACLs, SNMP, AAA, ...)
+is listed in the report under "Not understood", line by line, with secrets
+masked.
+
+## Usage
+
+```
+pip install .
+routershift convert --from ios --to eos running-config.txt -o eos.cfg --report report.txt
+routershift parse --from eos running-config.txt      # the vendor-neutral model as JSON
+routershift platforms
+```
+
+The report says, for each item, whether it was converted **exactly**,
+**approximated** (with what changed), needs **review**, or was **skipped**.
+
+### Port maps
+
+Ports are renumbered for the target (for example `GigabitEthernet1/0/1` becomes
+`Ethernet1` on EOS) and every renumbered port is flagged in the report. For a
+real migration, give a port map with `--port-map ports.txt`:
+
+```
+# source port = target port
+GigabitEthernet1/0/1 = Ethernet7
+TenGigabitEthernet1/1/1 = Ethernet49/1
+```
 
 ## Requirements
 
