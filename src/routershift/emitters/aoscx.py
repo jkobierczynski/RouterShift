@@ -10,6 +10,7 @@ import ipaddress
 from typing import Callable, Dict, List, Tuple
 
 from .. import acl as acl_text
+from .. import bgp as bgp_text
 from .. import fhrp
 from .. import ospf as ospf_text
 from ..model import Device, Interface, Ospf, InterfaceKind, LacpMode, StaticRoute, StpMode, SwitchportMode
@@ -56,6 +57,8 @@ class Writer:
         for iface in sorted(self.device.interfaces.values(), key=lambda i: order.get(i.kind, 2)):
             self.interface(iface)
         self.routes()
+        if self.device.bgp is not None:
+            self.bgp()
         self.report.unparsed(self.device.unparsed)
         return "\n".join(self.out) + "\n"
 
@@ -268,6 +271,49 @@ class Writer:
         for dotted in sorted(set(areas.values()) | set(p.area_types), key=ospf_text.area_number):
             kind = p.area_types.get(dotted)
             lines.append(f"area {dotted}" + (f" {kind}" if kind else ""))
+        self.out += [_IND + line for line in lines]
+
+    def bgp(self) -> None:
+        bgp = self.device.bgp
+        assert bgp is not None
+        label = f"bgp {bgp.local_as}"
+        self.report.item("bgp", label)
+        if bgp.peer_groups:
+            self.report.add("bgp", label, Severity.APPROX, "bgp-peer-group",
+                            f"peer groups {', '.join(bgp.peer_groups)} written out on each member")
+        lines: List[str] = []
+        if bgp.router_id:
+            lines.append(f"bgp router-id {bgp.router_id}")
+        neighbors = bgp_text.flat(bgp)
+        for peer in neighbors:
+            self.report.item("bgp", f"neighbor {peer.address}")
+            pre = f"neighbor {peer.address}"
+            if peer.remote_as:
+                lines.append(f"{pre} remote-as {peer.remote_as}")
+            if peer.description:
+                lines.append(f"{pre} description {peer.description}")
+            if peer.update_source:
+                lines.append(f"{pre} update-source {self.port(peer.update_source)}")
+            if peer.ebgp_multihop is not None:
+                lines.append(f"{pre} ebgp-multihop {peer.ebgp_multihop}")
+            if peer.shutdown:
+                lines.append(f"{pre} shutdown")
+        for af in ("ipv4", "ipv6"):
+            body: List[str] = []
+            for peer in neighbors:
+                if af in peer.families:
+                    body.append(f"neighbor {peer.address} activate")
+                    if peer.next_hop_self:
+                        body.append(f"neighbor {peer.address} next-hop-self")
+                    if peer.send_community:
+                        body.append(f"neighbor {peer.address} send-community standard")
+            body += [f"network {p}" for p in bgp.networks if (":" in p) == (af == "ipv6")]
+            body += [f"redistribute {r}" for r in (bgp.redistribute6 if af == "ipv6" else bgp.redistribute)]
+            if body:
+                lines.append(f"address-family {af} unicast")
+                lines += [_IND + line for line in body]
+                lines.append("exit-address-family")
+        self.out.append(f"router bgp {bgp.local_as}")
         self.out += [_IND + line for line in lines]
 
     def _ospf_interface(self, iface: Interface) -> List[str]:

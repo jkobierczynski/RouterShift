@@ -21,6 +21,7 @@ import ipaddress
 from typing import Callable, Dict, List, Optional, Tuple
 
 from .. import acl as acl_text
+from .. import bgp as bgp_text
 from .. import fhrp
 from .. import ospf as ospf_text
 from .. import confparse
@@ -254,7 +255,72 @@ class _Reader:
                 if not understood:
                     self.unparsed(child, node.text)
             return True
+        if w[1:2] == ["bgp"] and len(w) == 3 and self.device.bgp is None:
+            self.bgp(node, w[2])
+            return True
         return False
+
+    def bgp(self, node: Node, local_as: str) -> None:
+        b = bgp_text.Builder(local_as)
+        b.default_ipv4 = False  # AOS-CX lists "neighbor X activate" in the address family
+        b.bgp.origin = Origin(node.line, node.text)
+        for child in node.children:
+            w = child.words
+            af = ""
+            if w[0] == "address-family" and w[1:] in (["ipv4", "unicast"], ["ipv6", "unicast"]):
+                af = w[1]
+            elif w[0] == "address-family":
+                self.unparsed(child, node.text)
+                continue
+            for line in child.children if af else [child]:
+                try:
+                    understood = self.bgp_line(b, line.words, af)
+                except (ValueError, IndexError):
+                    understood = False
+                if not understood:
+                    self.unparsed(line, child.text if af else node.text)
+        self.device.bgp = b.finish()
+
+    @staticmethod
+    def bgp_line(b: bgp_text.Builder, w: List[str], af: str) -> bool:
+        n = len(w)
+        if w == ["exit-address-family"]:
+            return True
+        if w[:2] == ["bgp", "router-id"] and n == 3:
+            b.bgp.router_id = str(ipaddress.IPv4Address(w[2]))
+            return True
+        if w[0] == "network" and n == 2 and af:
+            b.bgp.networks.append(str(ipaddress.ip_network(w[1])))
+            return True
+        if w[0] == "redistribute" and n == 2 and w[1] in bgp_text.REDISTRIBUTE and af:
+            (b.bgp.redistribute6 if af == "ipv6" else b.bgp.redistribute).append(w[1])
+            return True
+        if w[:2] == ["no", "neighbor"] and n == 4 and w[3] == "activate":
+            b.activate(w[2], af or "ipv4", on=False)
+            return True
+        if w[0] != "neighbor" or n < 3:
+            return False
+        peer = b.peer(w[1])
+        args = w[2:]
+        if args[0] == "remote-as" and len(args) == 2:
+            peer.remote_as = args[1]
+        elif args[0] == "description" and len(args) >= 2:
+            peer.description = " ".join(args[1:])
+        elif args[0] == "update-source" and len(args) >= 2:
+            peer.update_source = canonical(" ".join(args[1:]))[0]
+        elif args[0] == "ebgp-multihop" and len(args) in (1, 2):
+            peer.ebgp_multihop = int(args[1]) if len(args) == 2 else 255
+        elif args == ["shutdown"]:
+            peer.shutdown = True
+        elif args == ["activate"]:
+            b.activate(w[1], af or "ipv4")
+        elif args == ["next-hop-self"]:
+            peer.next_hop_self = True
+        elif args[0] == "send-community" and args[1:] in ([], ["standard"], ["both"]):
+            peer.send_community = True
+        else:
+            return False
+        return True
 
     @staticmethod
     def ospf_line(p: Ospf, w: List[str]) -> bool:

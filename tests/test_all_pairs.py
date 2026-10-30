@@ -1,6 +1,7 @@
 import pytest
 from helpers import DATA
 
+from routershift import bgp as bgp_text
 from routershift import ospf as ospf_text
 from routershift.acl import safe_name
 from routershift.convert import PLATFORMS, convert, parse
@@ -49,4 +50,14 @@ def test_converts_and_reads_back(source: str, target: str) -> None:
         assert other.redistribute == p.redistribute and other.area_types == p.area_types
     costs = lambda dev: sorted(i.ospf_cost for i in dev.interfaces.values() if i.ospf_cost)  # noqa: E731
     assert costs(first) == costs(back)
+    # BGP keeps every neighbor with its settings (peer groups may be written out on their members), networks and
+    # redistribution; AOS-S leaves it to a person
+    if first.bgp is not None and target == "aoss":
+        assert back.bgp is None and "configure it by hand" in report.to_text()
+    elif first.bgp is not None:
+        assert back.bgp is not None
+        assert (back.bgp.local_as, back.bgp.router_id) == (first.bgp.local_as, first.bgp.router_id)
+        assert bgp_text.flat(back.bgp) == bgp_text.flat(first.bgp)
+        assert sorted(back.bgp.networks) == sorted(first.bgp.networks)
+        assert (back.bgp.redistribute, back.bgp.redistribute6) == (first.bgp.redistribute, first.bgp.redistribute6)
     assert report.counts()

@@ -10,10 +10,11 @@ import ipaddress
 from typing import Callable, Dict, List
 
 from .. import acl as acl_text
+from .. import bgp as bgp_text
 from .. import fhrp
 from .. import ospf as ospf_text
-from ..model import (AclAction, Device, FhrpGroup, Interface, InterfaceKind, LacpMode, Ospf, StaticRoute, StpMode,
-                     SwitchportMode)
+from ..model import (AclAction, Bgp, BgpNeighbor, Device, FhrpGroup, Interface, InterfaceKind, LacpMode, Ospf,
+                     StaticRoute, StpMode, SwitchportMode)
 from ..names import PortMapper
 from ..report import Report, Severity
 from ..timezones import offset_minutes
@@ -423,6 +424,8 @@ class Writer:
         self.out.append("!")
         for p in self.device.ospf:
             self.ospf(p)
+        if self.device.bgp is not None:
+            self.bgp(self.device.bgp)
 
     def _area(self, dotted: str) -> str:
         return ospf_text.area_number(dotted) if self.ios else dotted
@@ -472,6 +475,84 @@ class Writer:
         self.out.append(header)
         self.out += [self.ind + line for line in lines]
         self.out.append("!")
+
+    def bgp(self, bgp: Bgp) -> None:
+        self.report.item("bgp", f"bgp {bgp.local_as}")
+        ind = self.ind
+        lines: List[str] = []
+        if bgp.router_id:
+            lines.append(f"bgp router-id {bgp.router_id}" if self.ios else f"router-id {bgp.router_id}")
+        lines.append("no bgp default ipv4-unicast")  # every neighbor is activated where it belongs
+        for group in bgp.peer_groups.values():
+            lines.append(f"neighbor {group.address} {'peer-group' if self.ios else 'peer group'}")
+            lines += self._bgp_neighbor(group)
+        for neighbor in bgp.neighbors:
+            self.report.item("bgp", f"neighbor {neighbor.address}")
+            if neighbor.peer_group:
+                word = "peer-group" if self.ios else "peer group"
+                lines.append(f"neighbor {neighbor.address} {word} {neighbor.peer_group}")
+            lines += self._bgp_neighbor(neighbor)
+        if not self.ios:
+            for peer in list(bgp.peer_groups.values()) + bgp.neighbors:
+                lines += self._bgp_af_options(peer)
+        for af in ("ipv4", "ipv6"):
+            body: List[str] = []
+            for prefix in bgp.networks:
+                net = ipaddress.ip_network(prefix)
+                if (net.version == 6) != (af == "ipv6"):
+                    continue
+                if self.ios and net.version == 4:
+                    body.append(f"network {net.network_address} mask {net.netmask}")
+                else:
+                    body.append(f"network {net}")
+            for source in bgp.redistribute6 if af == "ipv6" else bgp.redistribute:
+                body.append(self._bgp_redistribute(source))
+            for group in bgp.peer_groups.values():  # IOS takes a group's options per address family
+                if self.ios and any(af in n.families for n in bgp.neighbors if n.peer_group == group.address):
+                    body += self._bgp_af_options(group)
+            for peer in bgp.neighbors:
+                if af in peer.families:
+                    body.append(f"neighbor {peer.address} activate")
+                    if self.ios:
+                        body += self._bgp_af_options(peer)
+            if not body:
+                continue
+            lines.append(f"address-family {af}" + (" unicast" if self.ios else ""))
+            lines += [ind + line for line in body]
+            if self.ios:
+                lines.append("exit-address-family")
+        self.out.append(f"router bgp {bgp.local_as}")
+        self.out += [ind + line for line in lines]
+        self.out.append("!")
+
+    def _bgp_neighbor(self, peer: BgpNeighbor) -> List[str]:
+        pre = f"neighbor {peer.address}"
+        lines = []
+        if peer.remote_as:
+            lines.append(f"{pre} remote-as {peer.remote_as}")
+        if peer.description:
+            lines.append(f"{pre} description {peer.description}")
+        if peer.update_source:
+            lines.append(f"{pre} update-source {self.port(peer.update_source)}")
+        if peer.ebgp_multihop is not None:
+            lines.append(f"{pre} ebgp-multihop {peer.ebgp_multihop}")
+        if peer.shutdown:
+            lines.append(f"{pre} shutdown")
+        return lines
+
+    @staticmethod
+    def _bgp_af_options(peer: BgpNeighbor) -> List[str]:
+        lines = []
+        if peer.next_hop_self:
+            lines.append(f"neighbor {peer.address} next-hop-self")
+        if peer.send_community:
+            lines.append(f"neighbor {peer.address} send-community")
+        return lines
+
+    def _bgp_redistribute(self, source: str) -> str:
+        if source == "ospf" and self.ios:
+            return f"redistribute ospf {self.device.ospf[0].process if self.device.ospf else 1}"
+        return f"redistribute {source}"
 
     def _route(self, route: StaticRoute) -> str:
         net = ipaddress.ip_network(route.prefix)

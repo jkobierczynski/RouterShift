@@ -34,7 +34,7 @@ platform converts to and from all the others.
 | Gateway redundancy: HSRP, VRRP, anycast gateways (IPv4) | `FhrpGroup` | 2 (done) |
 | Spanning tree mode, edge ports, BPDU guard | `Device.stp_mode`, `Interface` | 2 |
 | OSPFv2: processes per VRF, areas and area types, passive interfaces, redistribution, cost, network type | `Ospf`, `Interface.ospf_cost` | 2 (done) |
-| BGP | `Bgp`, `BgpNeighbor` | 2 |
+| BGP: neighbors, peer groups, IPv4/IPv6 activation, networks, redistribution | `Bgp`, `BgpNeighbor` | 2 (done) |
 | Access lists (IPv4 and IPv6) and their interface bindings | `Acl`, `AclEntry`, `Interface.acl_in` ... | 2 (done) |
 | SNMP, local users | `Snmp`, `LocalUser` | 2 |
 | Route maps, prefix lists, AAA/TACACS/RADIUS, QoS, MLAG/VSX/vPC, VXLAN/EVPN | to come | 3+ |
@@ -106,6 +106,19 @@ platform converts to and from all the others.
   what it can't hold is flagged. Its router ID is the global `ip router-id`.
 * Authentication, timers, summaries, virtual links and redistribution through route maps are listed under "Not
   understood" for now.
+
+## BGP
+
+* The one BGP process of the global routing table: local AS, router ID, neighbors and peer groups (remote AS,
+  description, update source, eBGP multihop, shutdown, next-hop-self, send-community), the address families each
+  neighbor is active in, networks and redistribution of connected, static and OSPF routes, for IPv4 and IPv6.
+* IOS and EOS activate IPv4 neighbors by default; the reader follows `no bgp default ipv4-unicast`, and the writers
+  switch the default off and activate every neighbor where it belongs. AOS-CX and Comware list each activation.
+* AOS-CX has no peer groups here: a group's settings are written on each member, and the report says so. Comware
+  groups are `group NAME internal|external`.
+* AOS-S is not written: its BGP depends on the model and release, and the report asks a person to configure it.
+* Passwords, timers, route maps, prefix lists, communities other than standard, and BGP in VRFs are listed under
+  "Not understood" for now (secrets masked).
 
 ## Port names
 

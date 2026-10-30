@@ -88,6 +88,9 @@ class Writer:
         self.routes()
         self.vlan_blocks()
         self.spanning_tree()
+        if self.device.bgp is not None:
+            self.report.skip("bgp", f"bgp {self.device.bgp.local_as}", "bgp",
+                             "not written: BGP on AOS-S depends on the model and release; configure it by hand")
         self.report.unparsed(self.device.unparsed)
         return "\n".join(self.out) + "\n"
 
