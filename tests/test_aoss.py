@@ -44,7 +44,9 @@ def test_aoss_to_aoscx() -> None:
 
 
 def test_ios_to_aoss() -> None:
-    out, report = convert(sample("ios_access.cfg"), "ios", "aoss")
+    # without its HSRP group the switch only needs a default gateway (test_fhrp covers the group)
+    text = "".join(line for line in sample("ios_access.cfg").splitlines(True) if not line.startswith(" standby"))
+    out, report = convert(text, "ios", "aoss")
     assert 'hostname "sw-access-01"\n' in out
     assert "time timezone 60\n" in out
     assert "ip default-gateway 10.99.0.1\n" in out and "ip routing" not in out

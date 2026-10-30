@@ -25,8 +25,8 @@ from .. import acl as acl_text
 from .. import confparse
 from ..confparse import Node
 from ..errors import ParseError
-from ..model import (Acl, Device, Interface, InterfaceKind, LacpMode, Origin, StaticRoute, StpMode, SwitchportMode,
-                     Unparsed, Vlan)
+from ..model import (Acl, Device, FhrpGroup, Interface, InterfaceKind, LacpMode, Origin, StaticRoute, StpMode,
+                     SwitchportMode, Unparsed, Vlan)
 from ..timezones import utc
 from .ioslike import _cidr, _is_address
 
@@ -116,6 +116,7 @@ class _Reader:
             "access-list": self.numbered_acl,
             "vlan": self.vlan,
             "spanning-tree": self.spanning_tree,
+            "router": self.router,
         }
         for node in roots:
             if node.text.startswith(_NOISE):
@@ -373,6 +374,8 @@ class _Reader:
                     self._access_group(l3(), c)
                 elif c[:2] == ["ip", "helper-address"] and len(c) == 3:
                     l3().helper_addresses.append(c[2])
+                elif c[:2] == ["vrrp", "vrid"] and len(c) == 3:
+                    self._vrrp(l3(), child)
                 elif c in (["no", "ip", "address"], ["ipv6", "enable"]):
                     pass
                 else:
@@ -380,6 +383,42 @@ class _Reader:
             except (ValueError, IndexError):
                 self.unparsed(child, node.text)
         return True
+
+    def router(self, node: Node) -> bool:
+        """router vrrp / ipv4 enable: implied by the groups."""
+        return node.words == ["router", "vrrp"] and all(
+            c.words in (["ipv4", "enable"], ["exit"]) for c in node.children)
+
+    def _vrrp(self, svi: Interface, node: Node) -> None:
+        """vrrp vrid N inside a VLAN; the group stays off until 'enable'."""
+        group = FhrpGroup("vrrp", int(node.words[2]), shutdown=True, origin=Origin(node.line, node.text))
+        svi.fhrp.append(group)
+        for child in node.children:
+            w = child.words
+            n = len(w)
+            try:
+                if w in (["exit"], ["owner"], ["backup"]):
+                    pass  # the owner is the router whose own address is the virtual one
+                elif w[0] == "virtual-ip-address" and n in (2, 3):
+                    address = str(ipaddress.IPv4Address(w[1]))
+                    if group.address:
+                        group.secondary.append(address)
+                    else:
+                        group.address = address
+                elif w[0] == "priority" and n == 2:
+                    group.priority = int(w[1])
+                elif w == ["preempt-mode"]:
+                    group.preempt = True
+                elif w == ["no", "preempt-mode"]:
+                    group.preempt = False
+                elif w[0] == "advertise-interval" and n == 2:
+                    group.hello_ms = int(w[1]) * 1000
+                elif w == ["enable"]:
+                    group.shutdown = False
+                else:
+                    self.unparsed(child, node.text)
+            except ValueError:
+                self.unparsed(child, node.text)
 
     def spanning_tree(self, node: Node) -> bool:
         w = node.words

@@ -10,6 +10,7 @@ import ipaddress
 from typing import Callable, Dict, List
 
 from .. import acl as acl_text
+from .. import fhrp
 from ..model import Device, Interface, InterfaceKind, LacpMode, StaticRoute, StpMode, SwitchportMode
 from ..names import PortMapper
 from ..report import Report, Severity
@@ -42,6 +43,10 @@ class Writer:
         self.spanning_tree()
         self.acls()
         self.vlans()
+        self.groups = {i.name: fhrp.plan(i, "aoscx", self.report, self.port(i.name))
+                       for i in self.device.interfaces.values() if i.fhrp}
+        if any(g.protocol == "vrrp" for gs in self.groups.values() for g in gs):
+            self.out.append("router vrrp enable")
         # a LAG exists before the ports that join it
         order = {InterfaceKind.MANAGEMENT: 0, InterfaceKind.LAG: 1}
         for iface in sorted(self.device.interfaces.values(), key=lambda i: order.get(i.kind, 2)):
@@ -195,6 +200,7 @@ class Writer:
                 lines.append(f"apply access-list {family} {acl_text.safe_name(acl_name)} {direction}")
             elif acl_name:
                 add(Severity.REVIEW, "acl-missing", f"ACL {acl_name} is applied but not defined; left out")
+        lines += self._fhrp(iface, name)
         if iface.stp_portfast:
             lines.append("spanning-tree port-type admin-edge")
         if iface.stp_bpduguard:
@@ -204,6 +210,33 @@ class Writer:
         if (iface.source_name or iface.name, name) in self.port.renumbered:
             add(Severity.APPROX, "port-renamed",
                 f"named {name} without a port map; check it against the cabling of the new device")
+
+    def _fhrp(self, iface: Interface, name: str) -> List[str]:
+        lines: List[str] = []
+        for g in self.groups.get(iface.name, []):
+            add = fhrp.adder(self.report, name, g)
+            if g.protocol == "anycast":
+                if g.mac:
+                    lines.append(f"active-gateway ip mac {g.mac}")
+                else:
+                    add(Severity.REVIEW, "fhrp-mac", "the source has no anycast MAC; add 'active-gateway ip mac'")
+                lines += [f"active-gateway ip {a}" for a in [g.address] + g.secondary]
+                continue
+            lines.append(f"vrrp {g.group} address-family ipv4")
+            body = [f"address {g.address} primary"] + [f"address {a} secondary" for a in g.secondary]
+            if g.priority is not None:
+                body.append(f"priority {g.priority}")
+            if not g.preempts():
+                body.append("no preempt")
+            if g.version == 3:
+                body.append("version 3")
+            if g.hello_ms is not None:
+                body.append(f"timers advertise {fhrp.interval(g.hello_ms, 1, add, 100, 40950)}")
+            if g.name:
+                add(Severity.APPROX, "fhrp-name", f"description '{g.name}' left out: AOS-CX has none for a group")
+            body.append("shutdown" if g.shutdown else "no shutdown")
+            lines += [_IND + line for line in body]
+        return lines
 
     def _layer2(self, iface: Interface, add: _Add) -> List[str]:
         if iface.lag:

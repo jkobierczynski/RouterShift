@@ -16,11 +16,12 @@ import ipaddress
 from typing import Callable, Dict, List, Optional
 
 from .. import acl as acl_text
+from .. import fhrp
 from .. import confparse, names
 from ..confparse import Node
 from ..errors import ParseError
-from ..model import (Acl, Device, Interface, InterfaceKind, LacpMode, Origin, StaticRoute, StpMode, SwitchportMode,
-                     Unparsed, Vlan)
+from ..model import (Acl, Device, FhrpGroup, Interface, InterfaceKind, LacpMode, Origin, StaticRoute, StpMode,
+                     SwitchportMode, Unparsed, Vlan)
 
 # Lines that only describe the file or the software, not the device's behaviour.
 _NOISE = ("Building configuration", "Current configuration", "version ", "end", "boot-start-marker",
@@ -61,6 +62,8 @@ class _Reader:
         self.switch_defaults = platform == "eos"  # physical ports start as switchports
         self._explicit_mode: Dict[str, bool] = {}  # "no switchport" seen
         self._switchport_seen: Dict[str, bool] = {}  # any switchport line seen
+        self._varp_mac = ""  # EOS: ip virtual-router mac-address
+        self._vrrp_v3 = False  # IOS XE: fhrp version vrrp v3
 
     def unparsed(self, node: Node, section: str = "") -> None:
         self.device.unparsed.append(Unparsed(node.line, node.text, section))
@@ -95,6 +98,7 @@ class _Reader:
             "vrf": self.vrf,
             "spanning-tree": self.spanning_tree,
             "access-list": self.numbered_acl,
+            "fhrp": self.fhrp_version,
         }
         for node in roots:
             if node.text.startswith(_NOISE) or node.text == "end":
@@ -171,6 +175,9 @@ class _Reader:
             return self.route(node, w[2:], 4)
         if w[1:2] == ["access-list"] and len(w) >= 3:
             return self.acl(node, 4)
+        if w[1:3] == ["virtual-router", "mac-address"] and len(w) == 4:  # EOS VARP
+            self._varp_mac = fhrp.mac(w[3])
+            return True
         if w[1:2] == ["vrf"] and len(w) == 3:  # IOS classic: ip vrf NAME
             self._add_vrf(w[2])
             return all(c.words[0] in ("rd", "route-target", "description") for c in node.children)
@@ -185,6 +192,12 @@ class _Reader:
         if w[1:2] == ["access-list"] and len(w) >= 3:
             return self.acl(node, 6)
         return False
+
+    def fhrp_version(self, node: Node) -> bool:
+        if node.words[1:] == ["version", "vrrp", "v3"]:
+            self._vrrp_v3 = True
+            return True
+        return node.words[1:] == ["version", "vrrp", "v2"]
 
     # access lists ----------------------------------------------------------------------------------------------------
 
@@ -327,9 +340,16 @@ class _Reader:
             iface.mode = SwitchportMode.ACCESS
         self.device.interfaces[canon] = iface
         trunk_vlans: Optional[List[str]] = None
+        hsrp_version: Optional[int] = None
         for child in node.children:
             if child.words[0] == "switchport":
                 self._switchport_seen[canon] = True
+            if child.words[:2] == ["standby", "version"] and len(child.words) == 3 and child.words[2] in ("1", "2"):
+                hsrp_version = int(child.words[2])
+                continue
+            if child.words[0] == "vrrp" and child.words[2:] == ["address-family", "ipv4"]:
+                self._vrrp_block(iface, child)
+                continue
             try:
                 understood = self.interface_line(iface, child.words)
             except (ValueError, IndexError):
@@ -344,7 +364,135 @@ class _Reader:
                     trunk_vlans = [w[4]] if w[4] not in ("all",) else []
         if trunk_vlans is not None:
             iface.allowed_vlans = ",".join(trunk_vlans)
+        for group in iface.fhrp:
+            if group.protocol == "hsrp":
+                group.version = hsrp_version
         return True
+
+    # first-hop redundancy --------------------------------------------------------------------------------------------
+
+    @staticmethod
+    def _fhrp_group(iface: Interface, protocol: str, number: int) -> FhrpGroup:
+        for group in iface.fhrp:
+            if group.protocol == protocol and group.group == number:
+                return group
+        group = FhrpGroup(protocol, number)
+        iface.fhrp.append(group)
+        return group
+
+    @staticmethod
+    def _virtual_ip(group: FhrpGroup, args: List[str]) -> bool:
+        if not args or len(args) > 2 or args[1:] not in ([], ["secondary"]):
+            return False
+        address = str(ipaddress.IPv4Address(args[0]))
+        if args[1:] or group.address:
+            group.secondary.append(address)
+        else:
+            group.address = address
+        return True
+
+    def _hsrp(self, iface: Interface, w: List[str]) -> bool:
+        """standby [N] ip|priority|preempt|timers|name|shutdown ..."""
+        number = int(w[0]) if w and w[0].isdigit() else 0
+        if w and w[0].isdigit():
+            w = w[1:]
+        if not w:
+            return False
+        group = self._fhrp_group(iface, "hsrp", number)
+        if w[0] == "ip":
+            return self._virtual_ip(group, w[1:])
+        if w[0] == "priority" and len(w) == 2:
+            group.priority = int(w[1])
+        elif w[0] == "preempt":
+            group.preempt = True
+            return len(w) == 1  # a delay is listed for review
+        elif w[0] == "timers" and len(w) >= 3:
+            times: List[int] = []
+            args = w[1:]
+            while args:
+                if args[0] == "msec" and len(args) >= 2:
+                    times.append(int(args[1]))
+                    args = args[2:]
+                else:
+                    times.append(int(args[0]) * 1000)
+                    args = args[1:]
+            if len(times) != 2:
+                return False
+            group.hello_ms, group.hold_ms = times
+        elif w[0] == "name" and len(w) == 2:
+            group.name = w[1]
+        elif w == ["shutdown"]:
+            group.shutdown = True
+        else:
+            return False
+        return True
+
+    def _vrrp(self, iface: Interface, w: List[str]) -> bool:
+        """vrrp N ... in the IOS classic and EOS spellings."""
+        if not w or not w[0].isdigit() or len(w) < 2:
+            return False
+        group = self._fhrp_group(iface, "vrrp", int(w[0]))
+        w = w[1:]
+        n = len(w)
+        if w[0] in ("ip", "ipv4") and n >= 2:
+            if w[1:] == ["version", "3"] or w[1:] == ["version", "2"]:
+                group.version = int(w[2])
+                return True
+            return self._virtual_ip(group, w[1:])
+        if w[0] == "version" and n == 2:
+            group.version = int(w[1])
+        elif w[0] in ("priority", "priority-level") and n == 2:
+            group.priority = int(w[1])
+        elif w[0] == "preempt":
+            group.preempt = True
+            return n == 1
+        elif w[:2] == ["timers", "advertise"] and n in (3, 4):
+            group.hello_ms = int(w[3]) if w[2] == "msec" and n == 4 else int(w[2]) * 1000
+            return n == 3 or w[2] == "msec"
+        elif w[:2] == ["advertisement", "interval"] and n == 3:
+            group.hello_ms = int(w[2]) * 1000
+        elif w[0] == "description" and n >= 2:
+            group.name = " ".join(w[1:])
+        elif w[:2] == ["session", "description"] and n >= 3:
+            group.name = " ".join(w[2:])
+        elif w in (["shutdown"], ["disabled"]):
+            group.shutdown = True
+        else:
+            return False
+        return True
+
+    def _vrrp_block(self, iface: Interface, node: Node) -> None:
+        """IOS XE VRRPv3: vrrp N address-family ipv4, with its settings inside."""
+        group = self._fhrp_group(iface, "vrrp", int(node.words[1]))
+        group.version = 3
+        group.preempt = True
+        for child in node.children:
+            w = child.words
+            n = len(w)
+            if w[0] == "address" and n in (2, 3) and w[2:] in ([], ["primary"], ["secondary"]):
+                address = str(ipaddress.IPv4Address(w[1]))
+                if w[2:] == ["secondary"]:
+                    group.secondary.append(address)
+                else:
+                    group.address = address
+            elif w[0] == "priority" and n == 2:
+                group.priority = int(w[1])
+            elif w == ["no", "preempt"]:
+                group.preempt = False
+            elif w == ["preempt"]:
+                group.preempt = True
+            elif w[:2] == ["timers", "advertise"] and n == 3:
+                group.hello_ms = int(w[2])
+            elif w == ["vrrpv2"]:
+                group.version = 2
+            elif w[0] == "description" and n >= 2:
+                group.name = " ".join(w[1:])
+            elif w == ["shutdown"]:
+                group.shutdown = True
+            elif w == ["exit-vrrp"]:
+                pass
+            else:
+                self.unparsed(child, node.text)
 
     def interface_line(self, iface: Interface, w: List[str]) -> bool:
         n = len(w)
@@ -418,6 +566,16 @@ class _Reader:
             if not tag.isdigit():
                 return False
             iface.encapsulation_vlan = int(tag)
+        elif w[0] == "standby" and n >= 2:
+            return self._hsrp(iface, w[1:])
+        elif w[0] == "vrrp" and n >= 2:
+            return self._vrrp(iface, w[1:])
+        elif w[:2] == ["no", "vrrp"] and n == 4 and w[3] == "preempt":
+            self._fhrp_group(iface, "vrrp", int(w[2])).preempt = False
+        elif w[:3] == ["ip", "virtual-router", "address"] and n == 4:  # EOS VARP
+            group = self._fhrp_group(iface, "anycast", 0)
+            address = w[3].split("/")[0]
+            return self._virtual_ip(group, [address] if not group.address else [address, "secondary"])
         elif w[:2] == ["spanning-tree", "portfast"] and (n == 2 or w[2:] in (["edge"], ["trunk"])):
             iface.stp_portfast = True
         elif w[:2] == ["spanning-tree", "bpduguard"] and n == 3:
@@ -460,6 +618,12 @@ class _Reader:
         return len(args) in (1, 2)
 
     def _finish(self) -> None:
+        for iface in self.device.interfaces.values():
+            for group in iface.fhrp:
+                if group.protocol == "anycast":
+                    group.mac = self._varp_mac
+                elif group.protocol == "vrrp" and self._vrrp_v3 and group.version is None:
+                    group.version = 3
         for iface in self.device.interfaces.values():
             # A routed port that carries no layer 3 address on a router is still routed; on IOS a physical port with an
             # address but without "no switchport" is routed as well (a router).

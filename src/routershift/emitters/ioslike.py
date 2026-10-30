@@ -10,7 +10,9 @@ import ipaddress
 from typing import Callable, Dict, List
 
 from .. import acl as acl_text
-from ..model import AclAction, Device, Interface, InterfaceKind, LacpMode, StaticRoute, StpMode, SwitchportMode
+from .. import fhrp
+from ..model import (AclAction, Device, FhrpGroup, Interface, InterfaceKind, LacpMode, StaticRoute, StpMode,
+                     SwitchportMode)
 from ..names import PortMapper
 from ..report import Report, Severity
 from ..timezones import offset_minutes
@@ -48,6 +50,10 @@ class Writer:
 
     def emit(self) -> str:
         self._plan_vrfs()
+        self.groups = {i.name: fhrp.plan(i, self.target, self.report, self.port(i.name))
+                       for i in self.device.interfaces.values() if i.fhrp}
+        self.vrrp_v3 = self.ios and any(
+            g.protocol == "vrrp" and g.version == 3 for gs in self.groups.values() for g in gs)
         self.system()
         self.spanning_tree()
         self.vrfs()
@@ -86,6 +92,9 @@ class Writer:
             via = f"vrf {self.vrf(s.service_vrf)} " if s.service_vrf else ""
             self.out.append(f"ip name-server {via}" + " ".join(s.dns_servers))
             rep.item("system", "name servers")
+        if self.vrrp_v3:
+            self.out.append("fhrp version vrrp v3")
+        self._anycast_mac()
         self.out.append("!")
 
     def spanning_tree(self) -> None:
@@ -162,6 +171,7 @@ class Writer:
             lines.append(f"vrf forwarding {vrf}" if self.ios else f"vrf {vrf}")
         lines += self._addresses(iface)
         lines += self._acl_bindings(iface, add)
+        lines += self._fhrp(iface, name)
         if iface.mtu is not None:
             mtu = iface.mtu
             if self.ios and mtu > _IOS_MAX_MTU:
@@ -267,6 +277,101 @@ class Writer:
                 word = "ip access-group"
             lines.append(f"{word} {acl_text.safe_name(name)} {direction}")
         return lines
+
+    # first-hop redundancy --------------------------------------------------------------------------------------------
+
+    def _anycast_mac(self) -> None:
+        if self.ios:
+            return
+        anycast = [g for gs in self.groups.values() for g in gs if g.protocol == "anycast"]
+        macs = sorted({g.mac for g in anycast if g.mac})
+        if macs:
+            self.out.append(f"ip virtual-router mac-address {macs[0]}")
+        if len(macs) > 1:
+            self.report.add("fhrp", "virtual MAC", Severity.REVIEW, "fhrp-mac",
+                            f"EOS takes one virtual-router MAC; {macs[0]} written, {', '.join(macs[1:])} left out")
+        elif anycast and not macs:
+            self.report.add("fhrp", "virtual MAC", Severity.REVIEW, "fhrp-mac",
+                            "the source has no anycast MAC; add 'ip virtual-router mac-address'")
+
+    def _fhrp(self, iface: Interface, name: str) -> List[str]:
+        lines: List[str] = []
+        groups = self.groups.get(iface.name, [])
+        hsrp = [g for g in groups if g.protocol == "hsrp"]
+        if any(g.version == 2 or g.group > 255 for g in hsrp):
+            lines.append("standby version 2")
+        for group in groups:
+            add = fhrp.adder(self.report, name, group)
+            if group.protocol == "hsrp":
+                lines += self._hsrp(group, add)
+            elif group.protocol == "anycast":
+                lines += [f"ip virtual-router address {a}" for a in [group.address] + group.secondary]
+            elif self.vrrp_v3:
+                lines += self._vrrp_v3(group)
+            else:
+                lines += self._vrrp(group, add)
+        return lines
+
+    @staticmethod
+    def _ms(ms: int) -> str:
+        return f"msec {ms}" if ms % 1000 else str(ms // 1000)
+
+    def _hsrp(self, g: FhrpGroup, add: fhrp.Add) -> List[str]:
+        pre = f"standby {g.group}"
+        lines = [f"{pre} ip {g.address}"] + [f"{pre} ip {a} secondary" for a in g.secondary]
+        if g.priority is not None:
+            lines.append(f"{pre} priority {g.priority}")
+        if g.preempts():
+            lines.append(f"{pre} preempt")
+        if g.hello_ms is not None:
+            hold = g.hold_ms if g.hold_ms is not None else 3 * g.hello_ms
+            lines.append(f"{pre} timers {self._ms(g.hello_ms)} {self._ms(hold)}")
+        if g.name:
+            lines.append(f"{pre} name {g.name.replace(' ', '_')}")
+        if g.shutdown:
+            lines.append(f"{pre} shutdown")
+        return lines
+
+    def _vrrp(self, g: FhrpGroup, add: fhrp.Add) -> List[str]:
+        pre = f"vrrp {g.group}"
+        family = "ip" if self.ios else "ipv4"
+        lines = [f"{pre} {family} {g.address}"] + [f"{pre} {family} {a} secondary" for a in g.secondary]
+        if g.priority is not None:
+            lines.append(f"{pre} priority {g.priority}" if self.ios else f"{pre} priority-level {g.priority}")
+        if not g.preempts():
+            lines.append(f"no {pre} preempt")
+        if g.hello_ms is not None:
+            if self.ios:
+                lines.append(f"{pre} timers advertise {self._ms(g.hello_ms)}")
+            else:
+                lines.append(f"{pre} advertisement interval {fhrp.interval(g.hello_ms, 1000, add, 1, 255)}")
+        if g.version == 3:
+            if self.ios:
+                add(Severity.APPROX, "fhrp-version", "VRRPv3 written as VRRPv2")
+            else:
+                lines.append(f"{pre} ipv4 version 3")
+        if g.name:
+            lines.append(f"{pre} description {g.name}" if self.ios else f"{pre} session description {g.name}")
+        if g.shutdown:
+            lines.append(f"{pre} shutdown" if self.ios else f"{pre} disabled")
+        return lines
+
+    def _vrrp_v3(self, g: FhrpGroup) -> List[str]:
+        body = [f"address {g.address} primary"] + [f"address {a} secondary" for a in g.secondary]
+        if g.priority is not None:
+            body.append(f"priority {g.priority}")
+        if not g.preempts():
+            body.append("no preempt")
+        if g.hello_ms is not None:
+            body.append(f"timers advertise {g.hello_ms}")
+        if g.version != 3:
+            body.append("vrrpv2")
+        if g.name:
+            body.append(f"description {g.name}")
+        if g.shutdown:
+            body.append("shutdown")
+        return [f"vrrp {g.group} address-family ipv4"] + [f"{self.ind}{line}" for line in body] + [
+            f"{self.ind}exit-vrrp"]
 
     # access lists ----------------------------------------------------------------------------------------------------
 

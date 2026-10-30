@@ -17,7 +17,8 @@ import re
 from typing import Dict, List, Optional, Set, Tuple
 
 from .. import acl as acl_text
-from ..model import Device, Interface, InterfaceKind, LacpMode, StaticRoute, StpMode, SwitchportMode, Vlan
+from .. import fhrp
+from ..model import Device, FhrpGroup, Interface, InterfaceKind, LacpMode, StaticRoute, StpMode, SwitchportMode, Vlan
 from ..names import PortMapper
 from ..parsers.ioslike import _vlan_ids
 from ..report import Report, Severity
@@ -112,7 +113,7 @@ class Writer:
                 svi = Interface(f"Vlan{vid}", InterfaceKind.VLAN, ipv4=list(iface.ipv4), ipv6=list(iface.ipv6),
                                 dhcp_client=iface.dhcp_client, helper_addresses=list(iface.helper_addresses),
                                 vrf=iface.vrf, acl_in=iface.acl_in, acl_out=iface.acl_out,
-                                acl6_in=iface.acl6_in, acl6_out=iface.acl6_out)
+                                acl6_in=iface.acl6_in, acl6_out=iface.acl6_out, fhrp=list(iface.fhrp))
                 self.svis[vid] = svi
                 self.untagged.setdefault(vid, []).append(name)
                 self.add(iface, Severity.APPROX, "routed-port",
@@ -141,6 +142,8 @@ class Writer:
             self.vlans.setdefault(1, Vlan(1, name="DEFAULT_VLAN"))  # ports start untagged in it
         for vid in set(self.untagged) | set(self.tagged):
             self.vlans.setdefault(vid, Vlan(vid))
+        self.groups = {vid: fhrp.plan(svi, "aoss", self.report, f"vlan {vid}")
+                       for vid, svi in self.svis.items() if svi.fhrp}
 
     # system ----------------------------------------------------------------------------------------------------------
 
@@ -191,13 +194,16 @@ class Writer:
         routes = [r for r in self.device.static_routes if r.vrf not in self.mgmt_vrfs]
         l3_vlans = [v for v in self.svis.values() if v.ipv4 or v.dhcp_client]
         default = [r for r in routes if r.prefix == "0.0.0.0/0" and r.next_hop]
-        if len(routes) == 1 and default and len(l3_vlans) <= 1:
+        vrrp = any(self.groups.values())
+        if len(routes) == 1 and default and len(l3_vlans) <= 1 and not vrrp:
             self.out.append(f"ip default-gateway {default[0].next_hop}")  # a layer 2 switch
             self.report.item("route", "0.0.0.0/0")
             self.gateway_only = default[0]
             return
-        if routes or len(l3_vlans) > 1:
+        if routes or len(l3_vlans) > 1 or vrrp:
             self.out.append("ip routing")
+        if vrrp:
+            self.out += ["router vrrp", f"{_IND}ipv4 enable", f"{_IND}exit"]
 
     def trunks(self) -> None:
         lags: Dict[str, List[Interface]] = {}
@@ -356,7 +362,32 @@ class Writer:
         for helper in svi.helper_addresses:
             lines.append(f"ip helper-address {helper}")
         lines += self._acl_bindings(svi)
+        vid = int(svi.name[len("Vlan"):])
+        for g in self.groups.get(vid, []):
+            lines += self._vrrp(svi, g, fhrp.adder(self.report, f"vlan {vid}", g))
         return lines
+
+    def _vrrp(self, svi: Interface, g: FhrpGroup, add: fhrp.Add) -> List[str]:
+        owner = fhrp.owns(svi, g)
+        body = ["owner" if owner else "backup"]
+        for address in [g.address] + g.secondary:
+            nets = [ipaddress.ip_interface(a).network for a in svi.ipv4]
+            net = next((n for n in nets if ipaddress.ip_address(address) in n), None)
+            body.append(f"virtual-ip-address {address}" + (f" {net.netmask}" if net else ""))
+        if g.priority is not None and not owner:
+            body.append(f"priority {g.priority}")
+        if not g.preempts():
+            body.append("no preempt-mode")
+        if g.hello_ms is not None:
+            body.append(f"advertise-interval {fhrp.interval(g.hello_ms, 1000, add, 1, 255)}")
+        if g.version == 3:
+            add(Severity.APPROX, "fhrp-version", "VRRPv3 written as VRRPv2, the version AOS-S runs for IPv4")
+        if g.name:
+            add(Severity.APPROX, "fhrp-name", f"description '{g.name}' left out: AOS-S has none for a group")
+        if not g.shutdown:
+            body.append("enable")
+        body.append("exit")
+        return [f"vrrp vrid {g.group}"] + [_IND + line for line in body]
 
     def _acl_bindings(self, iface: Interface) -> List[str]:
         lines = []
