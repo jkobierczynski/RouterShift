@@ -23,6 +23,7 @@ from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from .. import acl as acl_text
 from .. import confparse
+from .. import ospf as ospf_text
 from ..confparse import Node
 from ..errors import ParseError
 from ..model import (Acl, Device, FhrpGroup, Interface, InterfaceKind, LacpMode, Origin, StaticRoute, StpMode,
@@ -78,6 +79,10 @@ class _Reader:
         self.voice_vlans: Set[int] = set()
         self.routing = False
         self.default_gateway: Optional[StaticRoute] = None
+        self.router_id = ""
+        self.router_id_line: Optional[Node] = None
+        self.ospf_areas: List[Tuple[str, str, str]] = []
+        self.ospf_passive: Dict[str, bool] = {}
 
     def unparsed(self, node: Node, section: str = "") -> None:
         self.device.unparsed.append(Unparsed(node.line, node.text, section))
@@ -180,6 +185,10 @@ class _Reader:
             if args[:1] == ["priority"]:
                 args = args[2:]
             self.device.system.dns_servers.extend(args)
+            return True
+        if w[1:2] == ["router-id"] and len(w) == 3:
+            self.router_id = str(ipaddress.IPv4Address(w[2]))
+            self.router_id_line = node
             return True
         if w[1:2] == ["default-gateway"] and len(w) == 3:
             self.default_gateway = StaticRoute("0.0.0.0/0", next_hop=w[2], origin=Origin(node.line, node.text))
@@ -374,6 +383,12 @@ class _Reader:
                     self._access_group(l3(), c)
                 elif c[:2] == ["ip", "helper-address"] and len(c) == 3:
                     l3().helper_addresses.append(c[2])
+                elif c[:2] == ["ip", "ospf"] and len(c) in (4, 5) and c[-2] == "area":
+                    self.ospf_areas.append((l3().name, "", ospf_text.area(c[-1])))
+                elif c == ["ip", "ospf", "passive"]:
+                    self.ospf_passive[l3().name] = True
+                elif c[:3] == ["ip", "ospf", "cost"] and len(c) == 4:
+                    l3().ospf_cost = int(c[3])
                 elif c[:2] == ["vrrp", "vrid"] and len(c) == 3:
                     self._vrrp(l3(), child)
                 elif c in (["no", "ip", "address"], ["ipv6", "enable"]):
@@ -385,9 +400,30 @@ class _Reader:
         return True
 
     def router(self, node: Node) -> bool:
-        """router vrrp / ipv4 enable: implied by the groups."""
-        return node.words == ["router", "vrrp"] and all(
-            c.words in (["ipv4", "enable"], ["exit"]) for c in node.children)
+        """router vrrp / ipv4 enable (implied by the groups); router ospf, the one OSPF process."""
+        if node.words == ["router", "vrrp"]:
+            return all(c.words in (["ipv4", "enable"], ["exit"]) for c in node.children)
+        if node.words != ["router", "ospf"]:
+            return False
+        p = ospf_text.process(self.device, "1")
+        p.origin = Origin(node.line, node.text)
+        for child in node.children:
+            w = child.words
+            n = len(w)
+            try:
+                if w in (["enable"], ["exit"]):
+                    continue
+                if w[0] == "area" and n == 2:
+                    ospf_text.area(w[1])
+                elif w[0] == "area" and n in (4, 5) and w[2] == "stub" and w[4:] in ([], ["no-summary"]):
+                    p.area_types[ospf_text.area(w[1])] = "stub" + (" no-summary" if n == 5 else "")
+                elif w[0] == "redistribute" and n == 2 and w[1] in ("connected", "static"):
+                    p.redistribute.append(w[1])
+                else:
+                    self.unparsed(child, node.text)
+            except ValueError:
+                self.unparsed(child, node.text)
+        return True
 
     def _vrrp(self, svi: Interface, node: Node) -> None:
         """vrrp vrid N inside a VLAN; the group stays off until 'enable'."""
@@ -448,6 +484,11 @@ class _Reader:
     # VLAN membership to ports ----------------------------------------------------------------------------------------
 
     def _finish(self) -> None:
+        ospf_text.attach(self.device, self.ospf_areas, self.ospf_passive)
+        if self.router_id and self.device.ospf:
+            self.device.ospf[0].router_id = self.router_id
+        elif self.router_id_line is not None:
+            self.unparsed(self.router_id_line)  # only routing protocols use it
         for iface in self.device.interfaces.values():
             if iface.kind not in (InterfaceKind.ETHERNET, InterfaceKind.LAG):
                 continue

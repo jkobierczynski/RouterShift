@@ -13,15 +13,16 @@ pasted together by hand.
 from __future__ import annotations
 
 import ipaddress
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 from .. import acl as acl_text
 from .. import fhrp
+from .. import ospf as ospf_text
 from .. import confparse, names
 from ..confparse import Node
 from ..errors import ParseError
-from ..model import (Acl, Device, FhrpGroup, Interface, InterfaceKind, LacpMode, Origin, StaticRoute, StpMode,
-                     SwitchportMode, Unparsed, Vlan)
+from ..model import (Acl, Device, FhrpGroup, Interface, InterfaceKind, LacpMode, Origin, Ospf, OspfNetwork,
+                     StaticRoute, StpMode, SwitchportMode, Unparsed, Vlan)
 
 # Lines that only describe the file or the software, not the device's behaviour.
 _NOISE = ("Building configuration", "Current configuration", "version ", "end", "boot-start-marker",
@@ -64,6 +65,7 @@ class _Reader:
         self._switchport_seen: Dict[str, bool] = {}  # any switchport line seen
         self._varp_mac = ""  # EOS: ip virtual-router mac-address
         self._vrrp_v3 = False  # IOS XE: fhrp version vrrp v3
+        self._ospf_areas: List[Tuple[str, str, str]] = []  # interface, process ("" = the interface's VRF), area
 
     def unparsed(self, node: Node, section: str = "") -> None:
         self.device.unparsed.append(Unparsed(node.line, node.text, section))
@@ -99,6 +101,7 @@ class _Reader:
             "spanning-tree": self.spanning_tree,
             "access-list": self.numbered_acl,
             "fhrp": self.fhrp_version,
+            "router": self.router,
         }
         for node in roots:
             if node.text.startswith(_NOISE) or node.text == "end":
@@ -198,6 +201,60 @@ class _Reader:
             self._vrrp_v3 = True
             return True
         return node.words[1:] == ["version", "vrrp", "v2"]
+
+    # routing protocols -----------------------------------------------------------------------------------------------
+
+    def router(self, node: Node) -> bool:
+        w = node.words
+        if w[1:2] == ["ospf"] and len(w) in (3, 5) and (len(w) == 3 or w[3] == "vrf"):
+            return self.ospf(node, w[2], w[4] if len(w) == 5 else "")
+        return False
+
+    def ospf(self, node: Node, number: str, vrf: str) -> bool:
+        p = ospf_text.process(self.device, number, vrf)
+        p.vrf = vrf
+        p.origin = Origin(node.line, node.text)
+        if vrf:
+            self._add_vrf(vrf)
+        for child in node.children:
+            try:
+                understood = self.ospf_line(p, child.words)
+            except (ValueError, IndexError):
+                understood = False
+            if not understood:
+                self.unparsed(child, node.text)
+        return True
+
+    @staticmethod
+    def ospf_line(p: Ospf, w: List[str]) -> bool:
+        n = len(w)
+        if w[0] == "router-id" and n == 2:
+            p.router_id = str(ipaddress.IPv4Address(w[1]))
+        elif w[0] == "network" and n in (4, 5) and w[-2] == "area":
+            prefix = acl_text.wildcard_prefix(w[1], w[2]) if n == 5 else str(ipaddress.ip_network(w[1], strict=False))
+            p.networks.append(OspfNetwork(prefix, ospf_text.area(w[-1])))
+        elif w == ["passive-interface", "default"]:
+            p.passive_default = True
+        elif w[0] == "passive-interface" and n >= 2:
+            p.passive_interfaces.append(names.canonical(" ".join(w[1:]))[0])
+        elif w[:2] == ["no", "passive-interface"] and n >= 3:
+            p.active_interfaces.append(names.canonical(" ".join(w[2:]))[0])
+        elif w[0] == "area" and n in (3, 4) and w[2] in ("stub", "nssa") and w[3:] in ([], ["no-summary"]):
+            p.area_types[ospf_text.area(w[1])] = " ".join(w[2:])
+        elif w[0] == "redistribute" and n >= 2 and w[1] in ospf_text.REDISTRIBUTE:
+            rest = w[3:] if w[1] == "bgp" else w[2:]
+            if rest not in ([], ["subnets"]):
+                return False  # a route map or metric
+            p.redistribute.append(w[1])
+        elif w[:2] == ["default-information", "originate"] and w[2:] in ([], ["always"]):
+            p.default_originate = "always" if n == 3 else "on"
+        elif w[:2] == ["auto-cost", "reference-bandwidth"] and n == 3:
+            p.reference_bandwidth = int(w[2])
+        elif w[0] == "log-adjacency-changes" or w == ["max-lsa", "12000"]:
+            pass  # logging, and the EOS default
+        else:
+            return False
+        return True
 
     # access lists ----------------------------------------------------------------------------------------------------
 
@@ -566,6 +623,12 @@ class _Reader:
             if not tag.isdigit():
                 return False
             iface.encapsulation_vlan = int(tag)
+        elif w[:2] == ["ip", "ospf"] and n >= 4 and w[-2] == "area" and n in (4, 5):
+            self._ospf_areas.append((iface.name, w[2] if n == 5 else "", ospf_text.area(w[-1])))
+        elif w[:3] == ["ip", "ospf", "cost"] and n == 4:
+            iface.ospf_cost = int(w[3])
+        elif w[:3] == ["ip", "ospf", "network"] and n == 4 and w[3] in ("point-to-point", "broadcast"):
+            iface.ospf_network = w[3]
         elif w[0] == "standby" and n >= 2:
             return self._hsrp(iface, w[1:])
         elif w[0] == "vrrp" and n >= 2:
@@ -649,6 +712,9 @@ class _Reader:
         self.device.interfaces = renamed
         for route in self.device.static_routes:
             route.interface = old_to_new.get(route.interface, route.interface)
+        ospf_text.attach(self.device, [(old_to_new.get(n, n), p, a) for n, p, a in self._ospf_areas], {})
+        for p in self.device.ospf:
+            ospf_text.rename(p, old_to_new)
 
     def _lag_mode(self, lag: Interface) -> SwitchportMode:
         if lag.mode != SwitchportMode.ROUTED:

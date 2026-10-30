@@ -22,11 +22,12 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 from .. import acl as acl_text
 from .. import fhrp
+from .. import ospf as ospf_text
 from .. import confparse
 from ..confparse import Node
 from ..errors import ParseError
-from ..model import (Acl, Device, FhrpGroup, Interface, InterfaceKind, LacpMode, Origin, StaticRoute, StpMode,
-                     SwitchportMode, Unparsed, Vlan)
+from ..model import (Acl, Device, FhrpGroup, Interface, InterfaceKind, LacpMode, Origin, Ospf, StaticRoute,
+                     StpMode, SwitchportMode, Unparsed, Vlan)
 from .ioslike import _is_address, _vlan_ids
 
 MGMT_VRF = "mgmt"
@@ -58,6 +59,8 @@ class _Reader:
         self.device = Device(platform="aoscx")
         self._routing: Dict[str, bool] = {}  # explicit routing / no routing per interface
         self._lag_lacp: Dict[str, LacpMode] = {}
+        self._ospf_areas: List[Tuple[str, str, str]] = []
+        self._ospf_passive: Dict[str, bool] = {}
         self._voice_vlans: List[int] = []
 
     def unparsed(self, node: Node, section: str = "") -> None:
@@ -235,7 +238,44 @@ class _Reader:
     # interfaces ------------------------------------------------------------------------------------------------------
 
     def router(self, node: Node) -> bool:
-        return node.words == ["router", "vrrp", "enable"]  # implied by the groups
+        w = node.words
+        if w == ["router", "vrrp", "enable"]:
+            return True  # implied by the groups
+        if w[1:2] == ["ospf"] and len(w) in (3, 5) and (len(w) == 3 or w[3] == "vrf"):
+            vrf = w[4] if len(w) == 5 else ""
+            p = ospf_text.process(self.device, w[2], vrf)
+            p.vrf = vrf
+            p.origin = Origin(node.line, node.text)
+            for child in node.children:
+                try:
+                    understood = self.ospf_line(p, child.words)
+                except (ValueError, IndexError):
+                    understood = False
+                if not understood:
+                    self.unparsed(child, node.text)
+            return True
+        return False
+
+    @staticmethod
+    def ospf_line(p: Ospf, w: List[str]) -> bool:
+        n = len(w)
+        if w[0] == "router-id" and n == 2:
+            p.router_id = str(ipaddress.IPv4Address(w[1]))
+        elif w == ["passive-interface", "default"]:
+            p.passive_default = True
+        elif w[0] == "area" and n == 2:
+            ospf_text.area(w[1])  # declared; its interfaces say they are in it
+        elif w[0] == "area" and n in (3, 4) and w[2] in ("stub", "nssa") and w[3:] in ([], ["no-summary"]):
+            p.area_types[ospf_text.area(w[1])] = " ".join(w[2:])
+        elif w[0] == "redistribute" and n == 2 and w[1] in ospf_text.REDISTRIBUTE:
+            p.redistribute.append(w[1])
+        elif w[:2] == ["default-information", "originate"] and w[2:] in ([], ["always"]):
+            p.default_originate = "always" if n == 3 else "on"
+        elif w[0] == "reference-bandwidth" and n == 2:
+            p.reference_bandwidth = int(w[1])
+        else:
+            return False
+        return True
 
     def interface(self, node: Node) -> bool:
         source = " ".join(node.words[1:])
@@ -375,6 +415,16 @@ class _Reader:
                                                          next_hop=w[1], vrf=iface.vrf or MGMT_VRF))
         elif w[:2] == ["encapsulation", "dot1q"] and n == 3:
             iface.encapsulation_vlan = int(w[2])
+        elif w[:2] == ["ip", "ospf"] and n == 5 and w[3] == "area":
+            self._ospf_areas.append((iface.name, w[2], ospf_text.area(w[4])))
+        elif w == ["ip", "ospf", "passive"]:
+            self._ospf_passive[iface.name] = True
+        elif w == ["no", "ip", "ospf", "passive"]:
+            self._ospf_passive[iface.name] = False
+        elif w[:3] == ["ip", "ospf", "cost"] and n == 4:
+            iface.ospf_cost = int(w[3])
+        elif w[:3] == ["ip", "ospf", "network"] and n == 4 and w[3] in ("point-to-point", "broadcast"):
+            iface.ospf_network = w[3]
         elif w[:2] == ["active-gateway", "ip"] and n >= 3:
             return self._active_gateway(iface, w[2:])
         elif w[:2] == ["spanning-tree", "port-type"] and n == 3 and w[2] in ("admin-edge", "admin-network"):
@@ -417,6 +467,7 @@ class _Reader:
         for iface in self.device.interfaces.values():
             if iface.lag and iface.lacp_mode is None:
                 iface.lacp_mode = LacpMode.STATIC
+        ospf_text.attach(self.device, self._ospf_areas, self._ospf_passive)
 
 
     def _voice_port(self, iface: Interface) -> None:

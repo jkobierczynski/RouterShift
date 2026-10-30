@@ -1,3 +1,5 @@
+import re
+
 from helpers import sample
 
 from routershift.convert import convert, parse
@@ -44,8 +46,8 @@ def test_aoss_to_aoscx() -> None:
 
 
 def test_ios_to_aoss() -> None:
-    # without its HSRP group the switch only needs a default gateway (test_fhrp covers the group)
-    text = "".join(line for line in sample("ios_access.cfg").splitlines(True) if not line.startswith(" standby"))
+    # without its HSRP group and OSPF the switch only needs a default gateway (test_fhrp and test_ospf cover those)
+    text = re.sub(r"router ospf 1\n( .*\n)*|  ?standby .*\n", "", sample("ios_access.cfg"))
     out, report = convert(text, "ios", "aoss")
     assert 'hostname "sw-access-01"\n' in out
     assert "time timezone 60\n" in out

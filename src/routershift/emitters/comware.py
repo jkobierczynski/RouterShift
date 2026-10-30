@@ -11,7 +11,8 @@ from typing import Callable, List, Tuple
 
 from .. import acl as acl_text
 from .. import fhrp
-from ..model import AclAction, AclEntry, Device, FhrpGroup, Interface, InterfaceKind, LacpMode, StaticRoute, StpMode, SwitchportMode
+from .. import ospf as ospf_text
+from ..model import AclAction, AclEntry, Device, FhrpGroup, Interface, Ospf, InterfaceKind, LacpMode, StaticRoute, StpMode, SwitchportMode
 from ..names import PortMapper
 from ..parsers.comware import ranges
 from ..parsers.ioslike import _vlan_ids
@@ -48,6 +49,8 @@ class Writer:
         self.vlans()
         self.spanning_tree()
         self.acls()
+        for p in self.device.ospf:
+            self.ospf(p)
         order = {InterfaceKind.LAG: 0}
         for iface in sorted(self.device.interfaces.values(), key=lambda i: order.get(i.kind, 1)):
             self.interface(iface)
@@ -248,6 +251,13 @@ class Writer:
                 add(Severity.REVIEW, "acl-missing", f"ACL {acl_name} is applied but not defined; left out")
         for g in self.groups.get(iface.name, []):
             lines += self._vrrp(g, fhrp.adder(self.report, name, g))
+        for p in self.device.ospf:
+            if iface.name in p.interface_areas:
+                lines.append(f"ospf {p.process} area {p.interface_areas[iface.name]}")
+        if iface.ospf_cost is not None:
+            lines.append(f"ospf cost {iface.ospf_cost}")
+        if iface.ospf_network:
+            lines.append(f"ospf network-type {'p2p' if iface.ospf_network == 'point-to-point' else 'broadcast'}")
         if iface.helper_addresses:
             lines.append("dhcp select relay")
             lines += [f"dhcp relay server-address {helper}" for helper in iface.helper_addresses]
@@ -260,6 +270,35 @@ class Writer:
         if (iface.source_name or iface.name, name) in self.port.renumbered:
             add(Severity.APPROX, "port-renamed",
                 f"named {name} without a port map; check it against the cabling of the new device")
+
+    def ospf(self, p: Ospf) -> None:
+        self.report.item("ospf", ospf_text.label(p))
+        header = f"ospf {p.process}" + (f" router-id {p.router_id}" if p.router_id else "") + (
+            f" vpn-instance {p.vrf}" if p.vrf else "")
+        lines: List[str] = []
+        if p.passive_default:
+            lines.append("silent-interface all")
+            lines += [f"undo silent-interface {self.port(n)}" for n in p.active_interfaces]
+        else:
+            lines += [f"silent-interface {self.port(n)}" for n in p.passive_interfaces]
+        for source in p.redistribute:
+            lines.append(f"import-route {'direct' if source == 'connected' else source}")
+        if p.default_originate:
+            lines.append("default-route-advertise" + (" always" if p.default_originate == "always" else ""))
+        if p.reference_bandwidth is not None:
+            lines.append(f"bandwidth-reference {p.reference_bandwidth}")
+        areas = {n.area for n in p.networks} | set(p.area_types)
+        for dotted in sorted(areas, key=ospf_text.area_number):
+            lines.append(f"area {dotted}")
+            for network in p.networks:
+                if network.area == dotted:
+                    net = ipaddress.ip_network(network.prefix)
+                    lines.append(f"{_IND}network {net.network_address} {net.hostmask}")
+            if dotted in p.area_types:
+                lines.append(f"{_IND}{p.area_types[dotted]}")
+        self.out.append(header)
+        self.out += [_IND + line for line in lines]
+        self.block_end()
 
     def _vrrp(self, g: FhrpGroup, add: fhrp.Add) -> List[str]:
         pre = f"vrrp vrid {g.group}"

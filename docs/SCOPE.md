@@ -33,7 +33,7 @@ platform converts to and from all the others.
 | Static routes | `StaticRoute` | 1 |
 | Gateway redundancy: HSRP, VRRP, anycast gateways (IPv4) | `FhrpGroup` | 2 (done) |
 | Spanning tree mode, edge ports, BPDU guard | `Device.stp_mode`, `Interface` | 2 |
-| OSPFv2 | `Ospf` | 2 |
+| OSPFv2: processes per VRF, areas and area types, passive interfaces, redistribution, cost, network type | `Ospf`, `Interface.ospf_cost` | 2 (done) |
 | BGP | `Bgp`, `BgpNeighbor` | 2 |
 | Access lists (IPv4 and IPv6) and their interface bindings | `Acl`, `AclEntry`, `Interface.acl_in` ... | 2 (done) |
 | SNMP, local users | `Snmp`, `LocalUser` | 2 |
@@ -92,6 +92,20 @@ platform converts to and from all the others.
   `ip routing` and `router vrrp`.
 * Authentication, tracking, preempt delays and IPv6 groups are listed under "Not understood" for now (secrets
   masked).
+
+## OSPF
+
+* A process keeps its number, router ID, VRF, network statements, interface areas, passive interfaces (default
+  passive with exceptions, or the other way round), stub and NSSA areas, redistribution of connected, static and BGP
+  routes, default-route origination and reference bandwidth. Interfaces keep their cost and network type.
+* IOS, EOS and Comware write network statements as they are. AOS-CX and AOS-S have none: the writer puts the area on
+  every interface a statement matches (the most specific one wins) and the report says so, because an interface added
+  later is not picked up.
+* Areas are kept in dotted form; IOS shows them as numbers (`area 0`), AOS-S calls the backbone `backbone`.
+* AOS-S runs one process in one routing table, without NSSA, default-route origination or reference bandwidth;
+  what it can't hold is flagged. Its router ID is the global `ip router-id`.
+* Authentication, timers, summaries, virtual links and redistribution through route maps are listed under "Not
+  understood" for now.
 
 ## Port names
 

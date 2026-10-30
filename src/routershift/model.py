@@ -129,6 +129,8 @@ class Interface:
     stp_portfast: Optional[bool] = None
     stp_bpduguard: Optional[bool] = None
     fhrp: List["FhrpGroup"] = field(default_factory=list)
+    ospf_cost: Optional[int] = None
+    ospf_network: str = ""  # "", "point-to-point", "broadcast"
     origin: Origin = field(default_factory=Origin)
 
 
@@ -170,21 +172,32 @@ class StaticRoute:
 
 @dataclass
 class OspfNetwork:
-    prefix: str
+    prefix: str  # CIDR
     area: str  # dotted form, "0.0.0.0"
 
 
 @dataclass
 class Ospf:
+    """An OSPFv2 process. Interface names are canonical; areas are in dotted form."""
+
     process: str = "1"
     router_id: str = ""
     vrf: str = ""
-    networks: List[OspfNetwork] = field(default_factory=list)
-    interface_areas: Dict[str, str] = field(default_factory=dict)  # interface -> area
-    passive_interfaces: List[str] = field(default_factory=list)
+    networks: List[OspfNetwork] = field(default_factory=list)  # network statements, in order
+    interface_areas: Dict[str, str] = field(default_factory=dict)  # interface -> area, set on the interface
     passive_default: bool = False
+    passive_interfaces: List[str] = field(default_factory=list)  # passive although the default is not
+    active_interfaces: List[str] = field(default_factory=list)  # not passive although the default is
+    area_types: Dict[str, str] = field(default_factory=dict)  # area -> "stub", "stub no-summary", "nssa", ...
     redistribute: List[str] = field(default_factory=list)  # "connected", "static", "bgp"
+    default_originate: str = ""  # "", "on", "always"
+    reference_bandwidth: Optional[int] = None  # Mbit/s
     origin: Origin = field(default_factory=Origin)
+
+    def passive(self, interface: str) -> bool:
+        if self.passive_default:
+            return interface not in self.active_interfaces
+        return interface in self.passive_interfaces
 
 
 @dataclass
