@@ -10,6 +10,7 @@ import ipaddress
 from typing import Callable, List, Tuple
 
 from .. import acl as acl_text
+from .. import dhcp as dhcp_text
 from .. import fhrp
 from .. import ospf as ospf_text
 from ..model import (AclAction, AclEntry, BgpNeighbor, Device, FhrpGroup, Interface, InterfaceKind, LacpMode, Ospf,
@@ -52,6 +53,7 @@ class Writer:
         self.acls()
         for p in self.device.ospf:
             self.ospf(p)
+        self.dhcp()
         order = {InterfaceKind.LAG: 0}
         for iface in sorted(self.device.interfaces.values(), key=lambda i: order.get(i.kind, 1)):
             self.interface(iface)
@@ -302,6 +304,41 @@ class Writer:
         self.out.append(header)
         self.out += [_IND + line for line in lines]
         self.block_end()
+
+    def dhcp(self) -> None:
+        relay = any(i.helper_addresses for i in self.device.interfaces.values())
+        if not self.device.dhcp_pools and not relay:
+            return
+        self.out.append(f"{_IND}dhcp enable")  # relay and server both need it
+        for pool in self.device.dhcp_pools:
+            vpn = f" vpn-instance {pool.vrf}" if pool.vrf else ""
+            for first, last in dhcp_text.exclusions(pool):
+                self.out.append(f"{_IND}dhcp server forbidden-ip {first}" + (f" {last}" if last != first else "") + vpn)
+        self.block_end()
+        for pool in self.device.dhcp_pools:
+            label = dhcp_text.label(pool)
+            if not pool.network:
+                self.report.skip("dhcp", label, "dhcp-network", "a pool without a network (a host binding) is not written")
+                continue
+            self.report.item("dhcp", label)
+            net = ipaddress.ip_network(pool.network)
+            lines = [f"network {net.network_address} mask {net.netmask}"]
+            if pool.default_routers:
+                lines.append("gateway-list " + " ".join(pool.default_routers))
+            if pool.dns_servers:
+                lines.append("dns-list " + " ".join(pool.dns_servers))
+            if pool.domain_name:
+                lines.append(f"domain-name {pool.domain_name}")
+            if pool.lease_seconds == 0:
+                lines.append("expired unlimited")
+            elif pool.lease_seconds is not None:
+                days, hours, minutes = dhcp_text.lease_parts(pool.lease_seconds)
+                lines.append(f"expired day {days} hour {hours} minute {minutes}")
+            if pool.vrf:
+                lines.append(f"vpn-instance {pool.vrf}")
+            self.out.append(f"dhcp server ip-pool {pool.name.replace(' ', '_')}")
+            self.out += [_IND + line for line in lines]
+            self.block_end()
 
     def bgp(self) -> None:
         bgp = self.device.bgp

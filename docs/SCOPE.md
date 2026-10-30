@@ -31,6 +31,7 @@ platform converts to and from all the others.
 | Link aggregation and LACP | `Interface.lag`, `lacp_mode` | 1 |
 | IPv4/IPv6 addressing, DHCP relay, VRFs | `Interface`, `Device.vrfs` | 1 |
 | Static routes | `StaticRoute` | 1 |
+| DHCP server: pools, ranges and exclusions, gateways, DNS, domain, lease | `DhcpPool` | 2 (done) |
 | Gateway redundancy: HSRP, VRRP, anycast gateways (IPv4) | `FhrpGroup` | 2 (done) |
 | Spanning tree mode, edge ports, BPDU guard | `Device.stp_mode`, `Interface` | 2 |
 | OSPFv2: processes per VRF, areas and area types, passive interfaces, redistribution, cost, network type | `Ospf`, `Interface.ospf_cost` | 2 (done) |
@@ -119,6 +120,18 @@ platform converts to and from all the others.
 * AOS-S is not written: its BGP depends on the model and release, and the report asks a person to configure it.
 * Passwords, timers, route maps, prefix lists, communities other than standard, and BGP in VRFs are listed under
   "Not understood" for now (secrets masked).
+
+## DHCP server
+
+* A pool keeps its network, the addresses it hands out, default routers, DNS servers, domain name, lease time and
+  VRF. DHCP relay (helper addresses) was already converted with the interfaces.
+* IOS and Comware exclude addresses (`ip dhcp excluded-address`, `dhcp server forbidden-ip`); AOS-CX, AOS-S and EOS
+  list ranges. The readers turn exclusions into ranges and the writers turn ranges back into exclusions, so both
+  directions are exact.
+* EOS (4.22 and later) writes `dhcp server` with a subnet per pool, and `dhcp server ipv4` on the interfaces in a
+  pool's subnet. It takes one gateway per subnet and one domain name per VRF; anything more is reported.
+* Pools without a network (static host bindings), DHCP options and IPv6 pools are listed under "Not understood" for
+  now.
 
 ## Port names
 

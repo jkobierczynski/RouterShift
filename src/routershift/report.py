@@ -57,6 +57,7 @@ _KIND_TITLES = [
     ("ospf", "OSPF"),
     ("bgp", "BGP"),
     ("acl", "Access lists"),
+    ("dhcp", "DHCP server"),
     ("management", "Management"),
     ("unparsed", "Not understood"),
 ]

@@ -11,9 +11,10 @@ from typing import Callable, Dict, List
 
 from .. import acl as acl_text
 from .. import bgp as bgp_text
+from .. import dhcp as dhcp_text
 from .. import fhrp
 from .. import ospf as ospf_text
-from ..model import (AclAction, Bgp, BgpNeighbor, Device, FhrpGroup, Interface, InterfaceKind, LacpMode, Ospf,
+from ..model import (AclAction, Bgp, BgpNeighbor, Device, DhcpPool, FhrpGroup, Interface, InterfaceKind, LacpMode, Ospf,
                      StaticRoute, StpMode, SwitchportMode)
 from ..names import PortMapper
 from ..report import Report, Severity
@@ -64,6 +65,7 @@ class Writer:
             self.interface(iface)
         self.routing()
         self.acls()
+        self.dhcp()
         self.services()
         self.banner()
         self.out.append("end")
@@ -175,6 +177,8 @@ class Writer:
         lines += self._acl_bindings(iface, add)
         lines += self._fhrp(iface, name)
         lines += self._ospf_interface(iface)
+        if not self.ios and any(self._serves(pool, iface) for pool in self.device.dhcp_pools):
+            lines.append("dhcp server ipv4")
         if iface.mtu is not None:
             mtu = iface.mtu
             if self.ios and mtu > _IOS_MAX_MTU:
@@ -375,6 +379,86 @@ class Writer:
             body.append("shutdown")
         return [f"vrrp {g.group} address-family ipv4"] + [f"{self.ind}{line}" for line in body] + [
             f"{self.ind}exit-vrrp"]
+
+    # DHCP server ------------------------------------------------------------------------------------------------------
+
+    @staticmethod
+    def _serves(pool: DhcpPool, iface: Interface) -> bool:
+        return bool(pool.network) and pool.vrf == iface.vrf and any(
+            ipaddress.ip_interface(a).ip in ipaddress.ip_network(pool.network) for a in iface.ipv4)
+
+    def dhcp(self) -> None:
+        if self.ios:
+            for pool in self.device.dhcp_pools:
+                self._ios_pool(pool)
+            return
+        for vrf in sorted({p.vrf for p in self.device.dhcp_pools}):
+            pools = [p for p in self.device.dhcp_pools if p.vrf == vrf]
+            self.out.append("dhcp server" + (f" vrf {self.vrf(vrf)}" if vrf else ""))
+            domains = [p.domain_name for p in pools if p.domain_name]
+            if domains:
+                self.out.append(f"{self.ind}dns domain name ipv4 {domains[0]}")
+            for pool in pools:
+                self._eos_subnet(pool, domains[0] if domains else "")
+            self.out.append("!")
+
+    def _ios_pool(self, pool: DhcpPool) -> None:
+        label = dhcp_text.label(pool)
+        if not pool.network:
+            self.report.skip("dhcp", label, "dhcp-network", "a pool without a network (a host binding) is not written")
+            return
+        self.report.item("dhcp", label)
+        vrf = f"vrf {self.vrf(pool.vrf)} " if pool.vrf else ""
+        for first, last in dhcp_text.exclusions(pool):
+            self.out.append(f"ip dhcp excluded-address {vrf}{first}" + (f" {last}" if last != first else ""))
+        self.out.append(f"ip dhcp pool {pool.name.replace(' ', '_')}")
+        lines: List[str] = []
+        if pool.vrf:
+            lines.append(f"vrf {self.vrf(pool.vrf)}")
+        if pool.network:
+            net = ipaddress.ip_network(pool.network)
+            lines.append(f"network {net.network_address} {net.netmask}")
+        if pool.default_routers:
+            lines.append("default-router " + " ".join(pool.default_routers))
+        if pool.dns_servers:
+            lines.append("dns-server " + " ".join(pool.dns_servers))
+        if pool.domain_name:
+            lines.append(f"domain-name {pool.domain_name}")
+        if pool.lease_seconds == 0:
+            lines.append("lease infinite")
+        elif pool.lease_seconds is not None:
+            days, hours, minutes = dhcp_text.lease_parts(pool.lease_seconds)
+            lines.append(f"lease {days} {hours} {minutes}")
+        self.out += [self.ind + line for line in lines]
+        self.out.append("!")
+
+    def _eos_subnet(self, pool: DhcpPool, domain: str) -> None:
+        label = dhcp_text.label(pool)
+        self.report.item("dhcp", label)
+
+        def add(severity: Severity, code: str, message: str) -> None:
+            self.report.add("dhcp", label, severity, code, message)
+
+        if not pool.network:
+            self.report.skip("dhcp", label, "dhcp-network", "a pool without a network (a host binding) is not written")
+            return
+        lines = [f"name {pool.name.replace(' ', '_')}"]
+        lines += [f"range {first} {last}" for first, last in pool.ranges]
+        lines += [f"default-gateway {router}" for router in pool.default_routers[:1]]
+        if len(pool.default_routers) > 1:
+            add(Severity.APPROX, "dhcp-router", "EOS hands out one gateway; the others are left out")
+        if pool.dns_servers:
+            lines.append("dns server " + " ".join(pool.dns_servers))
+        if pool.domain_name and pool.domain_name != domain:
+            add(Severity.APPROX, "dhcp-domain", f"EOS takes one domain name per VRF; {domain} is handed out")
+        if pool.lease_seconds == 0:
+            add(Severity.APPROX, "dhcp-lease", "an infinite lease is written as 2000 days; check the EOS release takes it")
+            lines.append("lease time 2000 days 0 hours 0 minutes")
+        elif pool.lease_seconds is not None:
+            days, hours, minutes = dhcp_text.lease_parts(pool.lease_seconds)
+            lines.append(f"lease time {days} days {hours} hours {minutes} minutes")
+        self.out.append(f"{self.ind}subnet {pool.network}")
+        self.out += [self.ind * 2 + line for line in lines]
 
     # access lists ----------------------------------------------------------------------------------------------------
 

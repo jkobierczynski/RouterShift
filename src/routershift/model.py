@@ -25,7 +25,7 @@ import dataclasses
 import json
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 
 class InterfaceKind(str, Enum):
@@ -255,6 +255,22 @@ class Acl:
 
 
 @dataclass
+class DhcpPool:
+    """A DHCP server pool. Addresses are handed out from ``ranges``; platforms that exclude addresses instead
+    (IOS, Comware) are read into ranges and written back as exclusions."""
+
+    name: str
+    network: str = ""  # CIDR
+    ranges: List[Tuple[str, str]] = field(default_factory=list)  # first, last
+    default_routers: List[str] = field(default_factory=list)
+    dns_servers: List[str] = field(default_factory=list)
+    domain_name: str = ""
+    lease_seconds: Optional[int] = None  # None: the platform default; 0: infinite
+    vrf: str = ""
+    origin: Origin = field(default_factory=Origin)
+
+
+@dataclass
 class Snmp:
     communities: Dict[str, str] = field(default_factory=dict)  # community -> "ro" / "rw"; secrets stay out of reports
     location: str = ""
@@ -290,6 +306,7 @@ class Device:
     ospf: List[Ospf] = field(default_factory=list)
     bgp: Optional[Bgp] = None
     acls: Dict[str, Acl] = field(default_factory=dict)
+    dhcp_pools: List[DhcpPool] = field(default_factory=list)
     stp_mode: Optional[StpMode] = None
     snmp: Snmp = field(default_factory=Snmp)
     users: List[LocalUser] = field(default_factory=list)
