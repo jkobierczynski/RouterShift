@@ -16,7 +16,8 @@ from .model import Unparsed
 
 # Words after which a configuration line carries a secret; the report shows "<removed>" instead.
 _SECRET_WORDS = {"community", "password", "secret", "key", "key-string", "md5", "sha", "auth", "priv"}
-_SECRET_TYPES = {"ciphertext", "plaintext", "encrypted", "cipher"}
+# Words between a secret word and the secret: its form, or (SNMP) its access
+_SECRET_TYPES = {"ciphertext", "plaintext", "encrypted", "cipher", "hash", "simple", "read", "write"}
 
 
 def redact(text: str) -> str:
@@ -27,7 +28,7 @@ def redact(text: str) -> str:
         if words[n].lower() in _SECRET_WORDS:
             n += 1
             # "password 7 <hash>", "secret 0 <text>", "password ciphertext <hash>": the type stays, the secret goes
-            if n < len(words) - 1 and (words[n].isdigit() and len(words[n]) == 1 or words[n] in _SECRET_TYPES):
+            while n < len(words) - 1 and (words[n].isdigit() and len(words[n]) == 1 or words[n] in _SECRET_TYPES):
                 n += 1
             result[n] = "<removed>"
         n += 1

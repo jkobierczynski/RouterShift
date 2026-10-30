@@ -10,7 +10,7 @@ import re
 from typing import Dict, List, Optional, Tuple
 
 from .errors import RoutershiftError
-from .model import Device, Interface, InterfaceKind
+from .model import Device, Interface, InterfaceKind, SwitchportMode
 
 # Cisco-style prefixes, longest first so that "Te" does not swallow "TenGigabitEthernet". Value: kind, media.
 _PREFIXES: List[Tuple[str, InterfaceKind, str]] = [
@@ -37,6 +37,12 @@ _ABBREVIATIONS = {
     "ma": "Management", "mgmt": "Management", "tu": "Tunnel",
 }
 _NAME = re.compile(r"^([A-Za-z-]+?)\s*(\d[\d/.:]*)$")
+
+_SLOT_BASE = {"aoscx": 1}
+
+# How Comware names a port of each speed class.
+_COMWARE_PREFIX = {"100g": "HundredGigE", "40g": "FortyGigE", "25g": "Twenty-FiveGigE", "10g": "Ten-GigabitEthernet",
+                   "1g": "GigabitEthernet"}
 
 # How IOS names a port of each speed class.
 _IOS_PREFIX = {"100g": "HundredGigE", "40g": "FortyGigabitEthernet", "25g": "TwentyFiveGigE",
@@ -138,11 +144,8 @@ class PortMapper:
             members = {i.name[len("Ethernet"):].split("/")[0] for i in self.device.interfaces.values()
                        if i.kind == InterfaceKind.ETHERNET}
             return f"{member}/{port}" if len(members) > 1 else str(port)
-        # IOS counts the slot of the fixed ports from 0, AOS-CX from 1
-        if self.device.platform == "aoscx" and self.target == "ios":
-            slot -= 1
-        elif self.device.platform != "aoscx" and self.target == "aoscx":
-            slot += 1
+        # IOS and Comware count the slot of the fixed ports from 0, AOS-CX from 1
+        slot += _SLOT_BASE.get(self.target, 0) - _SLOT_BASE.get(self.device.platform, 0)
         return f"{member}/{slot}/{port}"
 
     def _default_physical(self, iface: Interface, index: int, kept: Optional[str]) -> str:
@@ -153,6 +156,8 @@ class PortMapper:
             return kept or f"1/1/{index}"
         if self.target == "aoss":
             return kept or str(index)
+        if self.target == "comware":
+            return f"{_COMWARE_PREFIX.get(iface.media, 'GigabitEthernet')}{kept or f'1/0/{index}'}"
         # eos: front-panel ports are numbered 1..n
         return f"Ethernet{index}"
 
@@ -162,6 +167,8 @@ class PortMapper:
             return self._aoscx_logical(iface)
         if self.target == "aoss":
             return self._aoss_logical(iface)
+        if self.target == "comware":
+            return self._comware_logical(iface)
         if iface.kind == InterfaceKind.LAG:
             number = name[len("Port-channel"):]
             return f"Port-Channel{number}" if self.target == "eos" else f"Port-channel{number}"
@@ -170,6 +177,21 @@ class PortMapper:
         if iface.kind == InterfaceKind.SUBINTERFACE and iface.parent:
             tag = name.rsplit(".", 1)[1]
             return f"{self(iface.parent)}.{tag}"
+        return name
+
+    def _comware_logical(self, iface: Interface) -> str:
+        name = iface.name
+        if iface.kind == InterfaceKind.LAG:
+            word = "Route-Aggregation" if iface.mode == SwitchportMode.ROUTED else "Bridge-Aggregation"
+            return f"{word}{name[len('Port-channel'):]}"
+        if iface.kind == InterfaceKind.VLAN:
+            return f"Vlan-interface{name[len('Vlan'):]}"
+        if iface.kind == InterfaceKind.LOOPBACK:
+            return f"LoopBack{name[len('Loopback'):]}"
+        if iface.kind == InterfaceKind.MANAGEMENT:
+            return "M-GigabitEthernet0/0/0"
+        if iface.kind == InterfaceKind.SUBINTERFACE and iface.parent:
+            return f"{self(iface.parent)}.{name.rsplit('.', 1)[1]}"
         return name
 
     def _aoss_logical(self, iface: Interface) -> str:

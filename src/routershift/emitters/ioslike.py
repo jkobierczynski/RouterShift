@@ -286,7 +286,7 @@ class Writer:
         if route.distance is not None:
             words.append(str(route.distance))
         if route.name:
-            words += ["name", route.name]
+            words += ["name", route.name.replace(" ", "_")]  # one word
         self.report.item("route", f"{route.vrf + ' ' if route.vrf else ''}{route.prefix}")
         return " ".join(words)
 
