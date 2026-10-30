@@ -19,3 +19,12 @@ jobs:
       - run: pip install -e ".[dev]"
       - run: pytest -q
       - run: mypy
+
+  # The one check the branch ruleset requires: it passes only when every Python version above passed.
+  build-and-test:
+    name: build and test
+    if: always()
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - run: test "${{ needs.test.result }}" = "success"
