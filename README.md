@@ -14,7 +14,8 @@ which does the same for firewall policies.
 
 ## Status
 
-Pre-alpha. Cisco IOS / IOS XE, Arista EOS and HPE Aruba AOS-CX convert in every
+Pre-alpha. Cisco IOS / IOS XE, Arista EOS, HPE Aruba AOS-CX and AOS-S (ProCurve)
+convert in every
 direction for the system
 settings (hostname, domain, DNS, NTP, syslog, banner, spanning-tree mode), VLANs,
 interfaces (switchport access and trunk, voice VLAN, LAGs and LACP, SVIs,

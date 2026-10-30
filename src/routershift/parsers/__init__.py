@@ -9,10 +9,11 @@ from __future__ import annotations
 from typing import Callable, Dict
 
 from ..model import Device
-from . import aoscx, ioslike
+from . import aoscx, aoss, ioslike
 
 PARSERS: Dict[str, Callable[[str], Device]] = {
     "ios": lambda text: ioslike.parse(text, "ios"),
     "eos": lambda text: ioslike.parse(text, "eos"),
     "aoscx": aoscx.parse,
+    "aoss": aoss.parse,
 }

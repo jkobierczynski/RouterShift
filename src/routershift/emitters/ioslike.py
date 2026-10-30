@@ -12,6 +12,7 @@ from typing import Callable, Dict, List
 from ..model import Device, Interface, InterfaceKind, LacpMode, StaticRoute, StpMode, SwitchportMode
 from ..names import PortMapper
 from ..report import Report, Severity
+from ..timezones import offset_minutes
 
 _IOS_MGMT_VRF = "Mgmt-vrf"  # fixed name of the management VRF of a Catalyst
 _IOS_MAX_MTU = 9198
@@ -312,11 +313,19 @@ class Writer:
     def _timezone(self, tz: str) -> None:
         words = tz.split()
         ios_style = len(words) >= 2 and words[1].lstrip("-").isdigit()
-        if self.ios and ios_style or not self.ios and not ios_style:
+        tz_database = "/" in tz or tz.upper() == "UTC"
+        if self.ios and ios_style or not self.ios and tz_database:
             if not self.ios and "/" in tz:  # tz database names are capitalised on EOS: America/New_York
                 tz = "/".join("_".join(p[:1].upper() + p[1:] for p in part.split("_")) for part in tz.split("/"))
             self.out.append(f"clock timezone {tz}")
             self.report.item("system", "time zone")
+            return
+        minutes = offset_minutes(tz)
+        if self.ios and minutes is not None:
+            sign = "-" if minutes < 0 else ""
+            self.out.append(f"clock timezone UTC {sign}{abs(minutes) // 60} {abs(minutes) % 60}")
+            self.report.add("system", "time zone", Severity.APPROX, "timezone",
+                            f"time zone '{tz}' written as a fixed offset; add 'clock summer-time' if it has one")
             return
         self.report.add("system", "time zone", Severity.REVIEW, "timezone",
                         f"time zone '{tz}' cannot be translated reliably (IOS takes a name and an offset, EOS a "

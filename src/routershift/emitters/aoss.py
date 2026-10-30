@@ -1,0 +1,386 @@
+# RouterShift - multi-vendor network device configuration converter
+# Copyright (C) 2026 Jurgen Kobierczynski
+# SPDX-License-Identifier: GPL-3.0-or-later
+
+"""Writer for HPE Aruba AOS-S (ProCurve / ProVision, 16.x).
+
+The model's ports carry their VLANs; AOS-S lists the ports in each VLAN, so the
+writer gathers them per VLAN. What AOS-S cannot do is written the nearest way
+and reported: a routed port becomes a port in a VLAN of its own with the address
+on the VLAN, and VRFs other than the management one do not exist.
+"""
+
+from __future__ import annotations
+
+import ipaddress
+import re
+from typing import Dict, List, Optional, Set, Tuple
+
+from ..model import Device, Interface, InterfaceKind, LacpMode, StaticRoute, StpMode, SwitchportMode, Vlan
+from ..names import PortMapper
+from ..parsers.ioslike import _vlan_ids
+from ..report import Report, Severity
+from ..timezones import offset_minutes
+
+_IND = "   "
+_PORT = re.compile(r"^(.*?)(\d+)$")
+_TRANSIT_VLANS = range(3999, 3000, -1)  # where a routed port's VLAN is taken from
+
+
+def port_list(names: List[str]) -> str:
+    """``1,2,3,5,Trk1`` as ``1-3,5,Trk1``."""
+    parsed: List[Tuple[str, int, str]] = []
+    for name in names:
+        m = _PORT.match(name)
+        parsed.append((m.group(1), int(m.group(2)), name) if m else (name, -1, name))
+    parsed.sort(key=lambda p: (p[0].lower().startswith("trk"), p[0], p[1]))
+    parts: List[str] = []
+    i = 0
+    while i < len(parsed):
+        prefix, number, name = parsed[i]
+        j = i
+        while (number >= 0 and j + 1 < len(parsed) and parsed[j + 1][0] == prefix
+               and parsed[j + 1][1] == parsed[j][1] + 1):
+            j += 1
+        parts.append(name if j == i else f"{name}-{parsed[j][2]}")
+        i = j + 1
+    return ",".join(parts)
+
+
+def _quote(text: str) -> str:
+    return '"' + text.replace('"', "'") + '"'
+
+
+class Writer:
+    def __init__(self, device: Device, ports: PortMapper, report: Report) -> None:
+        self.device = device
+        self.port = ports
+        self.report = report
+        self.out: List[str] = []
+        self.mgmt_vrfs = {i.vrf for i in device.interfaces.values() if i.kind == InterfaceKind.MANAGEMENT and i.vrf}
+        self.vlans: Dict[int, Vlan] = dict(device.vlans)
+        self.untagged: Dict[int, List[str]] = {}
+        self.tagged: Dict[int, List[str]] = {}
+        self.no_untagged: List[str] = []
+        self.svis: Dict[int, Interface] = {}
+        self.voice: Set[int] = set()
+        self.gateway_only: Optional[StaticRoute] = None  # the one default route, written as ip default-gateway
+
+    def label(self, iface: Interface) -> str:
+        return f"{iface.source_name or iface.name} -> {self.port(iface.name)}"
+
+    def add(self, iface: Interface, severity: Severity, code: str, message: str) -> None:
+        self.report.add("interface", self.label(iface), severity, code, message)
+
+    def emit(self) -> str:
+        self.gather()
+        self.system()
+        self.routing_mode()
+        self.trunks()
+        self.oobm()
+        self.interfaces()
+        self.routes()
+        self.vlan_blocks()
+        self.spanning_tree()
+        self.report.unparsed(self.device.unparsed)
+        return "\n".join(self.out) + "\n"
+
+    # VLAN membership -------------------------------------------------------------------------------------------------
+
+    def gather(self) -> None:
+        used = set(self.vlans) | {i.access_vlan for i in self.device.interfaces.values() if i.access_vlan}
+        transit = (v for v in _TRANSIT_VLANS if v not in used)
+        for iface in self.device.interfaces.values():
+            if iface.kind == InterfaceKind.VLAN:
+                self.svis[int(iface.name[len("Vlan"):])] = iface
+        for iface in self.device.interfaces.values():
+            name = self.port(iface.name)
+            if iface.kind == InterfaceKind.SUBINTERFACE:
+                self.report.skip("interface", self.label(iface), "subinterface",
+                                 "AOS-S has no subinterfaces; carry the VLAN on a tagged port and put the address on "
+                                 "the VLAN")
+                continue
+            if iface.kind not in (InterfaceKind.ETHERNET, InterfaceKind.LAG) or iface.lag:
+                continue
+            if iface.kind == InterfaceKind.LAG:
+                self.report.item("interface", self.label(iface))
+            if iface.mode == SwitchportMode.ROUTED:
+                vid = next(transit)
+                self.vlans[vid] = Vlan(vid, name=f"routed {name}")
+                svi = Interface(f"Vlan{vid}", InterfaceKind.VLAN, ipv4=list(iface.ipv4), ipv6=list(iface.ipv6),
+                                dhcp_client=iface.dhcp_client, helper_addresses=list(iface.helper_addresses),
+                                vrf=iface.vrf)
+                self.svis[vid] = svi
+                self.untagged.setdefault(vid, []).append(name)
+                self.add(iface, Severity.APPROX, "routed-port",
+                         f"AOS-S has no routed ports: the port is untagged in VLAN {vid} of its own, which carries "
+                         "the address")
+            elif iface.mode == SwitchportMode.ACCESS:
+                self.untagged.setdefault(iface.access_vlan or 1, []).append(name)
+                if iface.voice_vlan is not None:
+                    self.tagged.setdefault(iface.voice_vlan, []).append(name)
+                    self.voice.add(iface.voice_vlan)
+            else:
+                native = iface.native_vlan or 1
+                allowed = _vlan_ids(iface.allowed_vlans) if iface.allowed_vlans else sorted(self.vlans)
+                if not iface.allowed_vlans:
+                    self.add(iface, Severity.APPROX, "trunk-all",
+                             "the trunk allows all VLANs; AOS-S tags a port per VLAN, so it is tagged in every VLAN "
+                             "of the configuration")
+                if native in allowed or not iface.allowed_vlans:
+                    self.untagged.setdefault(native, []).append(name)
+                else:
+                    self.no_untagged.append(name)  # untagged frames are dropped, as on the source
+                for vid in allowed:
+                    if vid != native:
+                        self.tagged.setdefault(vid, []).append(name)
+        if self.no_untagged:
+            self.vlans.setdefault(1, Vlan(1, name="DEFAULT_VLAN"))  # ports start untagged in it
+        for vid in set(self.untagged) | set(self.tagged):
+            self.vlans.setdefault(vid, Vlan(vid))
+
+    # system ----------------------------------------------------------------------------------------------------------
+
+    def system(self) -> None:
+        s = self.device.system
+        rep = self.report
+        if s.hostname:
+            self.out.append(f"hostname {_quote(s.hostname)}")
+            rep.item("system", "hostname")
+        if s.timezone:
+            minutes = offset_minutes(s.timezone)
+            if minutes is None:
+                rep.add("system", "time zone", Severity.REVIEW, "timezone",
+                        f"time zone '{s.timezone}' has no fixed offset; AOS-S takes 'time timezone <minutes>' and "
+                        "'time daylight-time-rule'; set it by hand")
+            else:
+                self.out.append(f"time timezone {minutes}")
+                rep.add("system", "time zone", Severity.APPROX, "timezone",
+                        "written as a fixed offset; add 'time daylight-time-rule' if the zone has summer time")
+        if s.ntp_servers:
+            self.out += ["timesync sntp", "sntp unicast"]
+            self.out += [f"sntp server priority {n} {server}" for n, server in enumerate(s.ntp_servers, 1)]
+            rep.item("system", "ntp servers")
+        if s.domain_name:
+            self.out.append(f"ip dns domain-name {_quote(s.domain_name)}")
+            rep.item("system", "domain name")
+        for n, server in enumerate(s.dns_servers, 1):
+            self.out.append(f"ip dns server-address priority {n} {server}")
+        if s.dns_servers:
+            rep.item("system", "name servers")
+        for host in s.syslog_servers:
+            self.out.append(f"logging {host}")
+        if s.syslog_servers:
+            rep.item("system", "syslog servers")
+        if s.service_vrf and s.service_vrf in self.mgmt_vrfs:
+            rep.add("system", "service vrf", Severity.APPROX, "oobm",
+                    "the source reaches its servers through the management VRF; AOS-S picks the out-of-band port "
+                    "by route, so check that the servers are reachable from oobm")
+        if s.banner_motd:
+            self.out.append(f"banner motd {_quote(s.banner_motd)}")
+            rep.item("system", "banner motd")
+        for vrf in self.device.vrfs:
+            if vrf not in self.mgmt_vrfs:
+                rep.add("system", f"vrf {vrf}", Severity.REVIEW, "vrf",
+                        "AOS-S has no VRFs: its interfaces and routes are written in the one routing table")
+
+    def routing_mode(self) -> None:
+        routes = [r for r in self.device.static_routes if r.vrf not in self.mgmt_vrfs]
+        l3_vlans = [v for v in self.svis.values() if v.ipv4 or v.dhcp_client]
+        default = [r for r in routes if r.prefix == "0.0.0.0/0" and r.next_hop]
+        if len(routes) == 1 and default and len(l3_vlans) <= 1:
+            self.out.append(f"ip default-gateway {default[0].next_hop}")  # a layer 2 switch
+            self.report.item("route", "0.0.0.0/0")
+            self.gateway_only = default[0]
+            return
+        if routes or len(l3_vlans) > 1:
+            self.out.append("ip routing")
+
+    def trunks(self) -> None:
+        lags: Dict[str, List[Interface]] = {}
+        for iface in self.device.interfaces.values():
+            if iface.lag:
+                lags.setdefault(iface.lag, []).append(iface)
+        for lag, members in lags.items():
+            modes = {m.lacp_mode for m in members}
+            word = "trunk" if modes <= {LacpMode.STATIC, None} else "lacp"
+            names = [self.port(m.name) for m in members]
+            self.out.append(f"trunk {port_list(names)} {self.port(lag).lower()} {word}")
+            if LacpMode.PASSIVE in modes:
+                self.report.add("interface", f"{lag} -> {self.port(lag)}", Severity.APPROX, "lacp-passive",
+                                "AOS-S trunks are LACP active; the source was passive")
+
+    def oobm(self) -> None:
+        for iface in self.device.interfaces.values():
+            if iface.kind != InterfaceKind.MANAGEMENT:
+                continue
+            self.report.item("interface", self.label(iface))
+            lines: List[str] = []
+            if iface.dhcp_client:
+                lines.append("ip address dhcp-bootp")
+            for n, cidr in enumerate(iface.ipv4):
+                if n:
+                    self.add(iface, Severity.REVIEW, "mgmt-secondary", f"oobm takes one address; {cidr} left out")
+                    continue
+                net = ipaddress.ip_interface(cidr)
+                lines.append(f"ip address {net.ip} {net.netmask}")
+            for route in self.device.static_routes:
+                if route.vrf and route.vrf == iface.vrf and route.prefix == "0.0.0.0/0" and route.next_hop:
+                    lines.append(f"ip default-gateway {route.next_hop}")
+            lines.append("disable" if iface.shutdown else "enable")
+            self.out.append("oobm")
+            self.out += [_IND + line for line in lines]
+            self.out.append(_IND + "exit")
+
+    def interfaces(self) -> None:
+        for iface in self.device.interfaces.values():
+            if iface.kind == InterfaceKind.LOOPBACK:
+                self.out.append(f"interface loopback {iface.name[len('Loopback'):]}")
+                for cidr in iface.ipv4:
+                    net = ipaddress.ip_interface(cidr)
+                    self.out.append(f"{_IND}ip address {net.ip} {net.netmask}")
+                self.out.append(_IND + "exit")
+                self.report.item("interface", self.label(iface))
+                continue
+            if iface.kind not in (InterfaceKind.ETHERNET,):
+                continue
+            label = self.label(iface)
+            self.report.item("interface", label)
+            if (iface.source_name or iface.name, self.port(iface.name)) in self.port.renumbered:
+                self.add(iface, Severity.APPROX, "port-renamed",
+                         f"named {self.port(iface.name)} without a port map; check it against the cabling of the "
+                         "new device")
+            lines: List[str] = []
+            if iface.description:
+                lines.append(f"name {_quote(iface.description)}")
+            if iface.shutdown:
+                lines.append("disable")
+            if iface.speed is not None:
+                lines.append(f"speed-duplex {iface.speed}-{iface.duplex or 'full'}")
+                self.add(iface, Severity.APPROX, "speed", "forced speed: check that the port takes it")
+            if iface.mtu is not None and iface.mtu > 1522:
+                self.add(iface, Severity.APPROX, "mtu",
+                         f"MTU {iface.mtu}: AOS-S sets jumbo frames per VLAN ('jumbo' in the VLAN), not per port")
+            if lines:
+                self.out.append(f"interface {self.port(iface.name)}")
+                self.out += [_IND + line for line in lines]
+                self.out.append(_IND + "exit")
+
+    def routes(self) -> None:
+        for route in self.device.static_routes:
+            label = f"{route.vrf + ' ' if route.vrf else ''}{route.prefix}"
+            if route.vrf in self.mgmt_vrfs:
+                self.report.item("route", label)
+                if route.prefix != "0.0.0.0/0":
+                    self.report.add("route", label, Severity.REVIEW, "oobm-route",
+                                    "oobm takes only a default gateway; this route is left out")
+                continue
+            if self.gateway_only is route:
+                continue
+            self.report.item("route", label)
+            if route.vrf:
+                self.report.add("route", label, Severity.APPROX, "vrf",
+                                f"VRF {route.vrf} does not exist on AOS-S; written in the one routing table")
+            net = ipaddress.ip_network(route.prefix)
+            if net.version == 4:
+                words = ["ip", "route", str(net.network_address), str(net.netmask)]
+            else:
+                words = ["ipv6", "route", str(net)]
+            if route.discard:
+                words.append("blackhole")
+            elif route.next_hop:
+                words.append(route.next_hop)
+            elif route.interface.startswith("Vlan"):
+                words += ["vlan", route.interface[len("Vlan"):]]
+            else:
+                self.report.add("route", label, Severity.REVIEW, "route-interface",
+                                f"AOS-S routes to a next hop or a VLAN, not to port {route.interface}; left out")
+                continue
+            if route.distance is not None:
+                words += ["distance", str(route.distance)]
+            if route.name:
+                words += ["name", _quote(route.name)]
+            self.out.append(" ".join(words))
+
+    def vlan_blocks(self) -> None:
+        all_ports = {p for members in self.untagged.values() for p in members}
+        for vid in sorted(self.vlans):
+            vlan = self.vlans[vid]
+            self.out.append(f"vlan {vid}")
+            if vlan.name:
+                self.out.append(f"{_IND}name {_quote(vlan.name)}")
+            if self.untagged.get(vid):
+                self.out.append(f"{_IND}untagged {port_list(self.untagged[vid])}")
+            if vid == 1:
+                elsewhere = sorted((all_ports | set(self.no_untagged)) - set(self.untagged.get(1, [])))
+                if elsewhere:
+                    self.out.append(f"{_IND}no untagged {port_list(elsewhere)}")
+            if self.tagged.get(vid):
+                self.out.append(f"{_IND}tagged {port_list(self.tagged[vid])}")
+            if vid in self.voice:
+                self.out.append(f"{_IND}voice")
+            svi = self.svis.get(vid)
+            if svi is not None:
+                self.out += [_IND + line for line in self._svi(svi)]
+            elif vid != 1 or self.untagged.get(1) or self.tagged.get(1):
+                self.out.append(f"{_IND}no ip address")
+            self.out.append(_IND + "exit")
+            if vid in self.device.vlans:
+                self.report.item("vlan", str(vid))
+        for vid, svi in self.svis.items():
+            if vid not in self.vlans:
+                self.report.skip("interface", self.label(svi), "svi-without-vlan",
+                                 f"VLAN {vid} is not defined, so its interface has nowhere to go")
+
+    def _svi(self, svi: Interface) -> List[str]:
+        if svi.name in self.device.interfaces:
+            self.report.item("interface", self.label(svi))
+        if svi.vrf and svi.vrf not in self.mgmt_vrfs and svi.name in self.device.interfaces:
+            self.add(svi, Severity.APPROX, "vrf", f"VRF {svi.vrf} does not exist on AOS-S; the address is in the "
+                     "one routing table")
+        lines: List[str] = []
+        if svi.dhcp_client:
+            lines.append("ip address dhcp-bootp")
+        for cidr in svi.ipv4:
+            net = ipaddress.ip_interface(cidr)
+            lines.append(f"ip address {net.ip} {net.netmask}")
+        if not lines:
+            lines.append("no ip address")
+        for cidr in svi.ipv6:
+            lines.append(f"ipv6 address {cidr}")
+        for helper in svi.helper_addresses:
+            lines.append(f"ip helper-address {helper}")
+        return lines
+
+    def spanning_tree(self) -> None:
+        mode = self.device.stp_mode
+        is_switch = bool(self.untagged) or bool(self.tagged)
+        if mode == StpMode.NONE or (mode is None and not is_switch):
+            return
+        self.out.append("spanning-tree")
+        if mode is None:
+            self.report.add("system", "spanning-tree mode", Severity.APPROX, "stp-default",
+                            "the source runs spanning tree in its default mode; AOS-S has it off until enabled, so "
+                            "MSTP is switched on")
+        elif mode == StpMode.RSTP:
+            self.out.append("spanning-tree force-version rstp-operation")
+            self.report.item("system", "spanning-tree mode")
+        elif mode == StpMode.RAPID_PVST:
+            self.out.append("spanning-tree mode rapid-pvst")
+            self.report.item("system", "spanning-tree mode")
+        elif mode == StpMode.MSTP:
+            self.report.item("system", "spanning-tree mode")
+        else:
+            self.out.append("spanning-tree mode rapid-pvst")
+            self.report.add("system", "spanning-tree mode", Severity.APPROX, "stp-mode",
+                            f"{mode.value} is not available on AOS-S, written as rapid-pvst")
+        edge = [self.port(i.name) for i in self.device.interfaces.values() if i.stp_portfast and not i.lag]
+        guard = [self.port(i.name) for i in self.device.interfaces.values() if i.stp_bpduguard and not i.lag]
+        if edge:
+            self.out.append(f"spanning-tree {port_list(edge)} admin-edge-port")
+        if guard:
+            self.out.append(f"spanning-tree {port_list(guard)} bpdu-protection")
+
+
+def emit(device: Device, ports: PortMapper, report: Report) -> str:
+    return Writer(device, ports, report).emit()

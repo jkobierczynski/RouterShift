@@ -133,6 +133,11 @@ class PortMapper:
         if len(parts) != 3 or not all(p.isdigit() for p in parts) or self.target == "eos":
             return None
         member, slot, port = (int(p) for p in parts)
+        if self.target == "aoss":
+            # stack members are member/port; a single switch numbers its ports 1..n
+            members = {i.name[len("Ethernet"):].split("/")[0] for i in self.device.interfaces.values()
+                       if i.kind == InterfaceKind.ETHERNET}
+            return f"{member}/{port}" if len(members) > 1 else str(port)
         # IOS counts the slot of the fixed ports from 0, AOS-CX from 1
         if self.device.platform == "aoscx" and self.target == "ios":
             slot -= 1
@@ -146,6 +151,8 @@ class PortMapper:
             return f"{prefix}{kept or f'1/0/{index}'}"
         if self.target == "aoscx":
             return kept or f"1/1/{index}"
+        if self.target == "aoss":
+            return kept or str(index)
         # eos: front-panel ports are numbered 1..n
         return f"Ethernet{index}"
 
@@ -153,6 +160,8 @@ class PortMapper:
         name = iface.name
         if self.target == "aoscx":
             return self._aoscx_logical(iface)
+        if self.target == "aoss":
+            return self._aoss_logical(iface)
         if iface.kind == InterfaceKind.LAG:
             number = name[len("Port-channel"):]
             return f"Port-Channel{number}" if self.target == "eos" else f"Port-channel{number}"
@@ -161,6 +170,18 @@ class PortMapper:
         if iface.kind == InterfaceKind.SUBINTERFACE and iface.parent:
             tag = name.rsplit(".", 1)[1]
             return f"{self(iface.parent)}.{tag}"
+        return name
+
+    def _aoss_logical(self, iface: Interface) -> str:
+        name = iface.name
+        if iface.kind == InterfaceKind.LAG:
+            return f"Trk{name[len('Port-channel'):]}"
+        if iface.kind == InterfaceKind.VLAN:
+            return f"vlan {name[len('Vlan'):]}"
+        if iface.kind == InterfaceKind.LOOPBACK:
+            return f"loopback {name[len('Loopback'):]}"
+        if iface.kind == InterfaceKind.MANAGEMENT:
+            return "oobm"
         return name
 
     def _aoscx_logical(self, iface: Interface) -> str:

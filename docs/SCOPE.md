@@ -14,7 +14,7 @@ approximated and what a person has to look at.
 | `junos` | Juniper Junos (EX, QFX, MX, SRX in switching/routing) | `show configuration \| display set`, or braces | `set` commands, for `load set` | 2 |
 | `nxos` | Cisco NX-OS | `show running-config` | CLI configuration | 2 |
 | `aoscx` | HPE Aruba AOS-CX (10.x) | `show running-config` | CLI configuration | 1 (done) |
-| `aoss` | HPE Aruba AOS-S (ProCurve / ProVision) | `show running-config` | CLI configuration | 2 |
+| `aoss` | HPE Aruba AOS-S (ProCurve / ProVision, 16.x) | `show running-config` | CLI configuration | 1 (done) |
 | `comware` | HPE Comware (FlexFabric, 5130/5510...) | `display current-configuration` | CLI configuration | 3 |
 
 Every reader writes to the model and every writer reads from it, so each new
@@ -37,6 +37,18 @@ platform converts to and from all the others.
 | Access lists, standard and extended | `Acl`, `AclEntry` | 2 |
 | SNMP, local users | `Snmp`, `LocalUser` | 2 |
 | Route maps, prefix lists, AAA/TACACS/RADIUS, QoS, MLAG/VSX/vPC, VXLAN/EVPN | to come | 3+ |
+
+### AOS-S specifics
+
+* VLANs list their ports (`untagged 1-3,Trk1`, `tagged 49`); the reader turns that into access and trunk ports and
+  the writer gathers the ports back per VLAN. A port in no VLAN is untagged in VLAN 1.
+* A port untagged in a data VLAN and tagged only in a VLAN marked `voice` is an access port with a voice VLAN.
+* Link aggregations are `trunk 47-48 trk1 lacp`; `Trk1` is the port-channel.
+* AOS-S has no routed ports: the writer puts such a port untagged in a VLAN of its own (3999 downwards) and the
+  address on that VLAN. It has no VRFs either: their interfaces and routes go in the one routing table, reported.
+* The out-of-band port is the `oobm` block; a layer 2 switch with a single default route gets `ip default-gateway`.
+* Time zones are a fixed offset in minutes (`time timezone 60`), read as `UTC+01:00`; IOS takes the same offset,
+  a tz database zone (EOS, AOS-CX) does not convert to it and is reported.
 
 ## Port names
 
