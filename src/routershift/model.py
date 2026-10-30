@@ -202,25 +202,29 @@ class Ospf:
 
 @dataclass
 class BgpNeighbor:
+    """A BGP neighbor, or a peer group (address = the group's name)."""
+
     address: str
-    remote_as: str
+    remote_as: str = ""
     description: str = ""
-    update_source: str = ""
+    update_source: str = ""  # canonical interface name
     peer_group: str = ""
     shutdown: bool = False
-    route_map_in: str = ""
-    route_map_out: str = ""
-    address_families: List[str] = field(default_factory=lambda: ["ipv4-unicast"])
+    ebgp_multihop: Optional[int] = None  # TTL
+    next_hop_self: bool = False
+    send_community: bool = False
+    families: List[str] = field(default_factory=list)  # address families it is active in: "ipv4", "ipv6"
 
 
 @dataclass
 class Bgp:
     local_as: str
     router_id: str = ""
-    vrf: str = ""
+    peer_groups: Dict[str, BgpNeighbor] = field(default_factory=dict)
     neighbors: List[BgpNeighbor] = field(default_factory=list)
-    networks: List[str] = field(default_factory=list)
-    redistribute: List[str] = field(default_factory=list)
+    networks: List[str] = field(default_factory=list)  # IPv4 and IPv6 prefixes
+    redistribute: List[str] = field(default_factory=list)  # IPv4: "connected", "static", "ospf"
+    redistribute6: List[str] = field(default_factory=list)  # IPv6
     origin: Origin = field(default_factory=Origin)
 
 

@@ -56,7 +56,7 @@ def test_parse_eos_leaf() -> None:
     assert dev.interfaces["Port-channel10"].mode == SwitchportMode.TRUNK
     assert dev.interfaces["Management1"].vrf == "MGMT"
     assert dev.static_routes[2].discard
-    assert any(u.text == "router bgp 65001" for u in dev.unparsed)
+    assert dev.bgp is not None and dev.bgp.local_as == "65001"
 
 
 def test_ios_to_eos() -> None:

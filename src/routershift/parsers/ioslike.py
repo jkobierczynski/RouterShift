@@ -16,6 +16,7 @@ import ipaddress
 from typing import Callable, Dict, List, Optional, Tuple
 
 from .. import acl as acl_text
+from .. import bgp as bgp_text
 from .. import fhrp
 from .. import ospf as ospf_text
 from .. import confparse, names
@@ -208,7 +209,63 @@ class _Reader:
         w = node.words
         if w[1:2] == ["ospf"] and len(w) in (3, 5) and (len(w) == 3 or w[3] == "vrf"):
             return self.ospf(node, w[2], w[4] if len(w) == 5 else "")
+        if w[1:2] == ["bgp"] and len(w) == 3 and self.device.bgp is None:
+            return self.bgp(node, w[2])
         return False
+
+    def bgp(self, node: Node, local_as: str) -> bool:
+        b = bgp_text.Builder(local_as)
+        b.bgp.origin = Origin(node.line, node.text)
+        for child in node.children:
+            w = child.words
+            af = ""
+            if w[0] == "address-family" and w[1:] in (["ipv4"], ["ipv4", "unicast"], ["ipv6"], ["ipv6", "unicast"]):
+                af = w[1]
+            elif w[0] == "address-family":
+                self.unparsed(child, node.text)
+                continue
+            for line in child.children if af else [child]:
+                if line.words == ["exit-address-family"]:
+                    continue
+                try:
+                    understood = self.bgp_line(b, line.words, af)
+                except (ValueError, IndexError):
+                    understood = False
+                if not understood:
+                    self.unparsed(line, child.text if af else node.text)
+        self.device.bgp = b.finish()
+        return True
+
+    @staticmethod
+    def bgp_line(b: bgp_text.Builder, w: List[str], af: str) -> bool:
+        n = len(w)
+        bgp = b.bgp
+        if w[0] in ("bgp", "router-id") and w[-2:-1] == ["router-id"] and n in (2, 3):
+            bgp.router_id = str(ipaddress.IPv4Address(w[-1]))
+        elif w in (["bgp", "log-neighbor-changes"], ["no", "synchronization"], ["no", "auto-summary"]):
+            pass
+        elif w == ["no", "bgp", "default", "ipv4-unicast"]:
+            b.default_ipv4 = False
+        elif w[0] == "network" and n in (2, 4):
+            if n == 4 and w[2] == "mask":
+                prefix = str(ipaddress.ip_network(f"{w[1]}/{w[3]}"))
+            elif n == 2 and "/" in w[1]:
+                prefix = str(ipaddress.ip_network(w[1]))
+            else:
+                return False
+            bgp.networks.append(prefix)
+        elif w[0] == "redistribute" and n >= 2 and w[1] in bgp_text.REDISTRIBUTE:
+            rest = w[3:] if w[1] == "ospf" and n >= 3 and w[2].isdigit() else w[2:]
+            if rest:
+                return False  # a route map or metric
+            (bgp.redistribute6 if af == "ipv6" else bgp.redistribute).append(w[1])
+        elif w[:2] == ["no", "neighbor"] and n == 4 and w[3] == "activate":
+            b.activate(w[2], af or "ipv4", on=False)
+        elif w[0] == "neighbor" and n >= 3:
+            return ioslike_neighbor(b, w[1], w[2:], af)
+        else:
+            return False
+        return True
 
     def ospf(self, node: Node, number: str, vrf: str) -> bool:
         p = ospf_text.process(self.device, number, vrf)
@@ -721,6 +778,37 @@ class _Reader:
             return lag.mode
         members = [i for i in self.device.interfaces.values() if i.lag == lag.name]
         return members[0].mode if members else SwitchportMode.ACCESS
+
+
+def ioslike_neighbor(b: bgp_text.Builder, name: str, w: List[str], af: str) -> bool:
+    """neighbor NAME ... in the IOS and EOS spellings."""
+    n = len(w)
+    if w in (["peer-group"], ["peer", "group"]):
+        b.peer(name, group=True)
+        return True
+    peer = b.peer(name)
+    if w[0] == "peer-group" and n == 2 or w[:2] == ["peer", "group"] and n == 3:
+        peer.peer_group = w[-1]
+        b.peer(w[-1], group=True)
+    elif w[0] == "remote-as" and n == 2:
+        peer.remote_as = w[1]
+    elif w[0] == "description" and n >= 2:
+        peer.description = " ".join(w[1:])
+    elif w[0] == "update-source" and n >= 2:
+        peer.update_source = names.canonical(" ".join(w[1:]))[0]
+    elif w[0] == "ebgp-multihop" and n in (1, 2):
+        peer.ebgp_multihop = int(w[1]) if n == 2 else 255
+    elif w == ["shutdown"]:
+        peer.shutdown = True
+    elif w == ["next-hop-self"]:
+        peer.next_hop_self = True
+    elif w[0] == "send-community" and w[1:] in ([], ["both"], ["standard"]):
+        peer.send_community = True
+    elif w == ["activate"]:
+        b.activate(name, af or "ipv4")
+    else:
+        return False
+    return True
 
 
 def parse(text: str, platform: str) -> Device:

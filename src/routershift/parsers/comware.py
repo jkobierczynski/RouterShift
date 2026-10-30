@@ -22,12 +22,13 @@ import re
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from .. import acl as acl_text
+from .. import bgp as bgp_text
 from .. import confparse
 from .. import ospf as ospf_text
 from ..confparse import Node
 from ..errors import ParseError
-from ..model import (Acl, AclAction, AclEntry, Device, FhrpGroup, Interface, Ospf, OspfNetwork, InterfaceKind, LacpMode, Origin, StaticRoute, StpMode, SwitchportMode,
-                     Unparsed, Vlan)
+from ..model import (Acl, AclAction, AclEntry, Device, FhrpGroup, Interface, InterfaceKind, LacpMode, Origin, Ospf,
+                     OspfNetwork, StaticRoute, StpMode, SwitchportMode, Unparsed, Vlan)
 from .ioslike import _cidr, _is_address
 
 _PREFIXES: List[Tuple[str, InterfaceKind, str]] = [
@@ -145,6 +146,7 @@ class _Reader:
             "acl": self.acl,
             "vrrp": self.vrrp_version,
             "ospf": self.ospf,
+            "bgp": self.bgp,
         }
         for node in roots:
             if node.text.startswith(_NOISE):
@@ -386,6 +388,80 @@ class _Reader:
         return entry
 
     # interfaces ------------------------------------------------------------------------------------------------------
+
+    def bgp(self, node: Node) -> bool:
+        """bgp AS, with groups, peers and address families inside."""
+        if len(node.words) != 2 or self.device.bgp is not None:
+            return False
+        b = bgp_text.Builder(node.words[1])
+        b.default_ipv4 = False  # Comware enables each peer in the address family
+        b.bgp.origin = Origin(node.line, node.text)
+        for child in node.children:
+            w = child.words
+            af = ""
+            if w[0] == "address-family" and w[1:] in (["ipv4"], ["ipv4", "unicast"], ["ipv6"], ["ipv6", "unicast"]):
+                af = w[1]
+            elif w[0] == "address-family":
+                self.unparsed(child, node.text)
+                continue
+            for line in child.children if af else [child]:
+                try:
+                    understood = self.bgp_line(b, line.words, af)
+                except (ValueError, IndexError):
+                    understood = False
+                if not understood:
+                    self.unparsed(line, child.text if af else node.text)
+        self.device.bgp = b.finish()
+        return True
+
+    @staticmethod
+    def bgp_line(b: bgp_text.Builder, w: List[str], af: str) -> bool:
+        n = len(w)
+        bgp = b.bgp
+        if w[0] == "router-id" and n == 2:
+            bgp.router_id = str(ipaddress.IPv4Address(w[1]))
+        elif w[0] == "group" and n in (2, 3) and w[2:] in ([], ["external"], ["internal"]):
+            group = b.peer(w[1], group=True)
+            if w[2:] == ["internal"]:
+                group.remote_as = group.remote_as or bgp.local_as
+        elif w[0] == "network" and n in (2, 3) and af:
+            bgp.networks.append(str(ipaddress.ip_network(f"{w[1]}/{w[2]}" if n == 3 else w[1])))
+        elif w[0] == "import-route" and n in (2, 3) and w[1] in ("direct", "static", "ospf") and af:
+            if n == 3 and w[1] != "ospf":
+                return False
+            (bgp.redistribute6 if af == "ipv6" else bgp.redistribute).append(
+                "connected" if w[1] == "direct" else w[1])
+        elif w[:2] == ["undo", "peer"] and n == 4 and w[3] == "enable":
+            b.activate(w[2], af or "ipv4", on=False)
+        elif w[0] == "peer" and n >= 3:
+            peer = b.peer(w[1])
+            args = w[2:]
+            if args[0] == "as-number" and len(args) == 2:
+                peer.remote_as = args[1]
+            elif args[0] == "group" and len(args) in (2, 4) and args[2:3] in ([], ["as-number"]):
+                peer.peer_group = args[1]
+                b.peer(args[1], group=True)
+                if len(args) == 4:
+                    peer.remote_as = args[3]
+            elif args[0] == "description" and len(args) >= 2:
+                peer.description = " ".join(args[1:])
+            elif args[0] == "connect-interface" and len(args) == 2:
+                peer.update_source = canonical(args[1])[0]
+            elif args[0] == "ebgp-max-hop" and len(args) in (1, 2):
+                peer.ebgp_multihop = int(args[1]) if len(args) == 2 else 64
+            elif args == ["ignore"]:
+                peer.shutdown = True
+            elif args == ["enable"]:
+                b.activate(w[1], af or "ipv4")
+            elif args == ["next-hop-local"]:
+                peer.next_hop_self = True
+            elif args == ["advertise-community"]:
+                peer.send_community = True
+            else:
+                return False
+        else:
+            return False
+        return True
 
     def ospf(self, node: Node) -> bool:
         """ospf N [router-id A] [vpn-instance V], areas inside with their network statements."""

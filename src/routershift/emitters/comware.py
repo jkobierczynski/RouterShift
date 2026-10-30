@@ -12,7 +12,8 @@ from typing import Callable, List, Tuple
 from .. import acl as acl_text
 from .. import fhrp
 from .. import ospf as ospf_text
-from ..model import AclAction, AclEntry, Device, FhrpGroup, Interface, Ospf, InterfaceKind, LacpMode, StaticRoute, StpMode, SwitchportMode
+from ..model import (AclAction, AclEntry, BgpNeighbor, Device, FhrpGroup, Interface, InterfaceKind, LacpMode, Ospf,
+                     StaticRoute, StpMode, SwitchportMode)
 from ..names import PortMapper
 from ..parsers.comware import ranges
 from ..parsers.ioslike import _vlan_ids
@@ -55,6 +56,8 @@ class Writer:
         for iface in sorted(self.device.interfaces.values(), key=lambda i: order.get(i.kind, 1)):
             self.interface(iface)
         self.routes()
+        if self.device.bgp is not None:
+            self.bgp()
         self.out.append("return")
         self.report.unparsed(self.device.unparsed)
         return "\n".join(self.out) + "\n"
@@ -299,6 +302,71 @@ class Writer:
         self.out.append(header)
         self.out += [_IND + line for line in lines]
         self.block_end()
+
+    def bgp(self) -> None:
+        bgp = self.device.bgp
+        assert bgp is not None
+        self.report.item("bgp", f"bgp {bgp.local_as}")
+        lines: List[str] = []
+        if bgp.router_id:
+            lines.append(f"router-id {bgp.router_id}")
+        for group in bgp.peer_groups.values():
+            kind = "internal" if group.remote_as == bgp.local_as else "external"
+            lines.append(f"group {group.address} {kind}")
+            lines += self._bgp_peer(group)
+        for peer in bgp.neighbors:
+            self.report.item("bgp", f"neighbor {peer.address}")
+            if peer.peer_group:
+                lines.append(f"peer {peer.address} group {peer.peer_group}")
+            lines += self._bgp_peer(peer)
+        for af in ("ipv4", "ipv6"):
+            body: List[str] = []
+            for prefix in bgp.networks:
+                net = ipaddress.ip_network(prefix)
+                if (net.version == 6) == (af == "ipv6"):
+                    mask = str(net.netmask) if net.version == 4 else str(net.prefixlen)
+                    body.append(f"network {net.network_address} {mask}")
+            for source in bgp.redistribute6 if af == "ipv6" else bgp.redistribute:
+                if source == "ospf":
+                    source = f"ospf {self.device.ospf[0].process if self.device.ospf else 1}"
+                body.append(f"import-route {'direct' if source == 'connected' else source}")
+            for group in bgp.peer_groups.values():
+                if any(af in n.families for n in bgp.neighbors if n.peer_group == group.address):
+                    body += self._bgp_af_options(group)
+            for peer in bgp.neighbors:
+                if af in peer.families:
+                    body.append(f"peer {peer.address} enable")
+                    body += self._bgp_af_options(peer)
+            if body:
+                lines.append(f"address-family {af} unicast")
+                lines += [_IND + line for line in body]
+        self.out.append(f"bgp {bgp.local_as}")
+        self.out += [_IND + line for line in lines]
+        self.block_end()
+
+    def _bgp_peer(self, peer: BgpNeighbor) -> List[str]:
+        pre = f"peer {peer.address}"
+        lines = []
+        if peer.remote_as:
+            lines.append(f"{pre} as-number {peer.remote_as}")
+        if peer.description:
+            lines.append(f"{pre} description {peer.description}")
+        if peer.update_source:
+            lines.append(f"{pre} connect-interface {self.port(peer.update_source)}")
+        if peer.ebgp_multihop is not None:
+            lines.append(f"{pre} ebgp-max-hop {peer.ebgp_multihop}")
+        if peer.shutdown:
+            lines.append(f"{pre} ignore")
+        return lines
+
+    @staticmethod
+    def _bgp_af_options(peer: BgpNeighbor) -> List[str]:
+        lines = []
+        if peer.next_hop_self:
+            lines.append(f"peer {peer.address} next-hop-local")
+        if peer.send_community:
+            lines.append(f"peer {peer.address} advertise-community")
+        return lines
 
     def _vrrp(self, g: FhrpGroup, add: fhrp.Add) -> List[str]:
         pre = f"vrrp vrid {g.group}"
