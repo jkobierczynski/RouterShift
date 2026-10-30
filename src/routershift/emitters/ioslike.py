@@ -12,6 +12,7 @@ from typing import Callable, Dict, List
 from ..model import Device, Interface, InterfaceKind, LacpMode, StaticRoute, StpMode, SwitchportMode
 from ..names import PortMapper
 from ..report import Report, Severity
+from ..timezones import offset_minutes
 
 _IOS_MGMT_VRF = "Mgmt-vrf"  # fixed name of the management VRF of a Catalyst
 _IOS_MAX_MTU = 9198
@@ -21,23 +22,6 @@ _STP = {
     "eos": {StpMode.RAPID_PVST: "rapid-pvst", StpMode.MSTP: "mstp", StpMode.RSTP: "rstp", StpMode.NONE: "none"},
 }
 _STP_FALLBACK = {StpMode.RSTP: StpMode.RAPID_PVST, StpMode.PVST: StpMode.RAPID_PVST, StpMode.STP: StpMode.RAPID_PVST}
-
-# Words after which a configuration line carries a secret; the report shows "<removed>" instead.
-_SECRET_WORDS = {"community", "password", "secret", "key", "key-string", "md5", "sha", "auth", "priv"}
-
-
-def redact(text: str) -> str:
-    words = text.split()
-    for n in range(1, len(words)):
-        if words[n - 1].lower() in _SECRET_WORDS:
-            # "password 7 <hash>", "secret 0 <text>": the encryption type stays, the secret goes
-            if words[n].isdigit() and len(words[n]) == 1 and n + 1 < len(words):
-                continue
-            words[n] = "<removed>"
-        elif n >= 2 and words[n - 2].lower() in _SECRET_WORDS and words[n - 1].isdigit() and len(words[n - 1]) == 1:
-            words[n] = "<removed>"
-    return " ".join(words)
-
 
 _Add = Callable[[Severity, str, str], None]
 
@@ -329,9 +313,19 @@ class Writer:
     def _timezone(self, tz: str) -> None:
         words = tz.split()
         ios_style = len(words) >= 2 and words[1].lstrip("-").isdigit()
-        if self.ios and ios_style or not self.ios and not ios_style:
+        tz_database = "/" in tz or tz.upper() == "UTC"
+        if self.ios and ios_style or not self.ios and tz_database:
+            if not self.ios and "/" in tz:  # tz database names are capitalised on EOS: America/New_York
+                tz = "/".join("_".join(p[:1].upper() + p[1:] for p in part.split("_")) for part in tz.split("/"))
             self.out.append(f"clock timezone {tz}")
             self.report.item("system", "time zone")
+            return
+        minutes = offset_minutes(tz)
+        if self.ios and minutes is not None:
+            sign = "-" if minutes < 0 else ""
+            self.out.append(f"clock timezone UTC {sign}{abs(minutes) // 60} {abs(minutes) % 60}")
+            self.report.add("system", "time zone", Severity.APPROX, "timezone",
+                            f"time zone '{tz}' written as a fixed offset; add 'clock summer-time' if it has one")
             return
         self.report.add("system", "time zone", Severity.REVIEW, "timezone",
                         f"time zone '{tz}' cannot be translated reliably (IOS takes a name and an offset, EOS a "
@@ -349,10 +343,7 @@ class Writer:
         self.report.item("system", "banner motd")
 
     def unparsed(self) -> None:
-        for entry in self.device.unparsed:
-            where = f" (in '{redact(entry.section)}')" if entry.section else ""
-            self.report.skip("unparsed", f"line {entry.line}: {redact(entry.text)}", "not-converted",
-                             f"not converted{where}; translate it by hand if the new device needs it")
+        self.report.unparsed(self.device.unparsed)
 
 
 def emit(device: Device, target: str, ports: PortMapper, report: Report) -> str:

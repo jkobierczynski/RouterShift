@@ -113,6 +113,13 @@ def test_odd_values_are_reported_not_fatal() -> None:
     assert {u.text for u in dev.unparsed} >= {"switchport access vlan abc", "mtu big", "ntp server"}
 
 
+def test_redact() -> None:
+    from routershift.report import redact
+    assert redact("username a privilege 15 secret 9 $9$abc") == "username a privilege 15 secret 9 <removed>"
+    assert redact("user admin password ciphertext AQBx") == "user admin password ciphertext <removed>"
+    assert redact("key 7 0822455D0A16") == "key 7 <removed>"
+
+
 def test_cli(tmp_path) -> None:  # type: ignore[no-untyped-def]
     from routershift.cli import main
     src = tmp_path / "in.cfg"
