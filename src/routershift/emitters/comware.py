@@ -7,8 +7,9 @@
 from __future__ import annotations
 
 import ipaddress
-from typing import Callable, Dict, List, Set, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
+from .. import aaa as aaa_text
 from .. import acl as acl_text
 from .. import dhcp as dhcp_text
 from .. import fhrp
@@ -16,10 +17,10 @@ from .. import nat as nat_text
 from .. import vpn as vpn_text
 from .. import ospf as ospf_text
 from .. import snmp as snmp_text
-from ..model import (AclAction, AclEntry, BgpNeighbor, Device, FhrpGroup, IpsecPeer, SnmpGroup, Interface, InterfaceKind, LacpMode, NatRule,
+from ..model import (AaaMethod, AaaServer, AclAction, AclEntry, BgpNeighbor, Device, FhrpGroup, IpsecPeer, SnmpGroup, Interface, InterfaceKind, LacpMode, NatRule,
                      Ospf, StaticRoute, StpMode, SwitchportMode)
 from ..names import PortMapper
-from ..parsers.comware import ranges
+from ..parsers.comware import COMWARE_ROLES, ranges
 from ..parsers.ioslike import _vlan_ids
 from ..report import Report, Severity
 from ..timezones import offset_minutes
@@ -47,6 +48,8 @@ class Writer:
         groups = [g for gs in self.groups.values() for g in gs]
         self.vrrp_v2 = any(g.version != 3 for g in groups)
         self.system()
+        self.users()
+        self.aaa()
         if self.vrrp_v2:
             self.out.append(f"{_IND}vrrp version 2")  # Comware 7 runs VRRPv3 unless told otherwise
             self.block_end()
@@ -132,6 +135,155 @@ class Writer:
             self.out += [f"{_IND}header motd {delim}", s.banner_motd, delim]
             rep.item("system", "banner motd")
         self.block_end()
+
+    # users and AAA -----------------------------------------------------------------------------------------------------
+
+    _HASHES = ("comware-hash", "comware-cipher")
+    _FORMS = {"plain": "simple", "comware-hash": "hash", "comware-cipher": "cipher"}
+
+    @staticmethod
+    def role(privilege: Optional[int]) -> str:
+        if privilege is None or privilege in (1, 15):
+            return aaa_text.role(privilege, COMWARE_ROLES)
+        return f"level-{privilege}"
+
+    def users(self) -> None:
+        rep = self.report
+        secret = self.device.aaa.enable_secret
+        if secret is not None:
+            found = aaa_text.password(secret, self._HASHES, rep, "enable")
+            if found is not None and found[0] != "none":
+                rep.item("management", "enable secret")
+                self.out.append(f"{_IND}super password role network-admin {self._FORMS[found[0]]} {found[1]}")
+                self.block_end()
+        for u in self.device.users:
+            label = aaa_text.user_label(u)
+            found = aaa_text.password(u, self._HASHES, rep)
+            if found is None:
+                continue
+            rep.item("management", label)
+            lines = [f"local-user {u.name} class manage"]
+            if found[0] == "none":
+                rep.add("management", label, Severity.REVIEW, "no-password",
+                        "the user has no password in the source; Comware needs one for SSH and terminal logins")
+            else:
+                lines.append(f"{_IND}password {self._FORMS[found[0]]} {found[1]}")
+            lines += [f"{_IND}service-type ssh terminal", f"{_IND}authorization-attribute user-role {self.role(u.privilege)}"]
+            self.out += lines
+            self.block_end()
+
+    def _schemes(self) -> List[Tuple[str, str, List[AaaServer], str]]:
+        """(protocol, name, servers, VPN instance) per scheme: the groups, and one scheme per protocol for every
+        server of it when a method names the protocol or a server is in no group."""
+        a = self.device.aaa
+        by_address = {(s.protocol, s.address): s for s in a.servers}
+        schemes = []
+        grouped = set()
+        for g in a.groups.values():
+            servers = []
+            for address in g.servers:
+                server = by_address.get((g.protocol, address))
+                if server is None:
+                    self.report.add("management", f"{g.protocol} group {g.name}", Severity.REVIEW, "aaa-server",
+                                    f"server {address} is not defined; left out")
+                    continue
+                servers.append(server)
+                grouped.add(id(server))
+            vrfs = {s.vrf for s in servers}
+            schemes.append((g.protocol, g.name, servers, g.vrf or (vrfs.pop() if len(vrfs) == 1 else "")))
+        used = {method for m in a.methods for method in m.methods}
+        for protocol in ("radius", "tacacs"):
+            servers = [s for s in a.servers if s.protocol == protocol]
+            if servers and (f"group:{protocol}" in used or any(id(s) not in grouped for s in servers)):
+                vrfs = {s.vrf for s in servers}
+                schemes.append((protocol, protocol.upper(), servers, vrfs.pop() if len(vrfs) == 1 else ""))
+        return schemes
+
+    def aaa(self) -> None:
+        a = self.device.aaa
+        rep = self.report
+        if not aaa_text.has_aaa(self.device):
+            return
+        keys = {}
+        for s in a.servers:
+            rep.item("management", aaa_text.server_label(s))
+            keys[id(s)] = aaa_text.key(s, rep)
+        roles = {"radius": ["authentication", "accounting"], "tacacs": ["authentication", "authorization", "accounting"]}
+        for protocol, name, servers, vrf in self._schemes():
+            rep.item("management", f"{protocol} group {name}")
+            self.out.append(f"{'radius' if protocol == 'radius' else 'hwtacacs'} scheme {name}")
+            for n, s in enumerate(servers):
+                for role in roles[protocol]:
+                    port = s.acct_port if role == "accounting" and protocol == "radius" else s.auth_port
+                    if role == "accounting" and protocol == "radius" and port is None and s.auth_port:
+                        port = 1813
+                    words = [f"{_IND}{'primary' if n == 0 else 'secondary'} {role} {s.address}"]
+                    words += [str(port)] if port else []
+                    words.append(f"key simple {keys[id(s)]}")
+                    words += [f"vpn-instance {s.vrf}"] if s.vrf and s.vrf != vrf else []
+                    self.out.append(" ".join(words))
+            if vrf:
+                self.out.append(f"{_IND}vpn-instance {vrf}")
+            timeouts = [s.timeout for s in servers if s.timeout is not None]
+            if timeouts:
+                self.out.append(f"{_IND}timer response-timeout {max(timeouts)}")
+            self.block_end()
+        for protocol, source in a.source.items():
+            iface = self.device.interfaces.get(source)
+            if iface is None or not iface.ipv4:
+                rep.add("management", f"{protocol} source", Severity.REVIEW, "aaa-source",
+                        f"source {source} has no IPv4 address; set '{'radius' if protocol == 'radius' else 'hwtacacs'} "
+                        "nas-ip' by hand")
+                continue
+            address = iface.ipv4[0].split("/")[0]
+            self.out.append(f"{_IND}{'radius' if protocol == 'radius' else 'hwtacacs'} nas-ip {address}")
+            self.block_end()
+        lines = [f"{_IND}{line}" for line in (self._domain_line(m) for m in a.methods) if line]
+        if lines:
+            self.out += ["domain system"] + lines
+            self.block_end()
+        if lines or self.device.users:
+            self.out += ["line vty 0 63", f"{_IND}authentication-mode scheme"]
+            self.block_end()
+
+    _DOMAIN = {("authentication", "login"): "authentication login", ("authentication", "enable"): "authentication super",
+               ("authorization", "exec"): "authorization login", ("authorization", "commands"): "authorization command",
+               ("accounting", "exec"): "accounting login", ("accounting", "commands"): "accounting command"}
+
+    def _domain_line(self, m: AaaMethod) -> str:
+        """The ISP domain line for a method list, or '' with a note."""
+        rep = self.report
+        label = aaa_text.method_label(m)
+        words = self._DOMAIN.get((m.kind, m.service))
+        if words is None or m.name != "default":
+            why = ("Comware picks a domain by the user name, not per line" if words else "Comware has no such list")
+            rep.skip("management", label, "aaa-list", f"{why}; configure it by hand")
+            return ""
+        commands = m.service == "commands"
+        kept: List[str] = []
+        for method in m.methods:
+            protocol = aaa_text.protocol_of(self.device, method)
+            if protocol:
+                if kept or (commands and protocol != "tacacs"):
+                    continue
+                name = method[len("group:"):]
+                name = protocol.upper() if name == protocol else name
+                kept.append(f"{'radius' if protocol == 'radius' else 'hwtacacs'}-scheme {name}")
+            elif method in ("local", "none") and m.service != "enable":
+                kept.append(method)
+                break
+        if len(kept) != len(m.methods):
+            rep.add("management", label, Severity.APPROX, "aaa-method",
+                    "Comware takes one scheme, then local or none (HWTACACS only for commands, a scheme only for "
+                    f"super); written as {' '.join(kept) or 'nothing'}")
+        if not kept:
+            return ""
+        rep.item("management", label)
+        if commands and m.level not in (None, 15):
+            rep.add("management", label, Severity.APPROX, "aaa-level",
+                    f"level {m.level} left out: Comware authorizes every command")
+        return f"{words} {' '.join(kept)}"
+
 
     _SNMP_AUTH = ["md5", "sha", "sha256", "sha384", "sha512"]
     _SNMP_PRIV = ["des", "3des", "aes128", "aes192", "aes256"]

@@ -41,8 +41,10 @@ platform converts to and from all the others.
 | NAT: pools, dynamic source NAT and PAT, one-to-one and port forwarding rules, inside/outside interfaces | `NatPool`, `NatRule`, `Interface.nat` | 2 (done) |
 | Site-to-site IPsec VPN: IKE proposals, transform sets, crypto maps, IPsec profiles on tunnel interfaces, pre-shared keys | `IkePolicy`, `IpsecTransform`, `IpsecPeer`, `PreSharedKey`, `Interface.tunnel_*` | 2 (done) |
 | SNMP: communities with access and ACL, location, contact, notification hosts (v1/v2c/v3, traps or informs), v3 groups and users, source interface | `Snmp`, `SnmpCommunity`, `SnmpHost`, `SnmpGroup`, `SnmpUser` | 2 (done) |
-| Local users | `LocalUser` | 2 |
-| Route maps, prefix lists, AAA/TACACS/RADIUS, QoS, MLAG/VSX/vPC, VXLAN/EVPN | to come | 3+ |
+| Local users, privilege levels and roles, enable secret | `LocalUser`, `Aaa.enable_secret` | 3 (done) |
+| AAA: RADIUS and TACACS+ servers, server groups, login/enable/exec/command method lists, source interfaces | `Aaa`, `AaaServer`, `AaaGroup`, `AaaMethod` | 3 (done) |
+| LDAP, Kerberos, TFTP/FTP, 802.1X | to come | 3 |
+| Route maps, prefix lists, QoS, MLAG/VSX/vPC, VXLAN/EVPN | to come | 3+ |
 
 ### AOS-S specifics
 
@@ -166,6 +168,27 @@ platform converts to and from all the others.
 * Communities and keys in clear text are carried over. Encrypted ones (Comware cipher, AOS-CX ciphertext, EOS
   localized keys, IOS and EOS type 7 NTP keys) become `CHANGE-ME`, and the report asks for them. The report never
   shows a community or key: communities are numbered (`community #1 (ro)`).
+
+## Users and AAA
+
+* Local users keep their name, privilege and password. A clear-text password (and an IOS type 7 one, which is
+  reversible) goes to every platform. A hash goes only where the target takes the same kind: md5-crypt to IOS and
+  EOS, sha512-crypt to EOS, IOS type 8/9 to IOS, AOS-S SHA-1 and Comware hashes to their own platform.
+  Any other user is reported and left out: RouterShift never invents a password.
+* Privilege levels map to roles: 15 is `network-admin` (EOS, Comware) or `administrators` (AOS-CX), 1 is
+  `network-operator`/`operators`. Comware keeps other levels as `level-N` roles; AOS-S has one manager and one
+  operator user, so further users are reported.
+* The enable secret becomes `enable secret` (IOS), `enable password` (EOS) or `super password role network-admin`
+  (Comware). AOS-CX and AOS-S have none; it is reported.
+* RADIUS and TACACS+ servers keep their address, ports, timeout, VRF and key; server groups keep their members.
+  IOS writes `radius server`/`tacacs server` blocks and sets the VRF on the group; Comware writes a `radius scheme` or
+  `hwtacacs scheme` per group (and one for the servers in no group). Encrypted keys become `CHANGE-ME`, as for SNMP.
+* Method lists for login authentication, enable, exec and command authorization, and exec and command accounting
+  carry over where the target has them. Comware puts them in `domain system` (one scheme, then local or none;
+  commands through HWTACACS only) and adds `line vty 0 63` with `authentication-mode scheme`. AOS-CX has no enable or
+  exec authorization (a user's group gives the rights); AOS-S has per-access authentication and two methods at most.
+  Named lists (applied to lines) are reported.
+* The source interface for RADIUS and TACACS+ carries over; Comware takes the address (`nas-ip`) instead.
 
 ## Site-to-site VPN (IPsec)
 

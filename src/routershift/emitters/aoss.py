@@ -23,6 +23,7 @@ from .. import vpn as vpn_text
 from .. import fhrp
 from .. import ospf as ospf_text
 from .. import snmp as snmp_text
+from .. import aaa as aaa_text
 from ..model import Device, FhrpGroup, Interface, InterfaceKind, LacpMode, StaticRoute, StpMode, SwitchportMode, Vlan
 from ..names import PortMapper
 from ..parsers.ioslike import _vlan_ids
@@ -224,6 +225,8 @@ class Writer:
         if s.syslog_servers:
             rep.item("system", "syslog servers")
         self.snmp()
+        self.users()
+        self.aaa()
         if s.service_vrf and s.service_vrf in self.mgmt_vrfs:
             rep.add("system", "service vrf", Severity.APPROX, "oobm",
                     "the source reaches its servers through the management VRF; AOS-S picks the out-of-band port "
@@ -235,6 +238,97 @@ class Writer:
             if vrf not in self.mgmt_vrfs:
                 rep.add("system", f"vrf {vrf}", Severity.REVIEW, "vrf",
                         "AOS-S has no VRFs: its interfaces and routes are written in the one routing table")
+
+    def users(self) -> None:
+        if self.device.aaa.enable_secret is not None:
+            self.report.skip("management", "enable secret", "enable-secret",
+                             "AOS-S has no enable secret: the manager password gives full rights")
+        taken = set()
+        for u in self.device.users:
+            label = aaa_text.user_label(u)
+            level = "manager" if (u.privilege or 1) >= 15 else "operator"
+            if level in taken:
+                self.report.skip("management", label, "aoss-users",
+                                 f"AOS-S has one {level} user; create the others with local-user accounts by hand")
+                continue
+            found = aaa_text.password(u, ("aoss-sha1",), self.report)
+            if found is None:
+                continue
+            form, value = found
+            if form == "none":
+                self.report.skip("management", label, "no-password", "the user has no password in the source")
+                continue
+            taken.add(level)
+            self.report.item("management", label)
+            if u.privilege not in (None, 1, 15):
+                self.report.add("management", label, Severity.APPROX, "privilege",
+                                f"privilege {u.privilege} becomes the {level} user; AOS-S has no levels in between")
+            self.out.append(f"password {level} user-name {_quote(u.name)} "
+                            f"{'plaintext' if form == 'plain' else 'sha1'} {_quote(value)}")
+
+    def _aaa_methods(self, methods: List[str], label: str) -> str:
+        """'tacacs [server-group G] local' for at most two methods."""
+        words = []
+        kept = [m for m in methods if m.startswith("group:") or m in ("local", "none")]
+        if len(kept) != len(methods) or len(kept) > 2:
+            self.report.add("management", label, Severity.APPROX, "aaa-method",
+                            "AOS-S takes a primary and a secondary method of radius, tacacs, local or none; "
+                            f"written as {', '.join(kept[:2]) or 'local'}")
+        for m in kept[:2] or ["local"]:
+            if m.startswith("group:"):
+                protocol = aaa_text.protocol_of(self.device, m) or "tacacs"
+                name = m[len("group:"):]
+                words.append(protocol if name == protocol else f"{protocol} server-group {_quote(name)}")
+            else:
+                words.append(m)
+        return " ".join(words)
+
+    def aaa(self) -> None:
+        a = self.device.aaa
+        rep = self.report
+        for s in a.servers:
+            label = aaa_text.server_label(s)
+            rep.item("management", label)
+            words = [f"{s.protocol}-server host {s.address}"]
+            if s.protocol == "radius":
+                words += [f"auth-port {s.auth_port}"] if s.auth_port else []
+                words += [f"acct-port {s.acct_port}"] if s.acct_port else []
+            elif s.auth_port and s.auth_port != 49:
+                rep.add("management", label, Severity.REVIEW, "aaa-port", f"port {s.auth_port} left out: AOS-S uses 49")
+            if s.vrf:
+                rep.add("management", label, Severity.APPROX, "aaa-vrf", f"VRF {s.vrf} left out: AOS-S has no VRFs")
+            self.out.append(" ".join(words + [f"key {_quote(aaa_text.key(s, rep))}"]))
+        for g in a.groups.values():
+            rep.item("management", f"{g.protocol} group {g.name}")
+            self.out += [f"aaa server-group {g.protocol} {_quote(g.name)} host {address}" for address in g.servers]
+        for protocol, source in a.source.items():
+            if source.startswith(("Vlan", "Loopback")):
+                kind = "vlan" if source.startswith("Vlan") else "loopback"
+                self.out.append(f"ip source-interface {protocol} {kind} {source.lstrip('VlanLoopback')}")
+            else:
+                rep.add("management", f"{protocol} source", Severity.REVIEW, "aaa-source",
+                        f"source {source} is not a VLAN or loopback; set 'ip source-interface' by hand")
+        for m in a.methods:
+            label = aaa_text.method_label(m)
+            access = "ssh" if m.name == "default" else m.name
+            if m.kind == "authentication" and access in ("ssh", "telnet", "console", "web"):
+                rep.item("management", label)
+                self.out.append(f"aaa authentication {access} {m.service} {self._aaa_methods(m.methods, label)}")
+            elif m.kind == "authorization" and m.service == "commands" and m.name == "default":
+                rep.item("management", label)
+                self.out.append(f"aaa authorization commands {self._aaa_methods(m.methods, label)}")
+            elif m.kind == "accounting" and m.name == "default":
+                rep.item("management", label)
+                record = m.record or "start-stop"
+                if m.service == "commands" and record == "start-stop":
+                    record = "stop-only"
+                    rep.add("management", label, Severity.APPROX, "aaa-record",
+                            "AOS-S accounts commands as stop-only")
+                self.out.append(f"aaa accounting {m.service} {record} {self._aaa_methods(m.methods, label)}")
+            else:
+                rep.skip("management", label, "aaa-list",
+                         "AOS-S has no such list (only per-access authentication, command authorization and "
+                         "default accounting); configure it by hand")
 
     def snmp(self) -> None:
         s = self.device.snmp

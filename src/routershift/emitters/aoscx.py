@@ -17,6 +17,8 @@ from .. import vpn as vpn_text
 from .. import fhrp
 from .. import ospf as ospf_text
 from .. import snmp as snmp_text
+from .. import aaa as aaa_text
+from ..parsers.aoscx import AOSCX_ROLES
 from ..model import Device, Interface, Ospf, InterfaceKind, LacpMode, StaticRoute, StpMode, SwitchportMode
 from ..names import PortMapper
 from ..report import Report, Severity
@@ -133,7 +135,89 @@ class Writer:
         if s.syslog_servers:
             rep.item("system", "syslog servers")
         self.snmp()
+        self.users()
+        self.aaa()
         self.out.append("!")
+
+    def users(self) -> None:
+        if self.device.aaa.enable_secret is not None:
+            self.report.skip("management", "enable secret", "enable-secret",
+                             "AOS-CX has no enable secret: a user's group gives its rights")
+        for u in self.device.users:
+            label = aaa_text.user_label(u)
+            found = aaa_text.password(u, ("aoscx-ciphertext",), self.report)
+            if found is None:
+                continue
+            form, value = found
+            if form == "none":
+                self.report.skip("management", label, "no-password",
+                                 "the user has no password in the source; AOS-CX needs one, create it by hand")
+                continue
+            group = aaa_text.role(u.privilege, AOSCX_ROLES)
+            self.report.item("management", label)
+            if u.privilege not in (None, 1, 15):
+                self.report.add("management", label, Severity.APPROX, "privilege",
+                                f"privilege {u.privilege} becomes group {group}; AOS-CX has no levels in between")
+            self.out.append(f"user {u.name} group {group} password "
+                            f"{'plaintext' if form == 'plain' else 'ciphertext'} {value}")
+
+    def aaa(self) -> None:
+        a = self.device.aaa
+        rep = self.report
+        for s in a.servers:
+            label = aaa_text.server_label(s)
+            rep.item("management", label)
+            words = [f"{s.protocol}-server host {s.address} key plaintext {aaa_text.key(s, rep)}"]
+            if s.protocol == "radius":
+                words += [f"auth-port {s.auth_port}"] if s.auth_port else []
+                words += [f"acct-port {s.acct_port}"] if s.acct_port else []
+            elif s.auth_port:
+                words.append(f"port {s.auth_port}")
+            words += [f"timeout {s.timeout}"] if s.timeout is not None else []
+            words += [f"vrf {self.vrf(s.vrf)}"] if s.vrf else []
+            self.out.append(" ".join(words))
+        by_address = {(s.protocol, s.address): s for s in a.servers}
+        for g in a.groups.values():
+            rep.item("management", f"{g.protocol} group {g.name}")
+            self.out.append(f"aaa group server {g.protocol} {g.name}")
+            for address in g.servers:
+                server = by_address.get((g.protocol, address))
+                vrf = (server.vrf if server else "") or g.vrf
+                self.out.append(f"    server {address}" + (f" vrf {self.vrf(vrf)}" if vrf else ""))
+        for protocol, source in a.source.items():
+            vrfs = {s.vrf for s in a.servers if s.protocol == protocol}
+            vrf = f" vrf {self.vrf(vrfs.pop())}" if len(vrfs) == 1 and "" not in vrfs else ""
+            self.out.append(f"ip source-interface {protocol} interface {self.port(source).replace(' ', '')}{vrf}")
+        accounting_written = False
+        for m in a.methods:
+            label = aaa_text.method_label(m)
+            groups = [x[len("group:"):] for x in m.methods if x.startswith("group:")]
+            rest = [x for x in m.methods if x in ("local", "none")]
+            dropped = [x for x in m.methods if not x.startswith("group:") and x not in ("local", "none")]
+            if (m.kind, m.service) in (("authentication", "enable"), ("authorization", "exec")):
+                rep.skip("management", label, "aaa-service",
+                         f"AOS-CX has no {m.kind} for {m.service}; a user's group gives its rights")
+                continue
+            if m.kind == "accounting" and accounting_written:
+                rep.add("management", label, Severity.APPROX, "aaa-accounting",
+                        "AOS-CX accounts all management sessions and commands with one list, written once")
+                continue
+            rep.item("management", label)
+            if dropped:
+                rep.add("management", label, Severity.APPROX, "aaa-method",
+                        f"method {', '.join(dropped)} left out: AOS-CX has none")
+            if m.kind == "authorization" and m.level not in (None, 15):
+                rep.add("management", label, Severity.APPROX, "aaa-level",
+                        f"AOS-CX authorizes every command, not level {m.level} only")
+            service = {"login": "login", "commands": "commands", "exec": "all-mgmt"}[m.service]
+            if m.kind == "accounting":
+                service, accounting_written = "all-mgmt", True
+            words = [f"aaa {m.kind} {service} {m.name}"] + ([m.record] if m.record else [])
+            if groups:
+                words.append("group " + " ".join(groups + rest))
+            else:
+                words += rest
+            self.out.append(" ".join(words))
 
     _SNMP_AUTH = ["md5", "sha"]
     _SNMP_PRIV = ["des", "aes128"]

@@ -3,6 +3,7 @@ from helpers import DATA
 
 from routershift import bgp as bgp_text
 from routershift import nat as nat_text
+from routershift import aaa as aaa_text
 from routershift import snmp as snmp_text
 from routershift import vpn as vpn_text
 from routershift import ospf as ospf_text
@@ -116,6 +117,15 @@ def test_converts_and_reads_back(source: str, target: str) -> None:
         sorted((u.name, "" if aos else u.group or u.name, u.auth, plain(u.auth_key), u.priv, plain(u.priv_key))
                for u in dev.snmp.users))
     assert snmp(first) == snmp(back)
+    # AAA keeps every RADIUS and TACACS+ server with its key, the protocol and fallback of the login method list, and
+    # every user whose password the source holds in clear text
+    aaa = lambda dev: (  # noqa: E731
+        sorted((s.protocol, s.address, plain(s.key)) for s in dev.aaa.servers),
+        [(aaa_text.protocol_of(dev, m.methods[0]), m.methods[1:]) for m in dev.aaa.methods
+         if (m.kind, m.service, m.name) == ("authentication", "login", "default")])
+    assert aaa(first) == aaa(back)
+    users = lambda dev: sorted(u.name for u in dev.users if u.password)  # noqa: E731
+    assert users(first) == users(back)
     # BGP keeps every neighbor with its settings (peer groups may be written out on their members), networks and
     # redistribution; AOS-S leaves it to a person
     if first.bgp is not None and target == "aoss":

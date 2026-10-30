@@ -16,10 +16,16 @@ from .model import Unparsed
 
 # Words after which a configuration line carries a secret; the report shows "<removed>" instead.
 _SECRET_WORDS = {"community", "password", "secret", "key", "key-string", "md5", "sha", "auth", "priv", "pre-shared-key",
-                 "shared-key"}
+                 "shared-key", "authentication-key", "authentication-mode", "privacy-mode"}
 # Words between a secret word and the secret: its form, or (SNMP) its access
 _SECRET_TYPES = {"ciphertext", "plaintext", "encrypted", "cipher", "hash", "simple", "read", "write", "text",
                  "local", "remote"}
+# Algorithms and key sizes that stand between a secret word and the secret ("priv aes 128 <key>")
+_ALGORITHMS = {"des", "3des", "aes", "aes128", "aes192", "aes256", "128", "192", "256", "sha1", "sha256", "sha384",
+               "sha512", "hmac-sha-1", "hmac-sha-256"}
+# Forms that are always followed by the secret itself, wherever they stand ("super password role R simple X",
+# 'password manager user-name "U" plaintext "X"')
+_SECRET_FORMS = {"simple", "plaintext", "ciphertext", "cipher", "hash", "sha1"}
 # Commands where "authentication" itself is followed by a secret (HSRP: "standby 1 authentication cisco")
 _AUTH_COMMANDS = {"standby", "vrrp"}
 
@@ -35,9 +41,12 @@ def redact(text: str) -> str:
             # "password 7 <hash>", "secret 0 <text>", "password ciphertext <hash>", "md5 key-string <key>": the type
             # stays, the secret goes
             while n < len(words) - 1 and (words[n].isdigit() and len(words[n]) == 1 or words[n] in _SECRET_TYPES
-                                           or words[n].lower() in secret_words):
+                                           or words[n].lower() in secret_words | _ALGORITHMS):
                 n += 1
             result[n] = "<removed>"
+        elif words[n].lower() in _SECRET_FORMS:
+            n += 1 if words[n + 1].isdigit() and len(words[n + 1]) == 1 and n + 2 < len(words) else 0
+            result[n + 1] = "<removed>"
         n += 1
     return " ".join(result)
 

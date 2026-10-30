@@ -27,7 +27,7 @@ from .. import dhcp as dhcp_text
 from .. import ospf as ospf_text
 from ..confparse import Node
 from ..errors import ParseError
-from ..model import (Acl, Device, DhcpPool, FhrpGroup, NtpKey, SnmpCommunity, SnmpGroup, SnmpHost, SnmpUser, Interface, InterfaceKind, LacpMode, Origin, StaticRoute, StpMode,
+from ..model import (AaaGroup, AaaMethod, AaaServer, Acl, Device, LocalUser, DhcpPool, FhrpGroup, NtpKey, SnmpCommunity, SnmpGroup, SnmpHost, SnmpUser, Interface, InterfaceKind, LacpMode, Origin, StaticRoute, StpMode,
                      SwitchportMode, Unparsed, Vlan)
 from ..timezones import utc
 from .ioslike import _cidr, _is_address
@@ -85,6 +85,7 @@ class _Reader:
         self.ospf_areas: List[Tuple[str, str, str]] = []
         self.ospf_passive: Dict[str, bool] = {}
         self._snmp_groups: List[Tuple[str, str]] = []  # (user, group)
+        self._aaa_keys: Dict[str, str] = {}  # protocol -> the key of servers that have none of their own
 
     def unparsed(self, node: Node, section: str = "") -> None:
         self.device.unparsed.append(Unparsed(node.line, node.text, section))
@@ -116,6 +117,10 @@ class _Reader:
             "timesync": lambda node: len(node.words) == 2,
             "snmp-server": self.snmp,
             "snmpv3": self.snmpv3,
+            "password": self.password,
+            "radius-server": self.aaa_host,
+            "tacacs-server": self.aaa_host,
+            "aaa": self.aaa,
             "ip": self.ip,
             "ipv6": self.ipv6,
             "logging": self.logging,
@@ -213,6 +218,98 @@ class _Reader:
             return not args
         return False
 
+    def password(self, node: Node) -> bool:
+        """password manager|operator [user-name "U" plaintext|sha1 "X"]"""
+        w = [unquote(word) for word in node.words]
+        if w[1] not in ("manager", "operator"):
+            return False
+        if len(w) == 2:
+            return True  # a password is set but not shown
+        if len(w) != 6 or w[2] != "user-name" or w[4] not in ("plaintext", "sha1"):
+            return False
+        user = LocalUser(w[3], 15 if w[1] == "manager" else 1, origin=Origin(node.line, node.text))
+        if w[4] == "plaintext":
+            user.password = w[5]
+        else:
+            user.password_hash, user.hash_type = w[5], "aoss-sha1"
+        self.device.users.append(user)
+        return True
+
+    def aaa_host(self, node: Node) -> bool:
+        """radius-server|tacacs-server host A [key "K"] [auth-port N] [acct-port N] [timeout N]; ... key "K" (all)"""
+        w = [unquote(word) for word in node.words]
+        protocol = "radius" if w[0] == "radius-server" else "tacacs"
+        if w[1] == "key" and len(w) == 3:
+            self._aaa_keys[protocol] = w[2]
+            return True
+        if w[1] in ("timeout", "retransmit", "dead-time") and len(w) == 3:
+            return True
+        if w[1] != "host" or len(w) < 3:
+            return False
+        server = AaaServer(protocol, str(ipaddress.ip_address(w[2])), origin=Origin(node.line, node.text))
+        args = w[3:]
+        while len(args) >= 2:
+            if args[0] == "key":
+                server.key = args[1]
+            elif args[0] in ("auth-port", "acct-port", "timeout"):
+                setattr(server, args[0].replace("-", "_"), int(args[1]))
+            else:
+                return False
+            args = args[2:]
+        self.device.aaa.servers.append(server)
+        return not args
+
+    def aaa(self, node: Node) -> bool:
+        w = [unquote(word) for word in node.words]
+        a = self.device.aaa
+        origin = Origin(node.line, node.text)
+        if w[1] == "server-group" and len(w) == 6 and w[2] in ("radius", "tacacs") and w[4] == "host":
+            group = a.groups.setdefault(w[3], AaaGroup(w[2], w[3], origin=origin))
+            group.servers.append(str(ipaddress.ip_address(w[5])))
+            return True
+        if w[1] == "authentication" and len(w) >= 5 and w[2] in ("ssh", "telnet", "console", "web", "webui") \
+                and w[3] in ("login", "enable"):
+            # aaa authentication ssh login PRIMARY [server-group G] [SECONDARY]
+            methods = self._methods(w[4:])
+            if methods is None:
+                return False
+            a.methods.append(AaaMethod("authentication", w[3], methods, "default" if w[2] == "ssh" else w[2],
+                                       origin=origin))
+            return True
+        if w[1] == "accounting" and len(w) >= 5 and w[2] in ("exec", "commands") \
+                and w[3] in ("start-stop", "stop-only", "interim-update"):
+            methods = self._methods(w[4:])
+            if methods is None:
+                return False
+            a.methods.append(AaaMethod("accounting", w[2], methods, level=15 if w[2] == "commands" else None,
+                                       record="start-stop" if w[3] != "stop-only" else "stop-only", origin=origin))
+            return True
+        if w[1:3] == ["authorization", "commands"] and len(w) >= 4:
+            methods = self._methods(w[3:])
+            if methods is None:
+                return False
+            a.methods.append(AaaMethod("authorization", "commands", methods, level=15, origin=origin))
+            return True
+        return False
+
+    @staticmethod
+    def _methods(words: List[str]) -> Optional[List[str]]:
+        methods = []
+        while words:
+            if words[0] in ("radius", "tacacs"):
+                if words[1:2] == ["server-group"] and len(words) >= 3:
+                    methods.append(f"group:{words[2]}")
+                    words = words[3:]
+                else:
+                    methods.append(f"group:{words[0]}")
+                    words = words[1:]
+            elif words[0] in ("local", "none"):
+                methods.append(words[0])
+                words = words[1:]
+            else:
+                return None
+        return methods
+
     def snmpv3(self, node: Node) -> bool:
         """snmpv3 enable; snmpv3 user "U" [auth md5|sha "KEY" [priv des|aes "KEY"]]; snmpv3 group G user "U" sec-model
         ver3"""
@@ -241,6 +338,9 @@ class _Reader:
 
     def ip(self, node: Node) -> bool:
         w = node.words
+        if w[1] == "source-interface" and len(w) == 5 and w[2] in ("radius", "tacacs") and w[3] in ("vlan", "loopback"):
+            self.device.aaa.source[w[2]] = f"{'Vlan' if w[3] == 'vlan' else 'Loopback'}{w[4]}"
+            return True
         if w[1:] == ["routing"]:
             self.routing = True
             return True
@@ -586,6 +686,8 @@ class _Reader:
     # VLAN membership to ports ----------------------------------------------------------------------------------------
 
     def _finish(self) -> None:
+        for server in self.device.aaa.servers:
+            server.key = server.key or self._aaa_keys.get(server.protocol, "")
         snmp = self.device.snmp
         for name, group in self._snmp_groups:
             level = "priv" if group.endswith("priv") else "noauth" if group.endswith("noauth") else "auth"
