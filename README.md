@@ -15,9 +15,7 @@ which does the same for firewall policies.
 ## Status
 
 Pre-alpha. Cisco IOS / IOS XE, Arista EOS, HPE Aruba AOS-CX and AOS-S (ProCurve)
-convert in every
-direction for the system
-settings (hostname, domain, DNS, NTP, syslog, banner, spanning-tree mode), VLANs,
+convert in every direction for the system settings (hostname, domain, DNS, NTP, syslog, banner, spanning-tree mode), VLANs,
 interfaces (switchport access and trunk, voice VLAN, LAGs and LACP, SVIs,
 loopbacks, the management port, subinterfaces), IPv4 and IPv6 addressing, DHCP
 relay, VRFs and static routes. Everything else (BGP, OSPF, ACLs, SNMP, AAA, ...)
