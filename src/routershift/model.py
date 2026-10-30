@@ -7,7 +7,7 @@
 Every parser normalises to these semantics and every emitter may rely on them:
 
 * Interfaces carry a **canonical name** (``Ethernet1/0/1``, ``Port-channel10``,
-  ``Vlan20``, ``Loopback0``, ``Management0``) and keep the name the source used
+  ``Vlan20``, ``Loopback0``, ``Management1``) and keep the name the source used
   in ``source_name``. Emitters map the canonical name to their own naming
   through a port map the user can override; they never parse ``source_name``.
 * Addresses and prefixes are in CIDR notation (``10.0.0.1/24``, ``2001:db8::1/64``);
@@ -83,6 +83,8 @@ class System:
     dns_servers: List[str] = field(default_factory=list)
     ntp_servers: List[str] = field(default_factory=list)
     syslog_servers: List[str] = field(default_factory=list)
+    # VRF through which the device reaches its DNS, NTP and syslog servers ("" = the default VRF).
+    service_vrf: str = ""
 
 
 @dataclass
@@ -98,6 +100,9 @@ class Interface:
     name: str  # canonical
     kind: InterfaceKind
     source_name: str = ""
+    # Nominal speed class of a physical port as its name tells it ("1g", "10g", "25g", "40g", "100g"), so a
+    # writer that names ports by speed (IOS) picks the right prefix; "" when the name does not say.
+    media: str = ""
     description: str = ""
     shutdown: bool = False
     mtu: Optional[int] = None
