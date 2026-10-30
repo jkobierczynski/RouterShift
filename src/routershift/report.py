@@ -11,6 +11,28 @@ from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Dict, List, Tuple
 
+from .model import Unparsed
+
+
+# Words after which a configuration line carries a secret; the report shows "<removed>" instead.
+_SECRET_WORDS = {"community", "password", "secret", "key", "key-string", "md5", "sha", "auth", "priv"}
+_SECRET_TYPES = {"ciphertext", "plaintext", "encrypted", "cipher"}
+
+
+def redact(text: str) -> str:
+    words = text.split()
+    result = list(words)
+    n = 0
+    while n < len(words) - 1:
+        if words[n].lower() in _SECRET_WORDS:
+            n += 1
+            # "password 7 <hash>", "secret 0 <text>", "password ciphertext <hash>": the type stays, the secret goes
+            if n < len(words) - 1 and (words[n].isdigit() and len(words[n]) == 1 or words[n] in _SECRET_TYPES):
+                n += 1
+            result[n] = "<removed>"
+        n += 1
+    return " ".join(result)
+
 
 class Severity(IntEnum):
     INFO = 0  # exact, worth knowing
@@ -77,6 +99,12 @@ class Report:
         item = self.item(kind, name)
         item.skipped = True
         item.findings.append(Finding(Severity.REVIEW, code, message))
+
+    def unparsed(self, entries: List[Unparsed]) -> None:
+        for entry in entries:
+            where = f" (in '{redact(entry.section)}')" if entry.section else ""
+            self.skip("unparsed", f"line {entry.line}: {redact(entry.text)}", "not-converted",
+                      f"not converted{where}; translate it by hand if the new device needs it")
 
     def counts(self) -> Dict[str, int]:
         result: Dict[str, int] = {}

@@ -18,6 +18,7 @@ from .report import Report
 PLATFORMS = {
     "ios": "Cisco IOS and IOS XE",
     "eos": "Arista EOS",
+    "aoscx": "HPE Aruba AOS-CX",
 }
 
 

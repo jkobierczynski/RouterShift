@@ -9,12 +9,12 @@ approximated and what a person has to look at.
 
 | Key | Platform | Read | Write | Milestone |
 |---|---|---|---|---|
-| `ios` | Cisco IOS and IOS XE | `show running-config` | CLI configuration | 1 |
-| `eos` | Arista EOS | `show running-config` | CLI configuration | 1 |
+| `ios` | Cisco IOS and IOS XE | `show running-config` | CLI configuration | 1 (done) |
+| `eos` | Arista EOS | `show running-config` | CLI configuration | 1 (done) |
 | `junos` | Juniper Junos (EX, QFX, MX, SRX in switching/routing) | `show configuration \| display set`, or braces | `set` commands, for `load set` | 2 |
 | `nxos` | Cisco NX-OS | `show running-config` | CLI configuration | 2 |
-| `aoscx` | HPE Aruba AOS-CX | `show running-config` | CLI configuration | 2 |
-| `aoss` | HPE Aruba AOS-S (ProCurve / ProVision) | `show running-config` | CLI configuration | 3 |
+| `aoscx` | HPE Aruba AOS-CX (10.x) | `show running-config` | CLI configuration | 1 (done) |
+| `aoss` | HPE Aruba AOS-S (ProCurve / ProVision) | `show running-config` | CLI configuration | 2 |
 | `comware` | HPE Comware (FlexFabric, 5130/5510...) | `display current-configuration` | CLI configuration | 3 |
 
 Every reader writes to the model and every writer reads from it, so each new
@@ -37,6 +37,17 @@ platform converts to and from all the others.
 | Access lists, standard and extended | `Acl`, `AclEntry` | 2 |
 | SNMP, local users | `Snmp`, `LocalUser` | 2 |
 | Route maps, prefix lists, AAA/TACACS/RADIUS, QoS, MLAG/VSX/vPC, VXLAN/EVPN | to come | 3+ |
+
+## Port names
+
+### AOS-CX specifics
+
+* Ports start shut down on AOS-CX, so the writer says `shutdown` or `no shutdown` on every port.
+* A voice VLAN is a VLAN marked `voice` and tagged on a port whose native VLAN is the data VLAN. The reader turns
+  such a port into an access port with a voice VLAN, and the writer does the reverse.
+* The management port is always in VRF `mgmt`; a default route in that VRF becomes its `default-gateway`.
+* LACP is set on the LAG, not on its members.
+* AOS-CX counts the slot of the fixed ports from 1 and IOS from 0, so `1/1/7` becomes `GigabitEthernet1/0/7`.
 
 ## Port names
 

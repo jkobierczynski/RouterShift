@@ -14,7 +14,8 @@ which does the same for firewall policies.
 
 ## Status
 
-Pre-alpha. Cisco IOS / IOS XE and Arista EOS convert both ways for the system
+Pre-alpha. Cisco IOS / IOS XE, Arista EOS and HPE Aruba AOS-CX convert in every
+direction for the system
 settings (hostname, domain, DNS, NTP, syslog, banner, spanning-tree mode), VLANs,
 interfaces (switchport access and trunk, voice VLAN, LAGs and LACP, SVIs,
 loopbacks, the management port, subinterfaces), IPv4 and IPv6 addressing, DHCP
@@ -26,7 +27,7 @@ masked.
 
 ```
 pip install .
-routershift convert --from ios --to eos running-config.txt -o eos.cfg --report report.txt
+routershift convert --from ios --to aoscx running-config.txt -o aoscx.cfg --report report.txt
 routershift parse --from eos running-config.txt      # the vendor-neutral model as JSON
 routershift platforms
 ```
