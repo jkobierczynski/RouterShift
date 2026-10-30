@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "routershift"
+description = "Converts switch and router configurations between vendors (Cisco, Arista, Juniper, HPE Aruba) and says item by item how faithful the result is"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE"]
+authors = [{ name = "Jurgen Kobierczynski" }]
+keywords = ["network", "migration", "switch", "router", "cisco", "ios", "nx-os", "arista", "eos", "juniper", "junos", "hpe", "aruba", "aos-cx", "procurve", "comware"]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Environment :: Console",
+    "Intended Audience :: System Administrators",
+    "Intended Audience :: Telecommunications Industry",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: System :: Networking",
+]
+dependencies = []
+dynamic = ["version"]
+
+[project.urls]
+Homepage = "https://github.com/jkobierczynski/RouterShift"
+Source = "https://github.com/jkobierczynski/RouterShift"
+Issues = "https://github.com/jkobierczynski/RouterShift/issues"
+
+[project.optional-dependencies]
+dev = ["pytest>=7", "mypy>=1.8"]
+
+[tool.setuptools.dynamic]
+version = { attr = "routershift.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.mypy]
+strict = true
+files = ["src/routershift"]
