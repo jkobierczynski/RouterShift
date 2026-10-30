@@ -18,6 +18,7 @@ AOS-CX differs from the Cisco style in ways that matter to the model:
 from __future__ import annotations
 
 import ipaddress
+import re
 from typing import Callable, Dict, List, Optional, Tuple
 
 from .. import acl as acl_text
@@ -25,10 +26,11 @@ from .. import bgp as bgp_text
 from .. import dhcp as dhcp_text
 from .. import fhrp
 from .. import ospf as ospf_text
+from .. import aaa as aaa_text
 from .. import confparse
 from ..confparse import Node
 from ..errors import ParseError
-from ..model import (Acl, Device, DhcpPool, FhrpGroup, NtpKey, SnmpCommunity, SnmpHost, SnmpUser, Interface, InterfaceKind, LacpMode, Origin, Ospf, StaticRoute,
+from ..model import (AaaGroup, AaaMethod, AaaServer, Acl, Device, LocalUser, DhcpPool, FhrpGroup, NtpKey, SnmpCommunity, SnmpHost, SnmpUser, Interface, InterfaceKind, LacpMode, Origin, Ospf, StaticRoute,
                      StpMode, SwitchportMode, Unparsed, Vlan)
 from .ioslike import _is_address, _vlan_ids
 
@@ -54,6 +56,9 @@ def canonical(name: str) -> Tuple[str, InterfaceKind]:
             return f"Ethernet{name}", InterfaceKind.SUBINTERFACE
         return f"Ethernet{name}", InterfaceKind.ETHERNET
     return name, InterfaceKind.OTHER
+
+
+AOSCX_ROLES = [(15, "administrators"), (1, "operators")]
 
 
 class _Reader:
@@ -95,6 +100,10 @@ class _Reader:
             "dhcp-server": self.dhcp_server,
             "snmp-server": self.snmp,
             "snmpv3": self.snmpv3,
+            "user": self.user,
+            "radius-server": self.aaa_host,
+            "tacacs-server": self.aaa_host,
+            "aaa": self.aaa,
         }
         for node in roots:
             if node.text.startswith(_NOISE):
@@ -130,6 +139,14 @@ class _Reader:
 
     def ip(self, node: Node) -> bool:
         w = node.words
+        if w[1] == "source-interface" and len(w) >= 5 and w[2] in ("radius", "tacacs", "all") and w[3] == "interface":
+            # ip source-interface radius|tacacs|all interface X [vrf V]
+            # X is 1/1/1, vlan10 or loopback0 (or "vlan 10")
+            end = w.index("vrf") if "vrf" in w else len(w)
+            name = re.sub(r"^(vlan|loopback)(\d)", r"\1 \2", " ".join(w[4:end]))
+            for protocol in (["radius", "tacacs"] if w[2] == "all" else [w[2]]):
+                self.device.aaa.source[protocol] = canonical(name)[0]
+            return end in (5, 6) and len(w) in (end, end + 2)
         if w[1:3] == ["dns", "domain-name"] and len(w) == 4:
             self.device.system.domain_name = w[3]
             return True
@@ -221,6 +238,94 @@ class _Reader:
                 args = args[2:]
             s.hosts.append(host)
             return not args and host.version in ("1", "2c", "3")
+        return False
+
+    def user(self, node: Node) -> bool:
+        """user U group G password plaintext|ciphertext X"""
+        w = node.words
+        if len(w) != 7 or w[2] != "group" or w[4] != "password" or w[5] not in ("plaintext", "ciphertext"):
+            return False
+        privilege = aaa_text.privilege(w[3], AOSCX_ROLES)
+        user = LocalUser(w[1], privilege, origin=Origin(node.line, node.text))
+        if w[5] == "plaintext":
+            user.password = w[6]
+        else:
+            user.password_hash, user.hash_type = w[6], "aoscx-ciphertext"
+        self.device.users.append(user)
+        return privilege is not None
+
+    def _key(self, args: List[str]) -> str:
+        """key plaintext|ciphertext K: the key, '' when encrypted."""
+        return args[2] if args[1] == "plaintext" else ""
+
+    def aaa_host(self, node: Node) -> bool:
+        """radius-server|tacacs-server host A [key plaintext|ciphertext K] [auth-port N] [acct-port N] [port N]
+        [timeout N] [vrf V]"""
+        w = node.words
+        if w[1] != "host" or len(w) < 3:
+            return False
+        server = AaaServer("radius" if w[0] == "radius-server" else "tacacs", str(ipaddress.ip_address(w[2])),
+                           origin=Origin(node.line, node.text))
+        args = w[3:]
+        while args:
+            if args[0] == "key" and len(args) >= 3:
+                server.key, args = self._key(args), args[3:]
+            elif args[0] == "vrf" and len(args) >= 2:
+                server.vrf, args = args[1], args[2:]
+            elif args[0] in ("auth-port", "acct-port", "port", "timeout") and len(args) >= 2:
+                setattr(server, {"port": "auth_port"}.get(args[0], args[0].replace("-", "_")), int(args[1]))
+                args = args[2:]
+            else:
+                return False
+        self.device.aaa.servers.append(server)
+        return True
+
+    def aaa(self, node: Node) -> bool:
+        w = node.words
+        a = self.device.aaa
+        origin = Origin(node.line, node.text)
+        if w[1:3] == ["group", "server"] and len(w) == 5 and w[3] in ("radius", "tacacs"):
+            group = AaaGroup(w[3], w[4], origin=origin)
+            a.groups[group.name] = group
+            for child in node.children:
+                c = child.words
+                if c[0] == "server" and len(c) >= 2:
+                    group.servers.append(str(ipaddress.ip_address(c[1])))
+                    rest = c[2:]
+                    if rest[-2:-1] == ["vrf"]:
+                        group.vrf, rest = rest[-1], rest[:-2]
+                    if rest[:1] == ["port"]:
+                        rest = rest[2:]
+                    if rest:
+                        self.unparsed(child, node.text)
+                else:
+                    self.unparsed(child, node.text)
+            return True
+        # aaa authentication login NAME ..., aaa authorization commands NAME ..., aaa accounting all-mgmt NAME start-stop
+        if w[1:3] in (["authentication", "login"], ["authorization", "commands"], ["accounting", "all-mgmt"]) \
+                and len(w) >= 5:
+            args = w[4:]
+            methods = []
+            record = ""
+            if w[1] == "accounting":
+                record, args = args[0], args[1:]
+            while args:
+                if args[0] == "group" and len(args) >= 2:
+                    methods += [f"group:{name}" for name in args[1:] if name not in ("local", "none")]
+                    methods += [name for name in args[1:] if name in ("local", "none")]
+                    args = []
+                elif args[0] in ("local", "none"):
+                    methods.append(args[0])
+                    args = args[1:]
+                else:
+                    return False
+            if w[1] == "accounting":  # one list for exec sessions and commands
+                a.methods.append(AaaMethod("accounting", "exec", methods, w[3], record=record, origin=origin))
+                a.methods.append(AaaMethod("accounting", "commands", list(methods), w[3], 15, record, origin))
+            else:
+                a.methods.append(AaaMethod(w[1], w[2], methods, w[3], 15 if w[2] == "commands" else None,
+                                           origin=origin))
+            return True
         return False
 
     def snmpv3(self, node: Node) -> bool:

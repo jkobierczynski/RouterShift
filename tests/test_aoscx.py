@@ -49,7 +49,7 @@ def test_aoscx_to_ios() -> None:
     assert "logging host 10.0.5.14 vrf Mgmt-vrf\n" in out
     text = report.to_text()
     assert "AQBapQ1bXyzSecretHashValue" not in text
-    assert "password ciphertext <removed>" in text
+    assert "user admin: skipped" in text and "cannot be used on the target" in text
 
 
 def test_aoscx_to_eos_time_zone() -> None:

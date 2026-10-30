@@ -21,9 +21,10 @@ communities, v3 users and notification hosts), VLANs, interfaces
 (switchport access and trunk, voice VLAN, LAGs and LACP, SVIs, loopbacks, the
 management port, subinterfaces), IPv4 and IPv6 addressing, DHCP relay and server, VRFs,
 static routes, IPv4/IPv6 access lists with their interface bindings, gateway
-redundancy (HSRP, VRRP, anycast gateways), OSPF, BGP, and NAT and site-to-site
-IPsec VPNs (on IOS, EOS and Comware; the AOS switches have neither). Everything else (route
-maps, AAA, QoS, ...) is listed in the report under "Not understood", line by
+redundancy (HSRP, VRRP, anycast gateways), OSPF, BGP, NAT and site-to-site
+IPsec VPNs (on IOS, EOS and Comware; the AOS switches have neither), local users and
+privilege levels, and AAA (RADIUS and TACACS+ servers and groups, login, enable, command
+and accounting method lists). Everything else (route maps, LDAP, 802.1X, QoS, ...) is listed in the report under "Not understood", line by
 line, with secrets masked.
 
 ## Usage

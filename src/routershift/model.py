@@ -430,9 +430,61 @@ class SnmpUser:
 @dataclass
 class LocalUser:
     name: str
-    privilege: Optional[int] = None  # 15 = full administrator
+    privilege: Optional[int] = None  # 15 = full administrator, 1 = read-only operator
+    password: str = ""  # clear text, when the source has it (or a reversible type 7)
     password_hash: str = ""  # carried only when the target accepts the same hash
-    hash_type: str = ""
+    hash_type: str = ""  # "md5-crypt" ($1$), "sha512-crypt" ($6$), or a platform's own form ("ios-scrypt", ...)
+    origin: Origin = field(default_factory=Origin)
+
+
+@dataclass
+class AaaServer:
+    """A RADIUS or TACACS+ server. Its key is a secret: reports never show it."""
+
+    protocol: str  # "radius" or "tacacs"
+    address: str
+    name: str = ""  # IOS 'radius server NAME', Comware scheme
+    key: str = ""  # "" when the source holds it encrypted
+    auth_port: Optional[int] = None  # RADIUS authentication / TACACS+ port; None = the default (1812 / 49)
+    acct_port: Optional[int] = None  # RADIUS accounting; None = 1813
+    timeout: Optional[int] = None
+    vrf: str = ""
+    origin: Origin = field(default_factory=Origin)
+
+
+@dataclass
+class AaaGroup:
+    protocol: str  # "radius" or "tacacs"
+    name: str
+    servers: List[str] = field(default_factory=list)  # addresses
+    vrf: str = ""
+    origin: Origin = field(default_factory=Origin)
+
+
+@dataclass
+class AaaMethod:
+    """A method list: how logins are checked, commands authorized and sessions accounted.
+
+    Methods are "group:NAME" (a server group), "group:radius" / "group:tacacs" (every server of that protocol),
+    "local", "enable", "none" or "if-authenticated".
+    """
+
+    kind: str  # "authentication", "authorization" or "accounting"
+    service: str  # "login", "enable", "exec" or "commands"
+    methods: List[str] = field(default_factory=list)
+    name: str = "default"
+    level: Optional[int] = None  # commands: the privilege level
+    record: str = ""  # accounting: "start-stop" or "stop-only"
+    origin: Origin = field(default_factory=Origin)
+
+
+@dataclass
+class Aaa:
+    servers: List[AaaServer] = field(default_factory=list)
+    groups: Dict[str, AaaGroup] = field(default_factory=dict)
+    methods: List[AaaMethod] = field(default_factory=list)
+    source: Dict[str, str] = field(default_factory=dict)  # protocol -> canonical source interface
+    enable_secret: Optional[LocalUser] = None  # IOS/EOS enable secret, as a user named "enable"
 
 
 @dataclass
@@ -465,6 +517,7 @@ class Device:
     stp_mode: Optional[StpMode] = None
     snmp: Snmp = field(default_factory=Snmp)
     users: List[LocalUser] = field(default_factory=list)
+    aaa: Aaa = field(default_factory=Aaa)
     unparsed: List[Unparsed] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:

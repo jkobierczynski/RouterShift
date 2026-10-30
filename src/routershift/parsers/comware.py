@@ -21,6 +21,7 @@ import ipaddress
 import re
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
+from .. import aaa as aaa_text
 from .. import acl as acl_text
 from .. import bgp as bgp_text
 from .. import confparse
@@ -29,9 +30,9 @@ from .. import ospf as ospf_text
 from .. import vpn as vpn_text
 from ..confparse import Node
 from ..errors import ParseError
-from ..model import (Acl, AclAction, AclEntry, Device, DhcpPool, FhrpGroup, IkePolicy, IpsecPeer, IpsecTransform,
-                     NtpKey, PreSharedKey, SnmpCommunity, SnmpGroup, SnmpHost, SnmpUser, Interface, InterfaceKind, LacpMode, NatPool,
-                     NatRule, Origin, Ospf, OspfNetwork, StaticRoute, StpMode, SwitchportMode, Unparsed, Vlan)
+from ..model import (AaaGroup, AaaMethod, AaaServer, Acl, AclAction, AclEntry, Device, DhcpPool, FhrpGroup, IkePolicy, IpsecPeer, IpsecTransform,
+                     NtpKey, PreSharedKey, SnmpCommunity, SnmpGroup, SnmpHost, SnmpUser, Interface, InterfaceKind, LacpMode, LocalUser,
+                     NatPool, NatRule, Origin, Ospf, OspfNetwork, StaticRoute, StpMode, SwitchportMode, Unparsed, Vlan)
 from .ioslike import _cidr, _is_address
 
 _PREFIXES: List[Tuple[str, InterfaceKind, str]] = [
@@ -55,6 +56,9 @@ _ABBREVIATIONS = {
 }
 _NAME = re.compile(r"^([A-Za-z-]+?)\s*(\d[\d/.:]*)$")
 _NOISE = ("version ", "return")
+
+# Comware user roles for the privilege levels (level-N roles cover the rest)
+COMWARE_ROLES = [(15, "network-admin"), (1, "network-operator")]
 
 
 def canonical(name: str) -> Tuple[str, InterfaceKind, str]:
@@ -125,6 +129,9 @@ class _Reader:
         self._peer_profiles: List[Tuple[IpsecPeer, str]] = []
         self._pfs: Dict[str, int] = {}  # transform set -> PFS group
         self._nat_groups: Dict[str, str] = {}  # address-group number -> pool name
+        self._nas_ip: Dict[str, Tuple[str, int]] = {}  # protocol -> (source address, line)
+        self._domains: Dict[str, List[AaaMethod]] = {}
+        self._default_domain = "system"
 
     def unparsed(self, node: Node, section: str = "") -> None:
         self.device.unparsed.append(Unparsed(node.line, node.text, section))
@@ -160,6 +167,12 @@ class _Reader:
             "ike": self.ike,
             "snmp-agent": self.snmp,
             "ipsec": self.ipsec,
+            "local-user": self.local_user,
+            "super": self.super_password,
+            "radius": self.aaa_scheme,
+            "hwtacacs": self.aaa_scheme,
+            "domain": self.domain,
+            "line": self.line,
         }
         for node in roots:
             if node.text.startswith(_NOISE):
@@ -315,6 +328,204 @@ class _Reader:
             s.users.append(user)
             return not args
         return False
+
+    # users and AAA -----------------------------------------------------------------------------------------------------
+
+    @staticmethod
+    def _password(user: LocalUser, w: List[str]) -> bool:
+        """simple|hash|cipher VALUE"""
+        if len(w) != 2:
+            return False
+        if w[0] == "simple":
+            user.password = w[1]
+        elif w[0] in ("hash", "cipher"):
+            user.password_hash, user.hash_type = w[1], f"comware-{w[0]}"
+        else:
+            return False
+        return True
+
+    @staticmethod
+    def role_level(role: str) -> Optional[int]:
+        if role.startswith("level-") and role[len("level-"):].isdigit():
+            return int(role[len("level-"):])
+        return aaa_text.privilege(role, COMWARE_ROLES)
+
+    def local_user(self, node: Node) -> bool:
+        """local-user U [class manage]: password, service-type, authorization-attribute user-role"""
+        w = node.words
+        if w[2:] not in ([], ["class", "manage"]):
+            return False
+        user = LocalUser(w[1], origin=Origin(node.line, node.text))
+        self.device.users.append(user)
+        for child in node.children:
+            c = child.words
+            if c[0] == "password" and self._password(user, c[1:]):
+                continue
+            if c[0] == "service-type" or c[:2] == ["authorization-attribute", "work-directory"]:
+                continue
+            if c[:2] == ["authorization-attribute", "user-role"] and len(c) == 3:
+                level = self.role_level(c[2])
+                if level is not None:
+                    user.privilege = max(level, user.privilege or 0)
+                    continue
+            self.unparsed(child, node.text)
+        return True
+
+    def super_password(self, node: Node) -> bool:
+        """super password [role R] simple|hash|cipher X: the password to raise the role"""
+        w = node.words
+        args = w[2:]
+        if args[:1] == ["role"] and len(args) >= 2:
+            if args[1] != "network-admin":
+                return False
+            args = args[2:]
+        user = LocalUser("enable", 15, origin=Origin(node.line, node.text))
+        self.device.aaa.enable_secret = user
+        return w[1] == "password" and self._password(user, args)
+
+    def aaa_scheme(self, node: Node) -> bool:
+        """radius|hwtacacs scheme S (a server group) or radius|hwtacacs nas-ip A"""
+        w = node.words
+        protocol = "radius" if w[0] == "radius" else "tacacs"
+        if w[1] == "nas-ip" and len(w) == 3:
+            self._nas_ip[protocol] = (w[2], node.line)
+            return True
+        if w[1] != "scheme" or len(w) != 3:
+            return False
+        a = self.device.aaa
+        group = AaaGroup(protocol, w[2], origin=Origin(node.line, node.text))
+        a.groups[group.name] = group
+        timeout: Optional[int] = None
+        found: List[AaaServer] = []
+        for child in node.children:
+            c = child.words
+            if c[0] in ("primary", "secondary") and len(c) >= 3:
+                server = self._scheme_server(protocol, c[1:], child, found)
+                if server is not None:
+                    if server.address not in group.servers:
+                        group.servers.append(server.address)
+                    continue
+            elif c[0] == "vpn-instance" and len(c) == 2:
+                group.vrf = c[1]
+                continue
+            elif c[:2] == ["timer", "response-timeout"] and len(c) == 3:
+                timeout = int(c[2])
+                continue
+            elif c[0] == "nas-ip" and len(c) == 2:
+                self._nas_ip[protocol] = (c[1], child.line)
+                continue
+            elif c[0] in ("user-name-format", "key"):  # key: the scheme-wide key, read below
+                if c[0] == "key" and len(c) == 4 and c[2] in ("simple", "cipher"):
+                    for server in found:
+                        server.key = server.key or (c[3] if c[2] == "simple" else "")
+                continue
+            self.unparsed(child, node.text)
+        for server in found:
+            server.timeout = timeout
+            server.vrf = server.vrf or group.vrf
+        return True
+
+    def _scheme_server(self, protocol: str, c: List[str], child: Node, found: List[AaaServer]) -> Optional[AaaServer]:
+        """authentication|authorization|accounting A [port] [key simple|cipher K] [vpn-instance V]"""
+        role, address, args = c[0], c[1], c[2:]
+        if role not in ("authentication", "authorization", "accounting") or not _is_address(address):
+            return None
+        server = next((s for s in found if s.address == address), None)
+        if server is None:
+            server = AaaServer(protocol, address, origin=Origin(child.line, child.text))
+            found.append(server)
+            existing = next((s for s in self.device.aaa.servers if s.protocol == protocol and s.address == address), None)
+            if existing is None:
+                self.device.aaa.servers.append(server)
+            else:  # the same server in another scheme
+                found[-1] = server = existing
+        port: Optional[int] = None
+        while args:
+            if args[0].isdigit():
+                port, args = int(args[0]), args[1:]
+            elif args[0] == "key" and len(args) >= 3 and args[1] in ("simple", "cipher"):
+                server.key = args[2] if args[1] == "simple" else server.key
+                args = args[3:]
+            elif args[0] == "vpn-instance" and len(args) >= 2:
+                server.vrf, args = args[1], args[2:]
+            else:
+                return None
+        if port is not None:
+            if role == "accounting" and protocol == "radius":
+                server.acct_port = None if port == 1813 else port
+            elif role == "authentication" or protocol == "tacacs":
+                server.auth_port = None if port == (1812 if protocol == "radius" else 49) else port
+        return server
+
+    _DOMAIN = {("authentication", "login"): ("authentication", "login"),
+               ("authentication", "super"): ("authentication", "enable"),
+               ("authorization", "login"): ("authorization", "exec"),
+               ("authorization", "command"): ("authorization", "commands"),
+               ("accounting", "login"): ("accounting", "exec"),
+               ("accounting", "command"): ("accounting", "commands")}
+
+    def domain(self, node: Node) -> bool:
+        """domain NAME: the method lists of an ISP domain; domain default enable NAME"""
+        w = node.words
+        if w[1:3] == ["default", "enable"] and len(w) == 4:
+            self._default_domain = w[3]
+            return True
+        if len(w) != 2:
+            return False
+        methods = self._domains.setdefault(w[1], [])
+        for child in node.children:
+            c = child.words
+            kind = self._DOMAIN.get((c[0], c[1])) if len(c) >= 3 else None
+            words = self._methods(c[2:]) if kind else None
+            if kind is None or not words:
+                if c[0] != "state":
+                    self.unparsed(child, node.text)
+                continue
+            m = AaaMethod(kind[0], kind[1], words, origin=Origin(child.line, child.text))
+            if kind[1] == "commands":
+                m.level = 15
+            if kind[0] == "accounting":
+                m.record = "start-stop"
+            methods.append(m)
+        return True
+
+    def line(self, node: Node) -> bool:
+        """line vty|class ...: AAA ('authentication-mode scheme') is what the method lists describe"""
+        if node.words[1] not in ("vty", "class", "aux", "console"):
+            return False
+        for child in node.children:
+            if child.words != ["authentication-mode", "scheme"]:
+                self.unparsed(child, node.text)
+        return True
+
+    @staticmethod
+    def _methods(words: List[str]) -> Optional[List[str]]:
+        methods = []
+        while words:
+            if words[0] in ("radius-scheme", "hwtacacs-scheme") and len(words) >= 2:
+                methods.append(f"group:{words[1]}")
+                words = words[2:]
+            elif words[0] in ("local", "none"):
+                methods.append(words[0])
+                words = words[1:]
+            else:
+                return None
+        return methods
+
+    def _finish_aaa(self) -> None:
+        a = self.device.aaa
+        for name, methods in self._domains.items():
+            for m in methods:
+                m.name = "default" if name == self._default_domain else name
+                a.methods.append(m)
+        for protocol, (address, line) in self._nas_ip.items():
+            source = next((i.name for i in self.device.interfaces.values()
+                           if any(ipaddress.ip_interface(x).ip == ipaddress.ip_address(address) for x in i.ipv4)), "")
+            if source:
+                a.source[protocol] = source
+            else:
+                self.device.unparsed.append(Unparsed(line, f"{'radius' if protocol == 'radius' else 'hwtacacs'} nas-ip "
+                                                        f"{address}", "no interface has the source address"))
 
     def info_center(self, node: Node) -> bool:
         w = node.words
@@ -1038,6 +1249,7 @@ class _Reader:
 
     def _finish(self) -> None:
         ospf_text.attach(self.device, self._ospf_areas, {})
+        self._finish_aaa()
         for peer, profile in self._peer_profiles:
             proposals, remotes = self._ike_profiles.get(profile, ([], []))
             peer.ike_policies = list(proposals)

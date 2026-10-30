@@ -16,8 +16,9 @@ from .. import fhrp
 from .. import nat as nat_text
 from .. import ospf as ospf_text
 from .. import snmp as snmp_text
+from .. import aaa as aaa_text
 from .. import vpn as vpn_text
-from ..model import (AclAction, Bgp, BgpNeighbor, Device, DhcpPool, IkePolicy, IpsecPeer, NatRule, SnmpGroup, FhrpGroup, Interface, InterfaceKind, LacpMode, Ospf,
+from ..model import (AaaMethod, AaaServer, LocalUser, AclAction, Bgp, BgpNeighbor, Device, DhcpPool, IkePolicy, IpsecPeer, NatRule, SnmpGroup, FhrpGroup, Interface, InterfaceKind, LacpMode, Ospf,
                      StaticRoute, StpMode, SwitchportMode)
 from ..names import PortMapper
 from ..report import Report, Severity
@@ -1013,6 +1014,138 @@ class Writer:
         if s.ntp_servers:
             self.report.item("system", "ntp servers")
 
+    _HASHES = {"ios": ("md5-crypt", "ios-type8", "ios-type9"), "eos": ("md5-crypt", "sha512-crypt")}
+    _EOS_ROLES = [(15, "network-admin"), (1, "network-operator")]
+
+    def _secret(self, user: LocalUser, kind: str = "user") -> str:
+        """'secret ...' for a user or the enable secret, or "" when it cannot be written (reported)."""
+        found = aaa_text.password(user, self._HASHES[self.target], self.report, kind)
+        if found is None:
+            return ""
+        form, value = found
+        if form == "none":
+            return "nopassword" if kind == "user" else ""
+        if form == "plain":
+            return f"secret 0 {value}"
+        if form == "md5-crypt":
+            return f"secret 5 {value}"
+        if form == "sha512-crypt":
+            return f"secret sha512 {value}"
+        return f"secret {form[len('ios-type'):]} {value}"
+
+    def _users(self) -> None:
+        a = self.device.aaa
+        if a.enable_secret is not None:
+            secret = self._secret(a.enable_secret, "enable")
+            if secret:
+                self.report.item("management", "enable secret")
+                self.out.append(f"enable {secret}" if self.ios else f"enable password {secret.split(' ', 1)[1]}")
+        for u in self.device.users:
+            label = aaa_text.user_label(u)
+            secret = self._secret(u)
+            if not secret:
+                continue
+            self.report.item("management", label)
+            words = [f"username {u.name}"]
+            if u.privilege is not None:
+                words.append(f"privilege {u.privilege}")
+            if not self.ios:
+                words.append(f"role {aaa_text.role(u.privilege, self._EOS_ROLES)}")
+            if secret == "nopassword":
+                self.report.add("management", label, Severity.REVIEW, "no-password",
+                                "the user has no password in the source; give it one")
+            self.out.append(" ".join(words + [secret]))
+
+    def _group_vrf(self, addresses: List[str], protocol: str) -> str:
+        """The VRF the servers of a group share, if they do."""
+        vrfs = {s.vrf for s in self.device.aaa.servers if s.address in addresses and s.protocol == protocol}
+        return vrfs.pop() if len(vrfs) == 1 else ""
+
+    def _aaa_server_name(self, s: AaaServer) -> str:
+        return s.name or f"{s.protocol.upper()}-{s.address}"
+
+    def _aaa(self) -> None:
+        a = self.device.aaa
+        rep = self.report
+        if not aaa_text.has_aaa(self.device):
+            return
+        if self.ios:
+            self.out.append("aaa new-model")
+        for s in a.servers:
+            label = aaa_text.server_label(s)
+            rep.item("management", label)
+            key = aaa_text.key(s, rep)
+            if self.ios:
+                if s.vrf and not any(s.address in g.servers and (g.vrf or self._group_vrf(g.servers, g.protocol)) == s.vrf
+                                     for g in a.groups.values()):
+                    rep.add("management", label, Severity.REVIEW, "aaa-vrf",
+                            f"IOS sets the VRF on a server group ('ip vrf forwarding'); put the server in a group in "
+                            f"VRF {s.vrf}")
+                ports = (f" auth-port {s.auth_port or 1812} acct-port {s.acct_port or 1813}"
+                         if s.protocol == "radius" else "")
+                lines = [f"address ipv4 {s.address}{ports}"]
+                if s.protocol == "tacacs" and s.auth_port:
+                    lines.append(f"port {s.auth_port}")
+                lines.append(f"key {key}")
+                if s.timeout is not None:
+                    lines.append(f"timeout {s.timeout}")
+                self.out.append(f"{'radius' if s.protocol == 'radius' else 'tacacs'} server {self._aaa_server_name(s)}")
+                self.out += [self.ind + line for line in lines]
+                self.out.append("!")
+            else:
+                words = [f"{s.protocol}-server host {s.address}"]
+                words += [f"vrf {self.vrf(s.vrf)}"] if s.vrf else []
+                if s.protocol == "radius":
+                    words += [f"auth-port {s.auth_port}"] if s.auth_port else []
+                    words += [f"acct-port {s.acct_port}"] if s.acct_port else []
+                elif s.auth_port:
+                    words.append(f"port {s.auth_port}")
+                words += [f"timeout {s.timeout}"] if s.timeout is not None else []
+                self.out.append(" ".join(words + [f"key {key}"]))
+        by_address = {(s.protocol, s.address): s for s in a.servers}
+        for g in a.groups.values():
+            rep.item("management", f"{g.protocol} group {g.name}")
+            self.out.append(f"aaa group server {'radius' if g.protocol == 'radius' else 'tacacs+'} {g.name}")
+            for address in g.servers:
+                server = by_address.get((g.protocol, address))
+                if self.ios:
+                    if server is None:
+                        rep.add("management", f"{g.protocol} group {g.name}", Severity.REVIEW, "aaa-server",
+                                f"server {address} is not defined; left out")
+                        continue
+                    self.out.append(f"{self.ind}server name {self._aaa_server_name(server)}")
+                else:
+                    vrf = server.vrf if server else g.vrf
+                    self.out.append(f"{self.ind}server {address}" + (f" vrf {self.vrf(vrf)}" if vrf else ""))
+            vrf = g.vrf or self._group_vrf(g.servers, g.protocol)
+            if self.ios and vrf:
+                self.out.append(f"{self.ind}ip vrf forwarding {self.vrf(vrf)}")
+            self.out.append("!")
+        for protocol, source in a.source.items():
+            vrf = "" if self.ios else self._group_vrf([s.address for s in a.servers], protocol)
+            self.out.append(f"ip {protocol}" + (f" vrf {self.vrf(vrf)}" if vrf else "") +
+                            f" source-interface {self.port(source)}")
+        for m in a.methods:
+            label = aaa_text.method_label(m)
+            rep.item("management", label)
+            words = [f"aaa {m.kind} {m.service}"]
+            if m.service == "commands":
+                words.append("all" if not self.ios and m.level == 15 else str(m.level))
+            words.append(m.name)
+            if m.record:
+                words.append(m.record)
+            for method in m.methods:
+                if method.startswith("group:"):
+                    group = method[len("group:"):]
+                    words.append(f"group {'tacacs+' if group == 'tacacs' else group}")
+                else:
+                    words.append(method)
+            if m.name != "default":
+                rep.add("management", label, Severity.REVIEW, "aaa-list",
+                        f"named list {m.name}: check that the lines (vty, console) still refer to it")
+            self.out.append(" ".join(words))
+        self.out.append("!")
+
     _SNMP_AUTH = {"ios": ["md5", "sha", "sha256"], "eos": ["md5", "sha", "sha256", "sha384", "sha512"]}
     _SNMP_PRIV = {"ios": ["des", "3des", "aes128", "aes192", "aes256"], "eos": ["des", "aes128", "aes192", "aes256"]}
 
@@ -1086,6 +1219,8 @@ class Writer:
         vrf = self.vrf(s.service_vrf) if s.service_vrf else ""
         self._ntp(vrf)
         self._snmp()
+        self._users()
+        self._aaa()
         for host in s.syslog_servers:
             if not vrf:
                 self.out.append(f"logging host {host}")

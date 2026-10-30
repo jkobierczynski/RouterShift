@@ -22,9 +22,10 @@ from .. import ospf as ospf_text
 from .. import confparse, names
 from .. import dhcp as dhcp_text
 from .. import vpn as vpn_text
+from .. import aaa as aaa_text
 from ..confparse import Node
 from ..errors import ParseError
-from ..model import (Acl, Device, DhcpPool, FhrpGroup, IkePolicy, IpsecPeer, IpsecTransform, NtpKey, PreSharedKey,
+from ..model import (AaaGroup, AaaMethod, AaaServer, Acl, Device, LocalUser, DhcpPool, FhrpGroup, IkePolicy, IpsecPeer, IpsecTransform, NtpKey, PreSharedKey,
                      SnmpCommunity, SnmpGroup, SnmpHost, SnmpUser, NatPool, NatRule, Interface, InterfaceKind, LacpMode, Origin, Ospf, OspfNetwork,
                      StaticRoute, StpMode, SwitchportMode, Unparsed, Vlan)
 
@@ -61,6 +62,9 @@ def _is_address(text: str) -> bool:
         return False
 
 
+_EOS_ROLES = [(15, "network-admin"), (1, "network-operator")]
+
+
 class _Reader:
     def __init__(self, platform: str) -> None:
         self.device = Device(platform=platform)
@@ -72,6 +76,7 @@ class _Reader:
         self._ospf_areas: List[Tuple[str, str, str]] = []  # interface, process ("" = the interface's VRF), area
         self._dhcp_excluded: Dict[str, List[Tuple[str, str]]] = {}  # VRF -> excluded ranges
         self._ikev2_lifetime: Optional[int] = None
+        self._server_names: Dict[str, str] = {}  # IOS AAA server name -> address
         self._eos_sa: Dict[str, IpsecPeer] = {}  # EOS SA policy -> its PFS group and lifetime
         self._eos_keys: Dict[str, str] = {}  # EOS profile -> shared key
 
@@ -114,6 +119,13 @@ class _Reader:
             "service": lambda node: node.words == ["service", "dhcp"],
             "crypto": self.crypto,
             "snmp-server": self.snmp,
+            "username": self.username,
+            "enable": self.enable,
+            "aaa": self.aaa,
+            "radius": self.aaa_server,
+            "tacacs": self.aaa_server,
+            "radius-server": self.aaa_host,
+            "tacacs-server": self.aaa_host,
         }
         for node in roots:
             if node.text.startswith(_NOISE) or node.text == "end":
@@ -317,6 +329,10 @@ class _Reader:
             return self.acl(node, 4)
         if w[1:] == ["security"]:
             return self.eos_security(node)
+        if w[1] in ("radius", "tacacs") and w[-2] == "source-interface" and len(w) in (4, 6):
+            # IOS: ip radius source-interface X; EOS: ip radius [vrf V] source-interface X
+            self.device.aaa.source["radius" if w[1] == "radius" else "tacacs"] = names.canonical(w[-1])[0]
+            return len(w) == 4 or w[2] == "vrf"
         if w[1:3] == ["nat", "pool"] and len(w) == 8 and w[6] in ("netmask", "prefix-length"):
             length = w[7] if w[6] == "prefix-length" else str(ipaddress.ip_network(f"0.0.0.0/{w[7]}").prefixlen)
             first, last = str(ipaddress.IPv4Address(w[4])), str(ipaddress.IPv4Address(w[5]))
@@ -403,6 +419,173 @@ class _Reader:
             return False
         iface.nat = "outside"
         self.device.nat_rules.append(rule)
+        return True
+
+    # users and AAA ----------------------------------------------------------------------------------------------------
+
+    def _type7(self, value: str) -> str:
+        """IOS type 7 reads back to the clear text; EOS's type 7 is its own, so it stays unknown."""
+        return aaa_text.decode_type7(value) if self.device.platform == "ios" else ""
+
+    @staticmethod
+    def _password(user: LocalUser, args: List[str], platform: str) -> bool:
+        """secret|password [0|5|7|8|9|sha512] VALUE, as IOS and EOS write it."""
+        kind, args = args[0], args[1:]
+        form = args[0] if len(args) == 2 else "0"
+        value = args[-1]
+        if form == "0":
+            user.password = value
+        elif form == "7" and kind == "password" and platform == "ios":
+            user.password = aaa_text.decode_type7(value)
+            return bool(user.password)
+        elif form in ("5", "sha512"):
+            user.password_hash, user.hash_type = value, aaa_text.hash_type(value)
+        elif form in ("8", "9"):
+            user.password_hash, user.hash_type = value, f"ios-type{form}"
+        else:
+            return False
+        return len(args) in (1, 2)
+
+    def username(self, node: Node) -> bool:
+        """username U [privilege N] [role R] [secret|password [type] X | nopassword]"""
+        w = node.words
+        user = LocalUser(w[1], origin=Origin(node.line, node.text))
+        args = w[2:]
+        while args:
+            if args[0] == "privilege" and len(args) >= 2:
+                user.privilege, args = int(args[1]), args[2:]
+            elif args[0] == "role" and len(args) >= 2:
+                role = aaa_text.privilege(args[1], _EOS_ROLES)
+                if role is None:
+                    return False
+                user.privilege = user.privilege if user.privilege is not None else role
+                args = args[2:]
+            elif args[0] in ("secret", "password"):
+                self.device.users.append(user)
+                return self._password(user, args, self.device.platform)
+            elif args == ["nopassword"]:
+                args = []
+            else:
+                return False
+        self.device.users.append(user)
+        return True
+
+    def enable(self, node: Node) -> bool:
+        """enable secret [type] X; EOS: enable password [sha512] X"""
+        w = node.words
+        if w[1] not in ("secret", "password") or len(w) < 3:
+            return False
+        user = LocalUser("enable", 15, origin=Origin(node.line, node.text))
+        self.device.aaa.enable_secret = user
+        return self._password(user, w[1:], self.device.platform)
+
+    def aaa(self, node: Node) -> bool:
+        w = node.words
+        a = self.device.aaa
+        origin = Origin(node.line, node.text)
+        if w[1:] in (["new-model"], ["session-id", "common"]) or w[1] == "root":
+            return w[1] != "root"
+        if w[1:3] == ["group", "server"] and len(w) == 5 and w[3] in ("radius", "tacacs+"):
+            group = AaaGroup("radius" if w[3] == "radius" else "tacacs", w[4], origin=origin)
+            a.groups[group.name] = group
+            for child in node.children:
+                c = child.words
+                if c[:2] == ["server", "name"] and len(c) == 3:
+                    group.servers.append(f"name:{c[2]}")  # resolved in _finish, as the servers may come later
+                elif c[0] == "server" and len(c) in (2, 4):  # EOS: server A [vrf V]
+                    group.servers.append(c[1])
+                    group.vrf = c[3] if len(c) == 4 and c[2] == "vrf" else group.vrf
+                elif c[:3] == ["ip", "vrf", "forwarding"] and len(c) == 4:
+                    group.vrf = c[3]
+                elif c[0] in ("ip",) and c[1] in ("radius", "tacacs") and c[2:3] == ["source-interface"]:
+                    a.source[group.protocol] = names.canonical(c[-1])[0]
+                else:
+                    self.unparsed(child, node.text)
+            return True
+        if w[1] in ("authentication", "authorization", "accounting") and len(w) >= 4:
+            method = AaaMethod(w[1], w[2], origin=origin)
+            args = w[3:]
+            if method.service == "commands":
+                level = args[0]
+                method.level = 15 if level == "all" else int(level)
+                args = args[1:]
+            if method.service not in ("login", "enable", "exec", "commands") or not args:
+                return False
+            method.name, args = args[0], args[1:]
+            if method.kind == "accounting":
+                if not args or args[0] not in ("start-stop", "stop-only"):
+                    return False
+                method.record, args = args[0], args[1:]
+            while args:
+                if args[0] == "group" and len(args) >= 2:
+                    name = {"tacacs+": "tacacs"}.get(args[1], args[1])
+                    method.methods.append(f"group:{name}")
+                    args = args[2:]
+                elif args[0] in ("local", "none", "enable", "if-authenticated", "local-case"):
+                    method.methods.append("local" if args[0] == "local-case" else args[0])
+                    args = args[1:]
+                else:
+                    return False
+            a.methods.append(method)
+            return True
+        return False
+
+    def aaa_server(self, node: Node) -> bool:
+        """IOS: radius server NAME / tacacs server NAME, with address, ports, key and timeout inside."""
+        w = node.words
+        if w[1] != "server" or len(w) != 3:
+            return False
+        server = AaaServer("radius" if w[0] == "radius" else "tacacs", "", w[2], origin=Origin(node.line, node.text))
+        for child in node.children:
+            c = child.words
+            try:
+                if c[:2] == ["address", "ipv4"] and len(c) >= 3:
+                    server.address = str(ipaddress.ip_address(c[2]))
+                    rest = c[3:]
+                    while len(rest) >= 2 and rest[0] in ("auth-port", "acct-port"):
+                        setattr(server, rest[0].replace("-", "_"), int(rest[1]))
+                        rest = rest[2:]
+                    if rest:
+                        self.unparsed(child, node.text)
+                elif c[0] == "key" and len(c) in (2, 3):
+                    server.key = c[-1] if len(c) == 2 or c[1] == "0" else self._type7(c[2]) if c[1] == "7" else ""
+                elif c[0] == "port" and len(c) == 2:
+                    server.auth_port = int(c[1])
+                elif c[0] == "timeout" and len(c) == 2:
+                    server.timeout = int(c[1])
+                else:
+                    self.unparsed(child, node.text)
+            except ValueError:
+                self.unparsed(child, node.text)
+        if not server.address:
+            return False
+        self._server_names[server.name] = server.address
+        self.device.aaa.servers.append(server)
+        return True
+
+    def aaa_host(self, node: Node) -> bool:
+        """radius-server|tacacs-server host A [vrf V] [auth-port N] [acct-port N] [port N] [timeout N] [key [0|7] K]"""
+        w = node.words
+        protocol = "radius" if w[0] == "radius-server" else "tacacs"
+        if w[1] != "host" or len(w) < 3:
+            return w[1] in ("timeout", "retransmit", "deadtime") and len(w) == 3
+        server = AaaServer(protocol, str(ipaddress.ip_address(w[2])), origin=Origin(node.line, node.text))
+        args = w[3:]
+        while args:
+            if args[0] == "key" and len(args) >= 2:
+                form = args[1] if len(args) == 3 else "0"
+                server.key = args[-1] if form == "0" else self._type7(args[-1]) if form == "7" else ""
+                args = []
+            elif len(args) >= 2 and args[0] in ("vrf", "auth-port", "acct-port", "port", "timeout"):
+                if args[0] == "vrf":
+                    server.vrf = args[1]
+                else:
+                    attribute = {"port": "auth_port"}.get(args[0], args[0].replace("-", "_"))
+                    setattr(server, attribute, int(args[1]))
+                args = args[2:]
+            else:
+                return False
+        self.device.aaa.servers.append(server)
         return True
 
     # IPsec ------------------------------------------------------------------------------------------------------------
@@ -662,6 +845,14 @@ class _Reader:
         else:
             return False
         return True
+
+    def _finish_aaa(self) -> None:
+        for group in self.device.aaa.groups.values():
+            group.servers = [self._server_names.get(s[len("name:"):], s[len("name:"):]) if s.startswith("name:") else s
+                             for s in group.servers]
+            for server in self.device.aaa.servers:  # IOS sets the VRF on the group: the servers are reached in it
+                if server.address in group.servers and server.protocol == group.protocol and not server.vrf:
+                    server.vrf = group.vrf
 
     def _finish_vpn(self) -> None:
         for policy in self.device.ike_policies.values():
@@ -1324,6 +1515,7 @@ class _Reader:
 
     def _finish(self) -> None:
         self._finish_vpn()
+        self._finish_aaa()
         for pool in self.device.dhcp_pools:
             if pool.network:
                 pool.ranges = dhcp_text.subtract(pool.network, pool.ranges, self._dhcp_excluded.get(pool.vrf, []))
