@@ -19,6 +19,7 @@ from typing import Dict, List, Optional, Set, Tuple
 from .. import acl as acl_text
 from .. import dhcp as dhcp_text
 from .. import nat as nat_text
+from .. import vpn as vpn_text
 from .. import fhrp
 from .. import ospf as ospf_text
 from ..model import Device, FhrpGroup, Interface, InterfaceKind, LacpMode, StaticRoute, StpMode, SwitchportMode, Vlan
@@ -92,6 +93,7 @@ class Writer:
         self.spanning_tree()
         self.dhcp()
         nat_text.skip_all(self.device, self.report, "AOS-S")
+        vpn_text.skip_all(self.device, self.report, "AOS-S")
         if self.device.bgp is not None:
             self.report.skip("bgp", f"bgp {self.device.bgp.local_as}", "bgp",
                              "not written: BGP on AOS-S depends on the model and release; configure it by hand")
@@ -112,6 +114,10 @@ class Writer:
                 self.report.skip("interface", self.label(iface), "subinterface",
                                  "AOS-S has no subinterfaces; carry the VLAN on a tagged port and put the address on "
                                  "the VLAN")
+                continue
+            if iface.kind == InterfaceKind.TUNNEL:
+                self.report.skip("interface", self.label(iface), "tunnel",
+                                 "tunnel interfaces are not converted for AOS-S; configure it by hand")
                 continue
             if iface.kind not in (InterfaceKind.ETHERNET, InterfaceKind.LAG) or iface.lag:
                 continue

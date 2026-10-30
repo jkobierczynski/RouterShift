@@ -26,9 +26,11 @@ from .. import bgp as bgp_text
 from .. import confparse
 from .. import dhcp as dhcp_text
 from .. import ospf as ospf_text
+from .. import vpn as vpn_text
 from ..confparse import Node
 from ..errors import ParseError
-from ..model import (Acl, AclAction, AclEntry, Device, DhcpPool, FhrpGroup, Interface, InterfaceKind, LacpMode, NatPool,
+from ..model import (Acl, AclAction, AclEntry, Device, DhcpPool, FhrpGroup, IkePolicy, IpsecPeer, IpsecTransform,
+                     PreSharedKey, Interface, InterfaceKind, LacpMode, NatPool,
                      NatRule, Origin, Ospf, OspfNetwork, StaticRoute, StpMode, SwitchportMode, Unparsed, Vlan)
 from .ioslike import _cidr, _is_address
 
@@ -119,6 +121,9 @@ class _Reader:
         self._vrrp_version = 3  # the Comware 7 default
         self._ospf_areas: List[Tuple[str, str, str]] = []
         self._dhcp_excluded: Dict[str, List[Tuple[str, str]]] = {}  # VRF -> forbidden ranges
+        self._ike_profiles: Dict[str, Tuple[List[str], List[str]]] = {}  # name -> (proposals, remote addresses)
+        self._peer_profiles: List[Tuple[IpsecPeer, str]] = []
+        self._pfs: Dict[str, int] = {}  # transform set -> PFS group
         self._nat_groups: Dict[str, str] = {}  # address-group number -> pool name
 
     def unparsed(self, node: Node, section: str = "") -> None:
@@ -152,6 +157,8 @@ class _Reader:
             "bgp": self.bgp,
             "dhcp": self.dhcp,
             "nat": self.nat,
+            "ike": self.ike,
+            "ipsec": self.ipsec,
         }
         for node in roots:
             if node.text.startswith(_NOISE):
@@ -440,6 +447,125 @@ class _Reader:
                 self.unparsed(child, node.text)
         return True
 
+    def ike(self, node: Node) -> bool:
+        """ike proposal N, ike keychain K, ike profile P (IKEv1)."""
+        w = node.words
+        if w[1] == "proposal" and len(w) == 3:
+            policy = IkePolicy(w[2], 1, ["des"], ["sha1"], [1], origin=Origin(node.line, node.text))
+            self.device.ike_policies[w[2]] = policy
+            self._children(node, lambda c: self._ike_proposal_line(policy, c.words))
+            return True
+        if w[1] == "keychain" and len(w) == 3:
+            self._children(node, lambda c: self._keychain_line(c))
+            return True
+        if w[1] == "profile" and len(w) == 3:
+            proposals: List[str] = []
+            remotes: List[str] = []
+            self._ike_profiles[w[2]] = (proposals, remotes)
+            self._children(node, lambda c: self._ike_profile_line(c.words, proposals, remotes))
+            return True
+        return False
+
+    def _children(self, node: Node, line: Callable[[Node], bool]) -> None:
+        for child in node.children:
+            try:
+                understood = line(child)
+            except (ValueError, IndexError):
+                understood = False
+            if not understood:
+                self.unparsed(child, node.text)
+
+    @staticmethod
+    def _ike_proposal_line(policy: IkePolicy, w: List[str]) -> bool:
+        if w[0] == "encryption-algorithm" and len(w) == 2:
+            policy.encryption = [vpn_text.read(vpn_text.COMWARE_ENC, w[1])]
+        elif w[0] == "authentication-algorithm" and len(w) == 2:
+            policy.integrity = [vpn_text.read(vpn_text.COMWARE_IKE_INT, w[1])]
+        elif w[0] == "dh" and len(w) == 2 and w[1].startswith("group"):
+            policy.dh_groups = [int(w[1][len("group"):])]
+        elif w[:2] == ["sa", "duration"] and len(w) == 3:
+            policy.lifetime = int(w[2])
+        elif w[0] == "authentication-method" and len(w) == 2:
+            policy.authentication = w[1]
+        else:
+            return False
+        return True
+
+    def _keychain_line(self, node: Node) -> bool:
+        """pre-shared-key address A [M] key simple|cipher K"""
+        w = node.words
+        if w[:2] != ["pre-shared-key", "address"] or "key" not in w or len(w) < 6:
+            return False
+        address = str(ipaddress.IPv4Address(w[2]))
+        kind, key = w[-2:]
+        if kind not in ("simple", "cipher"):
+            return False
+        self.device.psks[address] = PreSharedKey(address, key if kind == "simple" else "", Origin(node.line, node.text))
+        return True
+
+    @staticmethod
+    def _ike_profile_line(w: List[str], proposals: List[str], remotes: List[str]) -> bool:
+        if w[0] == "keychain" and len(w) == 2:
+            pass  # keys are looked up by address
+        elif w[:4] == ["match", "remote", "identity", "address"] and len(w) in (5, 6):
+            remotes.append(str(ipaddress.IPv4Address(w[4])))
+        elif w[0] == "proposal" and len(w) >= 2:
+            proposals.extend(w[1:])
+        elif w[0] == "local-identity" and w[1:2] == ["address"]:
+            pass
+        else:
+            return False
+        return True
+
+    def ipsec(self, node: Node) -> bool:
+        """ipsec transform-set TS, ipsec policy MAP SEQ isakmp, ipsec profile P [isakmp]."""
+        w = node.words
+        origin = Origin(node.line, node.text)
+        if w[1] == "transform-set" and len(w) == 3:
+            transform = IpsecTransform(w[2], origin=origin)
+            self.device.ipsec_transforms[w[2]] = transform
+            self._children(node, lambda c: self._transform_line(transform, c.words))
+            return True
+        if w[1] == "policy" and len(w) == 5 and w[4] == "isakmp":
+            peer = IpsecPeer(w[2], int(w[3]), origin=origin)
+        elif w[1] == "profile" and len(w) in (3, 4) and w[3:] in ([], ["isakmp"]):
+            peer = IpsecPeer(w[2], origin=origin)
+        else:
+            return False
+        self.device.ipsec_peers.append(peer)
+        self._children(node, lambda c: self._ipsec_policy_line(peer, c.words))
+        return True
+
+    def _transform_line(self, transform: IpsecTransform, w: List[str]) -> bool:
+        if w[:2] == ["esp", "encryption-algorithm"] and len(w) == 3:
+            transform.encryption = vpn_text.read(vpn_text.COMWARE_ESP_ENC, w[2])
+        elif w[:2] == ["esp", "authentication-algorithm"] and len(w) == 3:
+            transform.integrity = vpn_text.read(vpn_text.COMWARE_ESP_INT, w[2])
+        elif w[0] == "encapsulation-mode" and w[1:] in (["tunnel"], ["transport"]):
+            transform.mode = w[1]
+        elif w == ["protocol", "esp"]:
+            pass
+        elif w[0] == "pfs" and len(w) == 2 and w[1].startswith("dh-group"):
+            self._pfs[transform.name] = int(w[1][len("dh-group"):])
+        else:
+            return False
+        return True
+
+    def _ipsec_policy_line(self, peer: IpsecPeer, w: List[str]) -> bool:
+        if w[0] == "transform-set" and len(w) >= 2:
+            peer.transforms = w[1:]
+        elif w[:2] == ["security", "acl"] and len(w) in (3, 4) and not peer.profile:
+            peer.acl = w[3] if w[2] == "name" and len(w) == 4 else w[2]
+        elif w[0] == "remote-address" and len(w) == 2 and not peer.profile:
+            peer.peer = str(ipaddress.IPv4Address(w[1]))
+        elif w[0] == "ike-profile" and len(w) == 2:
+            self._peer_profiles.append((peer, w[1]))
+        elif w[:3] == ["sa", "duration", "time-based"] and len(w) == 4:
+            peer.lifetime = int(w[3])
+        else:
+            return False
+        return True
+
     def nat(self, node: Node) -> bool:
         """nat address-group N [name X] / address A B; nat static outbound A [vpn-instance V] B."""
         w = node.words
@@ -675,7 +801,11 @@ class _Reader:
         return True
 
     def interface(self, node: Node) -> bool:
-        source = " ".join(node.words[1:])
+        words = node.words[1:]
+        tunnel_mode = ""
+        if len(words) == 3 and words[1] == "mode":  # interface Tunnel0 mode ipsec
+            words, tunnel_mode = words[:1], words[2]
+        source = " ".join(words)
         canon, kind, media = canonical(source)
         if source.upper() == "NULL0" and not node.children:
             return True  # always there
@@ -685,6 +815,10 @@ class _Reader:
         if kind == InterfaceKind.ETHERNET or source.startswith("Bridge-Aggregation"):
             iface.mode = SwitchportMode.ACCESS  # bridge mode is the default on a switch
         self.device.interfaces[canon] = iface
+        if tunnel_mode in ("gre", "ipsec"):
+            iface.tunnel_mode = tunnel_mode
+        elif tunnel_mode:
+            self.unparsed(node)
         for child in node.children:
             try:
                 understood = self.interface_line(iface, child.words)
@@ -772,6 +906,14 @@ class _Reader:
             iface.ospf_network = "point-to-point" if w[2] == "p2p" else "broadcast"
         elif w[0] == "nat" and n >= 2:
             return self.nat_interface(iface, w)
+        elif w[:3] == ["ipsec", "apply", "policy"] and n == 4:
+            iface.crypto_map = w[3]
+        elif w[0] == "source" and n == 2 and iface.kind == InterfaceKind.TUNNEL:
+            iface.tunnel_source = w[1] if _is_address(w[1]) else canonical(w[1])[0]
+        elif w[0] == "destination" and n == 2 and iface.kind == InterfaceKind.TUNNEL:
+            iface.tunnel_destination = str(ipaddress.IPv4Address(w[1]))
+        elif w[:4] == ["tunnel", "protection", "ipsec", "profile"] and n == 5:
+            iface.tunnel_profile = w[4]
         elif w[:2] == ["vrrp", "vrid"]:
             return self._vrrp(iface, w[2:])
         elif w[:3] == ["undo", "vrrp", "vrid"]:
@@ -796,6 +938,14 @@ class _Reader:
 
     def _finish(self) -> None:
         ospf_text.attach(self.device, self._ospf_areas, {})
+        for peer, profile in self._peer_profiles:
+            proposals, remotes = self._ike_profiles.get(profile, ([], []))
+            peer.ike_policies = list(proposals)
+            if remotes and not peer.peer and not peer.profile:
+                peer.peer = remotes[0]
+        for peer in self.device.ipsec_peers:
+            if peer.transforms and peer.transforms[0] in self._pfs:
+                peer.pfs_group = self._pfs[peer.transforms[0]]
         for rule in self.device.nat_rules:
             rule.pool = self._nat_groups.get(rule.pool, rule.pool)
         for nat_pool in self.device.nat_pools.values():  # an address group has no mask; take it from the interface

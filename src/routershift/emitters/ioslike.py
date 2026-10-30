@@ -15,7 +15,8 @@ from .. import dhcp as dhcp_text
 from .. import fhrp
 from .. import nat as nat_text
 from .. import ospf as ospf_text
-from ..model import (AclAction, Bgp, BgpNeighbor, Device, DhcpPool, NatRule, FhrpGroup, Interface, InterfaceKind, LacpMode, Ospf,
+from .. import vpn as vpn_text
+from ..model import (AclAction, Bgp, BgpNeighbor, Device, DhcpPool, IkePolicy, IpsecPeer, NatRule, FhrpGroup, Interface, InterfaceKind, LacpMode, Ospf,
                      StaticRoute, StpMode, SwitchportMode)
 from ..names import PortMapper
 from ..report import Report, Severity
@@ -68,6 +69,7 @@ class Writer:
         self.spanning_tree()
         self.vrfs()
         self.vlans()
+        self.vpn()
         for iface in self.device.interfaces.values():
             self.interface(iface)
         self.routing()
@@ -185,6 +187,7 @@ class Writer:
         lines += self._acl_bindings(iface, add)
         lines += self._fhrp(iface, name)
         lines += self._nat_interface(iface)
+        lines += self._tunnel(iface, add)
         lines += self._ospf_interface(iface)
         if not self.ios and any(self._serves(pool, iface) for pool in self.device.dhcp_pools):
             lines.append("dhcp server ipv4")
@@ -454,6 +457,245 @@ class Writer:
                             + ", ".join(self.port(n) for n in outside[1:]))
         where = self.port(outside[0]) if outside else "OUTSIDE-INTERFACE"
         return f"ip nat inside source list {acl} interface {where} overload{vrf}"
+
+    # IPsec ------------------------------------------------------------------------------------------------------------
+
+    def _tunnel(self, iface: Interface, add: _Add) -> List[str]:
+        lines = []
+        if iface.crypto_map and self.ios:
+            lines.append(f"crypto map {iface.crypto_map}")
+        elif iface.crypto_map:
+            add(Severity.REVIEW, "vpn-crypto-map", f"crypto map {iface.crypto_map} not applied: EOS has no crypto maps")
+        if iface.kind != InterfaceKind.TUNNEL:
+            return lines
+        if not self.ios and iface.tunnel_mode:
+            lines.append(f"tunnel mode {iface.tunnel_mode}")
+        if iface.tunnel_source:
+            source = iface.tunnel_source
+            if not vpn_text.is_address(source):
+                source = self.port(source) if self.ios else f"interface {self.port(source)}"
+            lines.append(f"tunnel source {source}")
+        if iface.tunnel_destination:
+            lines.append(f"tunnel destination {iface.tunnel_destination}")
+        if self.ios and iface.tunnel_mode == "ipsec":
+            lines.append("tunnel mode ipsec ipv4")
+        if iface.tunnel_profile:
+            lines.append(f"tunnel {'protection ' if self.ios else ''}ipsec profile {iface.tunnel_profile}")
+        return lines
+
+    def vpn(self) -> None:
+        if not vpn_text.has_vpn(self.device):
+            return
+        for policy in self.device.ike_policies.values():
+            label = vpn_text.policy_label(policy)
+            self.report.item("vpn", label)
+            if policy.authentication != "pre-share":
+                self.report.add("vpn", label, Severity.REVIEW, "vpn-auth",
+                                f"authentication {policy.authentication} is not converted; pre-shared keys are written")
+        if self.ios:
+            self._ios_vpn()
+        else:
+            self._eos_vpn()
+
+    def _ios_vpn(self) -> None:
+        peers = self.device.ipsec_peers
+        v1 = [p for p in self.device.ike_policies.values() if p.version == 1]
+        v2 = [p for p in self.device.ike_policies.values() if p.version == 2]
+        priorities = {p.name: p.name if p.name.isdigit() else str(10 * (n + 1)) for n, p in enumerate(v1)}
+        for policy in v1:
+            label = vpn_text.policy_label(policy)
+            if priorities[policy.name] != policy.name:
+                self.report.add("vpn", label, Severity.APPROX, "vpn-renumbered",
+                                f"written as ISAKMP policy {priorities[policy.name]}; IOS numbers its policies")
+            self.out.append(f"crypto isakmp policy {priorities[policy.name]}")
+            self.out += [self.ind + line for line in self._ios_ike_lines(policy, label)]
+            self.out.append("!")
+        for address in sorted({a for p in peers if p.ike_version == 1 for a in vpn_text.peers_of(self.device, p)}):
+            key = vpn_text.key_for(self.device, address, self.report, f"IKEv1 key {address}")
+            self.out.append(f"crypto isakmp key {key} address {address}")
+        v2_peers = [p for p in peers if p.ike_version == 2]
+        if v2_peers:
+            for policy in v2:
+                self.out.append(f"crypto ikev2 proposal {policy.name}")
+                self.out += [self.ind + line for line in self._ios_ike_lines(policy, vpn_text.policy_label(policy))]
+                self.out.append("!")
+            if v2:
+                self.out.append("crypto ikev2 policy IKEV2-POLICY")
+                self.out += [f"{self.ind}proposal {policy.name}" for policy in v2]
+                self.out.append("!")
+            addresses = sorted({a for p in v2_peers for a in vpn_text.peers_of(self.device, p)})
+            if addresses:
+                self.out.append("crypto ikev2 keyring IKEV2-KEYS")
+                for address in addresses:
+                    key = vpn_text.key_for(self.device, address, self.report, f"IKEv2 key {address}")
+                    self.out += [f"{self.ind}peer {address}", f"{self.ind * 2}address {address}",
+                                 f"{self.ind * 2}pre-shared-key {key}"]
+                self.out.append("!")
+            lifetime = next((p.lifetime for p in v2 if p.lifetime), None)
+            for p in v2_peers:
+                self.out.append(f"crypto ikev2 profile {self._ikev2_profile(p)}")
+                self.out += [f"{self.ind}match identity remote address {a} 255.255.255.255"
+                             for a in vpn_text.peers_of(self.device, p)]
+                self.out += [f"{self.ind}authentication remote pre-share", f"{self.ind}authentication local pre-share",
+                             f"{self.ind}keyring local IKEV2-KEYS"]
+                if lifetime:
+                    self.out.append(f"{self.ind}lifetime {lifetime}")
+                self.out.append("!")
+        for transform in self.device.ipsec_transforms.values():
+            label = f"transform {transform.name}"
+            self.report.item("vpn", label)
+            words = [vpn_text.pick(vpn_text.IOS_ESP_ENC, transform.encryption, self.report, label)]
+            if transform.integrity:
+                words.append(vpn_text.pick(vpn_text.IOS_ESP_INT, transform.integrity, self.report, label))
+            self.out.append(f"crypto ipsec transform-set {transform.name} {' '.join(words)}")
+            self.out += [f"{self.ind}mode {transform.mode}", "!"]
+        for p in peers:
+            label = vpn_text.peer_label(p)
+            self.report.item("vpn", label)
+            self._check_peer(p, label)
+            self.out.append(f"crypto ipsec profile {p.name}" if p.profile else f"crypto map {p.name} {p.seq} ipsec-isakmp")
+            lines = [f"set peer {p.peer}"] if p.peer else []
+            if p.transforms:
+                lines.append("set transform-set " + " ".join(p.transforms))
+            if p.pfs_group:
+                lines.append(f"set pfs group{p.pfs_group}")
+            if p.lifetime is not None:
+                lines.append(f"set security-association lifetime seconds {p.lifetime}")
+            if p.ike_version == 2:
+                lines.append(f"set ikev2-profile {self._ikev2_profile(p)}")
+            if p.acl:
+                lines.append(f"match address {acl_text.safe_name(p.acl)}")
+            self.out += [self.ind + line for line in lines]
+            self.out.append("!")
+
+    @staticmethod
+    def _ikev2_profile(p: IpsecPeer) -> str:
+        return f"IKEV2-{p.name}" + (f"-{p.seq}" if not p.profile else "")
+
+    def _ios_ike_lines(self, policy: IkePolicy, label: str) -> List[str]:
+        lines = []
+        if policy.version == 1:
+            for attr in ("encryption", "integrity", "dh_groups"):
+                if len(getattr(policy, attr)) > 1:
+                    self.report.add("vpn", label, Severity.APPROX, "vpn-one-algorithm",
+                                    f"an ISAKMP policy takes one {attr.replace('_', ' ')}; the first is written")
+            if policy.encryption:
+                lines.append("encryption " + vpn_text.pick(vpn_text.IOS_ISAKMP_ENC, policy.encryption[0],
+                                                           self.report, label))
+            if policy.integrity:
+                lines.append("hash " + vpn_text.pick(vpn_text.IOS_HASH, policy.integrity[0], self.report, label))
+            lines.append("authentication pre-share")
+            if policy.dh_groups:
+                lines.append(f"group {policy.dh_groups[0]}")
+            if policy.lifetime is not None:
+                lines.append(f"lifetime {policy.lifetime}")
+            return lines
+        if policy.encryption:
+            lines.append("encryption " + " ".join(vpn_text.pick(vpn_text.IOS_IKEV2_ENC, e, self.report, label)
+                                                  for e in policy.encryption))
+        if policy.integrity:
+            lines.append("integrity " + " ".join(vpn_text.pick(vpn_text.IOS_IKEV2_INT, i, self.report, label)
+                                                 for i in policy.integrity))
+        if policy.dh_groups:
+            lines.append("group " + " ".join(str(g) for g in policy.dh_groups))
+        return lines
+
+    def _check_peer(self, p: IpsecPeer, label: str) -> None:
+        if p.acl and p.acl not in self.device.acls:
+            self.report.add("vpn", label, Severity.REVIEW, "acl-missing", f"ACL {p.acl} is not defined")
+        missing = [t for t in p.transforms if t not in self.device.ipsec_transforms]
+        if missing:
+            self.report.add("vpn", label, Severity.REVIEW, "vpn-transform",
+                            "transform " + ", ".join(missing) + " is not defined")
+        if not vpn_text.policies_for(self.device, p):
+            self.report.add("vpn", label, Severity.REVIEW, "vpn-ike",
+                            f"no IKEv{p.ike_version} proposal is defined for it")
+
+    def _eos_vpn(self) -> None:
+        lines: List[str] = []
+        for policy in self.device.ike_policies.values():
+            label = vpn_text.policy_label(policy)
+            lines.append(f"ike policy {policy.name}")
+            if policy.version == 1:
+                lines.append(f"{self.ind}version 1")
+            for attr in ("encryption", "integrity", "dh_groups"):
+                if len(getattr(policy, attr)) > 1:
+                    self.report.add("vpn", label, Severity.APPROX, "vpn-one-algorithm",
+                                    f"an EOS IKE policy takes one {attr.replace('_', ' ')}; the first is written")
+            if policy.encryption:
+                lines.append(f"{self.ind}encryption " + vpn_text.pick(vpn_text.EOS_ENC, policy.encryption[0],
+                                                                      self.report, label))
+            if policy.integrity:
+                lines.append(f"{self.ind}integrity " + vpn_text.pick(vpn_text.EOS_INT, policy.integrity[0],
+                                                                     self.report, label))
+            if policy.dh_groups:
+                lines.append(f"{self.ind}dh-group {policy.dh_groups[0]}")
+            hours = vpn_text.lifetime_hours(policy.lifetime)
+            if hours is not None:
+                if hours * 3600 != policy.lifetime:
+                    self.report.add("vpn", label, Severity.APPROX, "vpn-lifetime",
+                                    f"lifetime rounded to {hours} hours, as EOS counts in hours")
+                lines.append(f"{self.ind}ike-lifetime {hours}")
+        profiles = [p for p in self.device.ipsec_peers if p.profile]
+        for p in self.device.ipsec_peers:
+            if not p.profile:
+                self.report.skip("vpn", vpn_text.peer_label(p), "vpn-crypto-map",
+                                 "EOS protects traffic on tunnel interfaces only; build a tunnel interface with an "
+                                 "IPsec profile for this peer")
+        sa_names: Dict[str, str] = {}
+        for transform in self.device.ipsec_transforms.values():
+            users = [p for p in profiles if p.transforms[:1] == [transform.name]]
+            settings = {(p.pfs_group, p.lifetime) for p in users}
+            for p in users:
+                sa_names[p.name] = transform.name if len(settings) == 1 else f"{transform.name}-{p.name}"
+            for name, p in {sa_names[p.name]: p for p in users}.items():
+                label = f"transform {transform.name}"
+                self.report.item("vpn", label)
+                lines.append(f"sa policy {name}")
+                lines.append(f"{self.ind}esp encryption " + vpn_text.pick(vpn_text.EOS_ESP_ENC, transform.encryption,
+                                                                          self.report, label))
+                if transform.integrity:
+                    lines.append(f"{self.ind}esp integrity " + vpn_text.pick(vpn_text.EOS_INT, transform.integrity,
+                                                                             self.report, label))
+                if p.pfs_group:
+                    lines.append(f"{self.ind}pfs dh-group {p.pfs_group}")
+                hours = vpn_text.lifetime_hours(p.lifetime)
+                if hours is not None:
+                    if hours * 3600 != p.lifetime:
+                        self.report.add("vpn", label, Severity.APPROX, "vpn-lifetime",
+                                        f"SA lifetime rounded to {hours} hours, as EOS counts in hours")
+                    lines.append(f"{self.ind}sa lifetime {hours} hours")
+                if transform.mode != "tunnel":
+                    self.report.add("vpn", label, Severity.REVIEW, "vpn-mode",
+                                    f"{transform.mode} mode is not written; EOS runs tunnel mode")
+        for p in profiles:
+            label = vpn_text.peer_label(p)
+            self.report.item("vpn", label)
+            self._check_peer(p, label)
+            lines.append(f"profile {p.name}")
+            policies = vpn_text.policies_for(self.device, p)
+            if len(policies) > 1:
+                self.report.add("vpn", label, Severity.APPROX, "vpn-one-policy",
+                                f"an EOS profile takes one IKE policy; {policies[0].name} is written")
+            if policies:
+                lines.append(f"{self.ind}ike-policy {policies[0].name}")
+            if len(p.transforms) > 1:
+                self.report.add("vpn", label, Severity.APPROX, "vpn-one-transform",
+                                f"an EOS profile takes one SA policy; {p.transforms[0]} is written")
+            if p.name in sa_names:
+                lines.append(f"{self.ind}sa-policy {sa_names[p.name]}")
+            lines.append(f"{self.ind}connection start")
+            addresses = vpn_text.peers_of(self.device, p)
+            keys = {vpn_text.key_for(self.device, a, self.report, label) for a in addresses}
+            if len(keys) > 1:
+                self.report.add("vpn", label, Severity.REVIEW, "vpn-key",
+                                "the tunnels using this profile have different keys; one profile per key is needed")
+            key = sorted(keys)[0] if keys else vpn_text.key_for(self.device, "", self.report, label)
+            lines.append(f"{self.ind}shared-key {key}")
+        if lines:
+            self.out.append("ip security")
+            self.out += [self.ind + line for line in lines]
+            self.out.append("!")
 
     # DHCP server ------------------------------------------------------------------------------------------------------
 

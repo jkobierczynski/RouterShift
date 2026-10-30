@@ -132,6 +132,11 @@ class Interface:
     nat: str = ""  # "inside", "outside" or ""
     ospf_cost: Optional[int] = None
     ospf_network: str = ""  # "", "point-to-point", "broadcast"
+    crypto_map: str = ""  # policy-based IPsec applied on the interface
+    tunnel_source: str = ""  # tunnel: a canonical interface name or an address
+    tunnel_destination: str = ""
+    tunnel_mode: str = ""  # tunnel: "gre" or "ipsec"
+    tunnel_profile: str = ""  # tunnel: the IPsec profile protecting it (an IpsecPeer name)
     origin: Origin = field(default_factory=Origin)
 
 
@@ -256,6 +261,62 @@ class Acl:
 
 
 @dataclass
+class IkePolicy:
+    """An IKE proposal: IOS 'crypto isakmp policy' or 'crypto ikev2 proposal', Comware 'ike proposal', EOS 'ike policy'.
+
+    Algorithms use neutral names: encryption des, 3des, aes-128, aes-192, aes-256, aes-gcm-128, aes-gcm-256;
+    integrity md5, sha1, sha256, sha384, sha512.
+    """
+
+    name: str
+    version: int = 1
+    encryption: List[str] = field(default_factory=list)
+    integrity: List[str] = field(default_factory=list)
+    dh_groups: List[int] = field(default_factory=list)
+    lifetime: Optional[int] = None  # seconds; None = the default, a day
+    authentication: str = "pre-share"  # anything else (certificates) is reported
+    origin: Origin = field(default_factory=Origin)
+
+
+@dataclass
+class IpsecTransform:
+    """How ESP protects the traffic: IOS transform set, Comware transform set, the ESP half of an EOS SA policy."""
+
+    name: str
+    encryption: str = ""
+    integrity: str = ""  # "" with GCM
+    mode: str = "tunnel"  # or "transport"
+    origin: Origin = field(default_factory=Origin)
+
+
+@dataclass
+class IpsecPeer:
+    """One IPsec connection: a crypto map entry (policy-based), or an IPsec profile used by tunnel interfaces."""
+
+    name: str  # crypto map or profile name
+    seq: int = 0  # crypto map sequence; 0 for a profile
+    peer: str = ""  # remote address; a profile takes it from the tunnel destination
+    acl: str = ""  # crypto map: the traffic to protect
+    transforms: List[str] = field(default_factory=list)
+    pfs_group: int = 0  # 0 = no PFS
+    lifetime: Optional[int] = None  # SA lifetime in seconds; None = the default, an hour
+    ike_version: int = 1
+    ike_policies: List[str] = field(default_factory=list)  # pinned proposals; empty = any the device has
+    origin: Origin = field(default_factory=Origin)
+
+    @property
+    def profile(self) -> bool:
+        return self.seq == 0
+
+
+@dataclass
+class PreSharedKey:
+    peer: str  # the remote address; 0.0.0.0 = any
+    key: str = ""  # "" when the source holds it encrypted, which no other platform can read
+    origin: Origin = field(default_factory=Origin)
+
+
+@dataclass
 class NatPool:
     name: str
     first: str
@@ -336,6 +397,10 @@ class Device:
     dhcp_pools: List[DhcpPool] = field(default_factory=list)
     nat_pools: Dict[str, NatPool] = field(default_factory=dict)
     nat_rules: List[NatRule] = field(default_factory=list)
+    ike_policies: Dict[str, IkePolicy] = field(default_factory=dict)
+    ipsec_transforms: Dict[str, IpsecTransform] = field(default_factory=dict)
+    ipsec_peers: List[IpsecPeer] = field(default_factory=list)
+    psks: Dict[str, PreSharedKey] = field(default_factory=dict)  # by peer address
     stp_mode: Optional[StpMode] = None
     snmp: Snmp = field(default_factory=Snmp)
     users: List[LocalUser] = field(default_factory=list)
