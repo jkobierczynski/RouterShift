@@ -25,6 +25,7 @@ platform converts to and from all the others.
 | Area | Model | Milestone |
 |---|---|---|
 | System: hostname, domain, banner, DNS, NTP, syslog, time zone | `System` | 1 |
+| NTP authentication keys, trusted keys, preferred server, source interface | `System.ntp_*`, `NtpKey` | 2 (done) |
 | VLANs | `Vlan` | 1 |
 | Interfaces: physical, LAG, SVI, loopback, management, subinterfaces | `Interface` | 1 |
 | Switchport: access, trunk, native, allowed, voice VLAN | `Interface` | 1 |
@@ -39,7 +40,8 @@ platform converts to and from all the others.
 | Access lists (IPv4 and IPv6) and their interface bindings | `Acl`, `AclEntry`, `Interface.acl_in` ... | 2 (done) |
 | NAT: pools, dynamic source NAT and PAT, one-to-one and port forwarding rules, inside/outside interfaces | `NatPool`, `NatRule`, `Interface.nat` | 2 (done) |
 | Site-to-site IPsec VPN: IKE proposals, transform sets, crypto maps, IPsec profiles on tunnel interfaces, pre-shared keys | `IkePolicy`, `IpsecTransform`, `IpsecPeer`, `PreSharedKey`, `Interface.tunnel_*` | 2 (done) |
-| SNMP, local users | `Snmp`, `LocalUser` | 2 |
+| SNMP: communities with access and ACL, location, contact, notification hosts (v1/v2c/v3, traps or informs), v3 groups and users, source interface | `Snmp`, `SnmpCommunity`, `SnmpHost`, `SnmpGroup`, `SnmpUser` | 2 (done) |
+| Local users | `LocalUser` | 2 |
 | Route maps, prefix lists, AAA/TACACS/RADIUS, QoS, MLAG/VSX/vPC, VXLAN/EVPN | to come | 3+ |
 
 ### AOS-S specifics
@@ -149,6 +151,21 @@ platform converts to and from all the others.
   and left out. AOS-CX and AOS-S switches have no NAT: every rule is reported, to move to a router or firewall.
 * Destination NAT other than port forwarding, NAT for IPv6 (NAT64, NPTv6), route maps in NAT rules and NAT
   timeouts are listed under "Not understood" for now.
+
+## NTP and SNMP
+
+* NTP servers keep their key and the preferred server; keys keep their algorithm and trust, and `ntp authenticate`
+  carries over. AOS-S has no preferred server (it is listed first) and switches from SNTP to NTP when keys are used.
+  AOS-CX and AOS-S pick the NTP and SNMP source interface themselves; a source interface is reported there.
+* SNMP communities keep read-only or read-write access and, on IOS, EOS and Comware, their ACL. AOS-S writes
+  read-only as `operator restricted` and read-write as `manager unrestricted`.
+* Notification hosts keep their version, community or user, traps or informs, and VRF. `snmp-server enable traps`
+  with a list of trap types is written as all traps. AOS-S takes v1/v2c hosts only; SNMPv3 targets are reported.
+* SNMPv3 users keep their group, authentication and privacy algorithms and keys. AOS-CX has no groups, AOS-S has
+  fixed ones (`managerpriv`, ...); both are reported. MIB views are reported, not converted.
+* Communities and keys in clear text are carried over. Encrypted ones (Comware cipher, AOS-CX ciphertext, EOS
+  localized keys, IOS and EOS type 7 NTP keys) become `CHANGE-ME`, and the report asks for them. The report never
+  shows a community or key: communities are numbered (`community #1 (ro)`).
 
 ## Site-to-site VPN (IPsec)
 

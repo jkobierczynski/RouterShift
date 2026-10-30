@@ -24,7 +24,8 @@ from .. import dhcp as dhcp_text
 from .. import vpn as vpn_text
 from ..confparse import Node
 from ..errors import ParseError
-from ..model import (Acl, Device, DhcpPool, FhrpGroup, IkePolicy, IpsecPeer, IpsecTransform, PreSharedKey, NatPool, NatRule, Interface, InterfaceKind, LacpMode, Origin, Ospf, OspfNetwork,
+from ..model import (Acl, Device, DhcpPool, FhrpGroup, IkePolicy, IpsecPeer, IpsecTransform, NtpKey, PreSharedKey,
+                     SnmpCommunity, SnmpGroup, SnmpHost, SnmpUser, NatPool, NatRule, Interface, InterfaceKind, LacpMode, Origin, Ospf, OspfNetwork,
                      StaticRoute, StpMode, SwitchportMode, Unparsed, Vlan)
 
 # Lines that only describe the file or the software, not the device's behaviour.
@@ -112,6 +113,7 @@ class _Reader:
             "dhcp": self.eos_dhcp,
             "service": lambda node: node.words == ["service", "dhcp"],
             "crypto": self.crypto,
+            "snmp-server": self.snmp,
         }
         for node in roots:
             if node.text.startswith(_NOISE) or node.text == "end":
@@ -138,14 +140,139 @@ class _Reader:
 
     def ntp(self, node: Node) -> bool:
         w = node.words
+        s = self.device.system
         if len(w) >= 3 and w[1] == "server":
             args = w[2:]
             if args[0] == "vrf" and len(args) >= 3:
-                self.device.system.service_vrf = args[1]
+                s.service_vrf = args[1]
                 args = args[2:]
-            self.device.system.ntp_servers.append(args[0])
-            return len(args) == 1 or args[1:] in (["prefer"], ["iburst"], ["prefer", "iburst"], ["iburst", "prefer"])
+            server = args[0]
+            s.ntp_servers.append(server)
+            options = args[1:]
+            while options:
+                if options[0] == "prefer":
+                    s.ntp_prefer = server
+                elif options[0] == "key" and len(options) >= 2:
+                    s.ntp_server_keys[server] = int(options[1])
+                    options = options[1:]
+                elif options[0] in ("source", "local-interface") and len(options) >= 2:
+                    s.ntp_source = names.canonical(options[1])[0]
+                    options = options[1:]
+                elif options[0] != "iburst":
+                    return False
+                options = options[1:]
+            return True
+        if w[1:] == ["authenticate"]:
+            s.ntp_authenticate = True
+            return True
+        if w[1] == "authentication-key" and len(w) >= 5:
+            # IOS: ntp authentication-key 1 md5 KEY [7]; EOS: ntp authentication-key 1 md5 [0|7] KEY
+            algorithm, rest = {"hmac-sha1": "sha1", "hmac-sha2-256": "sha256"}.get(w[3], w[3]), w[4:]
+            if len(rest) == 2 and rest[1] == "7":
+                key, encrypted = rest[0], True
+            elif len(rest) == 2 and rest[0] in ("0", "7"):
+                key, encrypted = rest[1], rest[0] == "7"
+            elif len(rest) == 1:
+                key, encrypted = rest[0], False
+            else:
+                return False
+            ntp_key = self._ntp_key(int(w[2]))
+            ntp_key.algorithm, ntp_key.key = algorithm, "" if encrypted else key
+            return algorithm in ("md5", "sha1", "sha256")
+        if w[1] == "trusted-key" and len(w) == 3:
+            self._ntp_key(int(w[2])).trusted = True
+            return True
+        if w[1] in ("source", "local-interface") and len(w) >= 3:
+            s.ntp_source = names.canonical(" ".join(w[2:]))[0]
+            return True
         return False
+
+    def _ntp_key(self, number: int) -> NtpKey:
+        return self.device.system.ntp_keys.setdefault(number, NtpKey(number))
+
+    def snmp(self, node: Node) -> bool:
+        w = node.words
+        s = self.device.snmp
+        origin = Origin(node.line, node.text)
+        if w[1] == "community" and len(w) >= 3:
+            community = SnmpCommunity(w[2], origin=origin)
+            args = w[3:]
+            if args[:1] == ["view"] and len(args) >= 2:
+                return False
+            if args and args[0].lower() in ("ro", "rw"):
+                community.access, args = args[0].lower(), args[1:]
+            if len(args) > 1:
+                return False
+            community.acl = args[0] if args else ""
+            s.communities.append(community)
+            return True
+        if w[1] in ("location", "contact") and len(w) >= 3:
+            setattr(s, w[1], node.text.split(None, 2)[2])
+            return True
+        if w[1:3] == ["enable", "traps"]:
+            s.traps = True
+            return True
+        if w[1] in ("trap-source", "local-interface") and len(w) == 3:
+            s.source = names.canonical(w[2])[0]
+            return True
+        if w[1] == "source-interface" and len(w) == 4:
+            s.source = names.canonical(w[3])[0]
+            return w[2] in ("traps", "informs", "all")
+        if w[1] == "vrf" and len(w) == 3:
+            s.vrf = w[2]
+            return True
+        if w[1] == "host" and len(w) >= 4:
+            return self._snmp_host(w[2:], origin)
+        if w[1] == "group" and len(w) >= 5 and w[3] == "v3":
+            group = SnmpGroup(w[2], w[4], origin=origin)
+            args = w[5:]
+            while len(args) >= 2 and args[0] in ("read", "write"):
+                setattr(group, f"{args[0]}_view", args[1])
+                args = args[2:]
+            s.groups[group.name] = group
+            return not args and group.level in ("noauth", "auth", "priv")
+        if w[1] == "user" and len(w) >= 5 and w[4] == "v3":
+            return self._snmp_user(w[2], w[3], w[5:], origin)
+        return False
+
+    def _snmp_host(self, args: List[str], origin: Origin) -> bool:
+        host = SnmpHost(str(ipaddress.ip_address(args[0])), origin=origin)
+        args = args[1:]
+        if args[:1] == ["vrf"] and len(args) >= 2:
+            host.vrf, args = args[1], args[2:]
+        if args[:1] in (["informs"], ["traps"]):
+            host.informs, args = args[0] == "informs", args[1:]
+        if args[:1] == ["version"] and len(args) >= 2:
+            host.version, args = args[1], args[2:]
+            if host.version == "3" and args:
+                host.level, args = args[0], args[1:]
+        if not args or host.version not in ("1", "2c", "3"):
+            return False
+        host.secret = args[0]
+        self.device.snmp.hosts.append(host)
+        return True  # trap types after the community narrow what is sent; every type is written
+
+    def _snmp_user(self, name: str, group: str, args: List[str], origin: Origin) -> bool:
+        """[localized ID] auth md5|sha|sha-2 256 KEY [priv des|3des|aes 128 KEY] (EOS: aes, aes256)"""
+        user = SnmpUser(name, group, origin=origin)
+        localized = args[:1] == ["localized"]  # EOS: keys localized to the engine ID, useless elsewhere
+        if localized:
+            args = args[2:]
+        if args[:1] == ["auth"] and len(args) >= 3:
+            if args[1] == "sha-2" and len(args) >= 4:
+                user.auth, args = f"sha{args[2]}", args[3:]
+            else:
+                user.auth, args = args[1], args[2:]
+            user.auth_key, args = ("" if localized else args[0]), args[1:]
+        if args[:1] == ["priv"] and len(args) >= 3:
+            algorithm, args = args[1], args[2:]
+            if algorithm == "aes" and args[0] in ("128", "192", "256") and len(args) >= 2:
+                algorithm, args = f"aes{args[0]}", args[1:]
+            user.priv = "aes128" if algorithm == "aes" else algorithm
+            user.priv_key, args = ("" if localized else args[0]), args[1:]
+        self.device.snmp.users.append(user)
+        return not args and user.auth in ("", "md5", "sha", "sha256", "sha384", "sha512") and user.priv in (
+            "", "des", "3des", "aes128", "aes192", "aes256")
 
     def logging(self, node: Node) -> bool:
         w = node.words

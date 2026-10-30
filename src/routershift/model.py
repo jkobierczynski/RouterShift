@@ -85,6 +85,19 @@ class System:
     syslog_servers: List[str] = field(default_factory=list)
     # VRF through which the device reaches its DNS, NTP and syslog servers ("" = the default VRF).
     service_vrf: str = ""
+    ntp_prefer: str = ""  # the preferred NTP server
+    ntp_server_keys: Dict[str, int] = field(default_factory=dict)  # NTP server -> authentication key number
+    ntp_keys: Dict[int, "NtpKey"] = field(default_factory=dict)
+    ntp_authenticate: bool = False  # only take time from authenticated servers
+    ntp_source: str = ""  # canonical name of the interface NTP packets leave from
+
+
+@dataclass
+class NtpKey:
+    number: int
+    algorithm: str = "md5"  # md5, sha1, sha256
+    key: str = ""  # "" when the source holds it encrypted, which no other platform can read
+    trusted: bool = False
 
 
 @dataclass
@@ -360,10 +373,58 @@ class DhcpPool:
 
 @dataclass
 class Snmp:
-    communities: Dict[str, str] = field(default_factory=dict)  # community -> "ro" / "rw"; secrets stay out of reports
+    communities: List["SnmpCommunity"] = field(default_factory=list)
     location: str = ""
     contact: str = ""
-    trap_hosts: List[str] = field(default_factory=list)
+    hosts: List["SnmpHost"] = field(default_factory=list)  # where notifications go
+    traps: bool = False  # notifications switched on
+    groups: Dict[str, "SnmpGroup"] = field(default_factory=dict)
+    users: List["SnmpUser"] = field(default_factory=list)
+    source: str = ""  # canonical name of the interface SNMP packets leave from
+    vrf: str = ""  # VRF the agent answers in, where the platform sets one for all of SNMP
+
+
+@dataclass
+class SnmpCommunity:
+    """An SNMPv1/v2c community. Its name is a secret: reports never show it."""
+
+    name: str
+    access: str = "ro"  # "ro" or "rw"
+    acl: str = ""  # standard ACL of the managers allowed to use it
+    origin: Origin = field(default_factory=Origin)
+
+
+@dataclass
+class SnmpHost:
+    address: str
+    version: str = "2c"  # "1", "2c" or "3"
+    secret: str = ""  # v1/v2c: the community (a secret); v3: the user name
+    level: str = ""  # v3: "noauth", "auth" or "priv"
+    informs: bool = False  # informs (acknowledged) instead of traps
+    vrf: str = ""
+    origin: Origin = field(default_factory=Origin)
+
+
+@dataclass
+class SnmpGroup:
+    name: str
+    level: str = "priv"  # "noauth", "auth" or "priv"
+    read_view: str = ""  # "" = the platform default (everything)
+    write_view: str = ""
+    origin: Origin = field(default_factory=Origin)
+
+
+@dataclass
+class SnmpUser:
+    """An SNMPv3 user. Its keys are secrets: reports never show them."""
+
+    name: str
+    group: str = ""
+    auth: str = ""  # "", "md5", "sha", "sha256", "sha384", "sha512"
+    auth_key: str = ""  # "" when the source holds it encrypted or localized
+    priv: str = ""  # "", "des", "aes128", "aes192", "aes256"
+    priv_key: str = ""
+    origin: Origin = field(default_factory=Origin)
 
 
 @dataclass

@@ -27,7 +27,7 @@ from .. import dhcp as dhcp_text
 from .. import ospf as ospf_text
 from ..confparse import Node
 from ..errors import ParseError
-from ..model import (Acl, Device, DhcpPool, FhrpGroup, Interface, InterfaceKind, LacpMode, Origin, StaticRoute, StpMode,
+from ..model import (Acl, Device, DhcpPool, FhrpGroup, NtpKey, SnmpCommunity, SnmpGroup, SnmpHost, SnmpUser, Interface, InterfaceKind, LacpMode, Origin, StaticRoute, StpMode,
                      SwitchportMode, Unparsed, Vlan)
 from ..timezones import utc
 from .ioslike import _cidr, _is_address
@@ -84,6 +84,7 @@ class _Reader:
         self.router_id_line: Optional[Node] = None
         self.ospf_areas: List[Tuple[str, str, str]] = []
         self.ospf_passive: Dict[str, bool] = {}
+        self._snmp_groups: List[Tuple[str, str]] = []  # (user, group)
 
     def unparsed(self, node: Node, section: str = "") -> None:
         self.device.unparsed.append(Unparsed(node.line, node.text, section))
@@ -113,6 +114,8 @@ class _Reader:
             "sntp": self.sntp,
             "ntp": self.ntp,
             "timesync": lambda node: len(node.words) == 2,
+            "snmp-server": self.snmp,
+            "snmpv3": self.snmpv3,
             "ip": self.ip,
             "ipv6": self.ipv6,
             "logging": self.logging,
@@ -163,10 +166,72 @@ class _Reader:
 
     def ntp(self, node: Node) -> bool:
         w = node.words
+        s = self.device.system
         if w[1:2] == ["server"] and len(w) >= 3:
-            self.device.system.ntp_servers.append(w[2])
-            return all(word in ("iburst", "burst") for word in w[3:])
+            s.ntp_servers.append(w[2])
+            options = w[3:]
+            if options[:1] == ["key"] and len(options) >= 2:
+                s.ntp_server_keys[w[2]] = int(options[1])
+                options = options[2:]
+            return all(word in ("iburst", "burst") for word in options)
+        if w[1:3] == ["authentication", "key-id"] and len(w) >= 8 and w[4] == "authentication-mode" \
+                and w[6] == "key-value":
+            # ntp authentication key-id 1 authentication-mode md5 key-value "KEY" [trusted]
+            key = s.ntp_keys.setdefault(int(w[3]), NtpKey(int(w[3])))
+            key.algorithm, key.key = w[5], w[7].strip('"')
+            key.trusted = w[8:] == ["trusted"]
+            s.ntp_authenticate = True  # AOS-S checks authentication whenever keys exist
+            return len(w) in (8, 9) and w[5] in ("md5", "sha1")
         return w[1:] in (["enable"], ["unicast"])
+
+    def snmp(self, node: Node) -> bool:
+        w = [word.strip('"') for word in node.words]
+        s = self.device.snmp
+        origin = Origin(node.line, node.text)
+        if w[1] == "community" and len(w) >= 3:
+            words = set(w[3:])
+            if not words <= {"operator", "manager", "restricted", "unrestricted"}:
+                return False
+            s.communities.append(SnmpCommunity(w[2], "ro" if "restricted" in words else "rw", origin=origin))
+            return True
+        if w[1] in ("location", "contact") and len(w) >= 3:
+            setattr(s, w[1], node.text.split(None, 2)[2].strip('"'))
+            return True
+        if w[1:3] == ["enable", "traps"]:
+            s.traps = True
+            return True
+        if w[1] == "host" and len(w) >= 5 and w[3] == "community":
+            # snmp-server host A community "X" [trap-level all|critical|not-info|debug|none] [inform]
+            host = SnmpHost(str(ipaddress.ip_address(w[2])), secret=w[4], origin=origin)
+            args = w[5:]
+            if args[:1] == ["trap-level"] and len(args) >= 2:
+                args = args[2:]
+            if args == ["inform"]:
+                host.informs, args = True, []
+            s.hosts.append(host)
+            s.traps = True  # AOS-S sends notifications to every host it has
+            return not args
+        return False
+
+    def snmpv3(self, node: Node) -> bool:
+        """snmpv3 enable; snmpv3 user "U" [auth md5|sha "KEY" [priv des|aes "KEY"]]; snmpv3 group G user "U" sec-model
+        ver3"""
+        w = [word.strip('"') for word in node.words]
+        if w[1:] in (["enable"],):
+            return True
+        if w[1] == "user" and len(w) >= 3:
+            user = SnmpUser(w[2], origin=Origin(node.line, node.text))
+            args = w[3:]
+            if args[:1] == ["auth"] and len(args) >= 3:
+                user.auth, user.auth_key, args = args[1], args[2], args[3:]
+            if args[:1] == ["priv"] and len(args) >= 3:
+                user.priv, user.priv_key, args = ("aes128" if args[1] == "aes" else args[1]), args[2], args[3:]
+            self.device.snmp.users.append(user)
+            return not args
+        if w[1] == "group" and len(w) == 7 and w[3] == "user" and w[5:] == ["sec-model", "ver3"]:
+            self._snmp_groups.append((w[4], w[2]))
+            return True
+        return False
 
     def logging(self, node: Node) -> bool:
         if len(node.words) == 2 and _is_address(node.words[1]):
@@ -521,6 +586,13 @@ class _Reader:
     # VLAN membership to ports ----------------------------------------------------------------------------------------
 
     def _finish(self) -> None:
+        snmp = self.device.snmp
+        for name, group in self._snmp_groups:
+            level = "priv" if group.endswith("priv") else "noauth" if group.endswith("noauth") else "auth"
+            snmp.groups.setdefault(group, SnmpGroup(group, level))
+            for user in snmp.users:
+                if user.name == name:
+                    user.group = group
         ospf_text.attach(self.device, self.ospf_areas, self.ospf_passive)
         if self.router_id and self.device.ospf:
             self.device.ospf[0].router_id = self.router_id

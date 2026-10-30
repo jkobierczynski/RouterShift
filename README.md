@@ -16,13 +16,14 @@ which does the same for firewall policies.
 
 Pre-alpha. Cisco IOS / IOS XE, Arista EOS, HPE Aruba AOS-CX, AOS-S (ProCurve) and
 HPE Comware 7 convert in every direction for the system settings (hostname,
-domain, DNS, NTP, syslog, banner, spanning-tree mode), VLANs, interfaces
+domain, DNS, NTP with authentication keys, syslog, banner, spanning-tree mode, SNMP
+communities, v3 users and notification hosts), VLANs, interfaces
 (switchport access and trunk, voice VLAN, LAGs and LACP, SVIs, loopbacks, the
 management port, subinterfaces), IPv4 and IPv6 addressing, DHCP relay and server, VRFs,
 static routes, IPv4/IPv6 access lists with their interface bindings, gateway
 redundancy (HSRP, VRRP, anycast gateways), OSPF, BGP, and NAT and site-to-site
 IPsec VPNs (on IOS, EOS and Comware; the AOS switches have neither). Everything else (route
-maps, SNMP, AAA, ...) is listed in the report under "Not understood", line by
+maps, AAA, QoS, ...) is listed in the report under "Not understood", line by
 line, with secrets masked.
 
 ## Usage

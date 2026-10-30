@@ -30,7 +30,7 @@ from .. import vpn as vpn_text
 from ..confparse import Node
 from ..errors import ParseError
 from ..model import (Acl, AclAction, AclEntry, Device, DhcpPool, FhrpGroup, IkePolicy, IpsecPeer, IpsecTransform,
-                     PreSharedKey, Interface, InterfaceKind, LacpMode, NatPool,
+                     NtpKey, PreSharedKey, SnmpCommunity, SnmpGroup, SnmpHost, SnmpUser, Interface, InterfaceKind, LacpMode, NatPool,
                      NatRule, Origin, Ospf, OspfNetwork, StaticRoute, StpMode, SwitchportMode, Unparsed, Vlan)
 from .ioslike import _cidr, _is_address
 
@@ -158,6 +158,7 @@ class _Reader:
             "dhcp": self.dhcp,
             "nat": self.nat,
             "ike": self.ike,
+            "snmp-agent": self.snmp,
             "ipsec": self.ipsec,
         }
         for node in roots:
@@ -210,10 +211,109 @@ class _Reader:
         w = node.words
         if w[1:] == ["enable"]:
             return True
+        s = self.device.system
         if w[1:2] == ["unicast-server"] and len(w) >= 3:
-            args = self._vpn(w[2:])
-            self.device.system.ntp_servers.append(args[0])
-            return len(args) == 1 or args[1:] == ["priority"]
+            server = w[2]
+            s.ntp_servers.append(server)
+            options = w[3:]
+            while options:
+                if options[0] == "priority":
+                    s.ntp_prefer = server
+                elif options[0] == "vpn-instance" and len(options) >= 2:
+                    s.service_vrf, options = options[1], options[1:]
+                elif options[0] == "authentication-keyid" and len(options) >= 2:
+                    s.ntp_server_keys[server], options = int(options[1]), options[1:]
+                elif options[0] == "source" and len(options) >= 2:
+                    s.ntp_source, options = canonical(options[1])[0], options[1:]
+                else:
+                    return False
+                options = options[1:]
+            return True
+        if w[1:] == ["authentication", "enable"]:
+            s.ntp_authenticate = True
+            return True
+        if w[1] == "authentication-keyid" and len(w) == 7 and w[3] == "authentication-mode":
+            # ntp-service authentication-keyid 1 authentication-mode md5 simple|cipher KEY
+            key = s.ntp_keys.setdefault(int(w[2]), NtpKey(int(w[2])))
+            key.algorithm = {"hmac-sha-1": "sha1", "hmac-sha-256": "sha256"}.get(w[4], w[4])
+            key.key = w[6] if w[5] == "simple" else ""
+            return key.algorithm in ("md5", "sha1", "sha256") and w[5] in ("simple", "cipher")
+        if w[1:3] == ["reliable", "authentication-keyid"] and len(w) == 4:
+            s.ntp_keys.setdefault(int(w[3]), NtpKey(int(w[3]))).trusted = True
+            return True
+        if w[1] == "source" and len(w) == 3:
+            s.ntp_source = canonical(w[2])[0]
+            return True
+        return False
+
+    def snmp(self, node: Node) -> bool:
+        w = node.words
+        s = self.device.snmp
+        origin = Origin(node.line, node.text)
+        if len(w) == 1:
+            return True  # snmp-agent: the agent runs
+        if w[1] == "community" and len(w) >= 4 and w[2] in ("read", "write"):
+            args = w[3:]
+            encrypted = args[0] == "cipher"
+            if args[0] in ("simple", "cipher"):
+                args = args[1:]
+            community = SnmpCommunity("" if encrypted else args[0], "ro" if w[2] == "read" else "rw", origin=origin)
+            args = args[1:]
+            if args[:1] == ["acl"] and len(args) >= 2:
+                community.acl, args = args[-1], args[2 + (args[1] == "name"):]
+            s.communities.append(community)
+            return not args
+        if w[1] == "sys-info" and len(w) >= 4 and w[2] in ("location", "contact"):
+            setattr(s, w[2], node.text.split(None, 3)[3])
+            return True
+        if w[1:3] == ["sys-info", "version"]:
+            return True
+        if w[1:3] == ["trap", "enable"]:
+            s.traps = True
+            return True
+        if w[1:3] == ["trap", "source"] and len(w) == 4:
+            s.source = canonical(w[3])[0]
+            return True
+        if w[1] == "target-host" and len(w) >= 9 and w[3:5] == ["address", "udp-domain"]:
+            # target-host trap|inform address udp-domain A [vpn-instance V] params securityname NAME [v1|v2c|v3 [level]]
+            host = SnmpHost(str(ipaddress.ip_address(w[5])), "1", informs=w[2] == "inform", origin=origin)
+            args = w[6:]
+            if args[:1] == ["vpn-instance"] and len(args) >= 2:
+                host.vrf, args = args[1], args[2:]
+            if args[:2] != ["params", "securityname"] or len(args) < 3:
+                return False
+            host.secret, args = args[2], args[3:]
+            if args[:1] in (["v1"], ["v2c"], ["v3"]):
+                host.version, args = args[0][1:], args[1:]
+            if host.version == "3":
+                host.level = {"authentication": "auth", "privacy": "priv"}.get(args[0], "") if args else "noauth"
+                args = args[1:]
+            s.hosts.append(host)
+            return not args and w[2] in ("trap", "inform")
+        if w[1:3] == ["group", "v3"] and len(w) >= 4:
+            group = SnmpGroup(w[3], "noauth", origin=origin)
+            args = w[4:]
+            if args[:1] in (["authentication"], ["privacy"]):
+                group.level, args = ("auth" if args[0] == "authentication" else "priv"), args[1:]
+            while len(args) >= 2 and args[0] in ("read-view", "write-view"):
+                setattr(group, f"{args[0][:-5]}_view", args[1])
+                args = args[2:]
+            s.groups[group.name] = group
+            return not args
+        if w[1:3] == ["usm-user", "v3"] and len(w) >= 5:
+            # usm-user v3 U G [simple|cipher] [authentication-mode A KEY [privacy-mode P KEY]]
+            user = SnmpUser(w[3], w[4], origin=origin)
+            args = w[5:]
+            encrypted = args[:1] == ["cipher"]
+            if args[:1] in (["simple"], ["cipher"]):
+                args = args[1:]
+            if args[:1] == ["authentication-mode"] and len(args) >= 3:
+                user.auth, user.auth_key, args = args[1], ("" if encrypted else args[2]), args[3:]
+            if args[:1] == ["privacy-mode"] and len(args) >= 3:
+                user.priv = {"des56": "des", "3des": "3des"}.get(args[1], args[1])
+                user.priv_key, args = ("" if encrypted else args[2]), args[3:]
+            s.users.append(user)
+            return not args
         return False
 
     def info_center(self, node: Node) -> bool:

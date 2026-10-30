@@ -22,6 +22,7 @@ from .. import nat as nat_text
 from .. import vpn as vpn_text
 from .. import fhrp
 from .. import ospf as ospf_text
+from .. import snmp as snmp_text
 from ..model import Device, FhrpGroup, Interface, InterfaceKind, LacpMode, StaticRoute, StpMode, SwitchportMode, Vlan
 from ..names import PortMapper
 from ..parsers.ioslike import _vlan_ids
@@ -55,6 +56,9 @@ def port_list(names: List[str]) -> str:
 
 def _quote(text: str) -> str:
     return '"' + text.replace('"', "'") + '"'
+
+
+_SNMP_LEVEL_GROUP = {"priv": "managerpriv", "auth": "managerauth", "noauth": "operatornoauth"}
 
 
 class Writer:
@@ -181,10 +185,33 @@ class Writer:
                 self.out.append(f"time timezone {minutes}")
                 rep.add("system", "time zone", Severity.APPROX, "timezone",
                         "written as a fixed offset; add 'time daylight-time-rule' if the zone has summer time")
-        if s.ntp_servers:
-            self.out += ["timesync sntp", "sntp unicast"]
-            self.out += [f"sntp server priority {n} {server}" for n, server in enumerate(s.ntp_servers, 1)]
+        servers = sorted(s.ntp_servers, key=lambda server: server != s.ntp_prefer)  # the preferred one first
+        if s.ntp_servers and (s.ntp_keys or s.ntp_authenticate):
+            self.out += ["timesync ntp", "ntp unicast"]
+            for key in s.ntp_keys.values():
+                rep.item("system", f"ntp key {key.number}")
+                algorithm = key.algorithm
+                if algorithm not in ("md5", "sha1"):
+                    algorithm = "sha1"
+                    rep.add("system", f"ntp key {key.number}", Severity.REVIEW, "ntp-algorithm",
+                            f"{key.algorithm} is not offered; sha1 is written, so the servers must use it too")
+                self.out.append(f"ntp authentication key-id {key.number} authentication-mode {algorithm} key-value "
+                                f"{_quote(snmp_text.ntp_key(key, rep))}" + (" trusted" if key.trusted else ""))
+            for server in servers:
+                keyed = f" key {s.ntp_server_keys[server]}" if server in s.ntp_server_keys else ""
+                self.out.append(f"ntp server {server}{keyed} iburst")
+            self.out.append("ntp enable")
             rep.item("system", "ntp servers")
+        elif s.ntp_servers:
+            self.out += ["timesync sntp", "sntp unicast"]
+            self.out += [f"sntp server priority {n} {server}" for n, server in enumerate(servers, 1)]
+            rep.item("system", "ntp servers")
+        if s.ntp_prefer and s.ntp_servers:
+            rep.add("system", "ntp servers", Severity.APPROX, "ntp-prefer",
+                    f"AOS-S has no preferred NTP server; {s.ntp_prefer} is listed first")
+        if s.ntp_source and s.ntp_servers:
+            rep.add("system", "ntp servers", Severity.REVIEW, "ntp-source",
+                    f"NTP source interface {s.ntp_source} is not written; set 'ip source-interface' by hand")
         if s.domain_name:
             self.out.append(f"ip dns domain-name {_quote(s.domain_name)}")
             rep.item("system", "domain name")
@@ -196,6 +223,7 @@ class Writer:
             self.out.append(f"logging {host}")
         if s.syslog_servers:
             rep.item("system", "syslog servers")
+        self.snmp()
         if s.service_vrf and s.service_vrf in self.mgmt_vrfs:
             rep.add("system", "service vrf", Severity.APPROX, "oobm",
                     "the source reaches its servers through the management VRF; AOS-S picks the out-of-band port "
@@ -207,6 +235,57 @@ class Writer:
             if vrf not in self.mgmt_vrfs:
                 rep.add("system", f"vrf {vrf}", Severity.REVIEW, "vrf",
                         "AOS-S has no VRFs: its interfaces and routes are written in the one routing table")
+
+    def snmp(self) -> None:
+        s = self.device.snmp
+        rep = self.report
+        for c in s.communities:
+            label = snmp_text.community_label(self.device, c)
+            rep.item("management", label)
+            name = snmp_text.secret(c.name, rep, "management", label, "community")
+            self.out.append(f"snmp-server community {_quote(name)} " +
+                            ("operator restricted" if c.access == "ro" else "manager unrestricted"))
+            if c.acl:
+                rep.add("management", label, Severity.REVIEW, "snmp-acl",
+                        f"ACL {c.acl} is not written for the community; use 'ip authorized-managers' by hand")
+        if s.location:
+            self.out.append(f"snmp-server location {_quote(s.location)}")
+            rep.item("management", "snmp location")
+        if s.contact:
+            self.out.append(f"snmp-server contact {_quote(s.contact)}")
+            rep.item("management", "snmp contact")
+        for h in s.hosts:
+            label = snmp_text.host_label(h)
+            if h.version == "3":
+                rep.skip("management", label, "snmp-v3-host",
+                         "SNMPv3 notification targets are not written for AOS-S; add 'snmpv3 targetaddress' by hand")
+                continue
+            rep.item("management", label)
+            secret = snmp_text.secret(h.secret, rep, "management", label, "community")
+            self.out.append(f"snmp-server host {h.address} community {_quote(secret)}" + (" inform" if h.informs else ""))
+            if h.vrf:
+                rep.add("management", label, Severity.APPROX, "snmp-vrf", f"VRF {h.vrf} left out: AOS-S has no VRFs")
+        if s.users:
+            self.out.append("snmpv3 enable")
+        for u in s.users:
+            label = snmp_text.user_label(u)
+            rep.item("management", label)
+            keys = snmp_text.user_keys(u, rep)
+            words = [f"snmpv3 user {_quote(u.name)}"]
+            if u.auth:
+                words.append(f"auth {snmp_text.pick(u.auth, ['md5', 'sha'], rep, label)} {_quote(keys[0])}")
+            if u.priv:
+                priv = snmp_text.pick(u.priv, ["des", "aes128"], rep, label)
+                words.append(f"priv {'aes' if priv == 'aes128' else priv} {_quote(keys[1])}")
+            self.out.append(" ".join(words))
+            group = u.group if u.group.startswith(("manager", "operator")) else _SNMP_LEVEL_GROUP[snmp_text.level(u)]
+            if group != u.group:
+                rep.add("management", label, Severity.APPROX, "snmp-group",
+                        f"in AOS-S group {group}, as AOS-S has fixed groups" + (f" (was {u.group})" if u.group else ""))
+            self.out.append(f"snmpv3 group {group} user {_quote(u.name)} sec-model ver3")
+        if s.source:
+            rep.add("management", "snmp source", Severity.REVIEW, "snmp-source",
+                    f"SNMP source interface {s.source} is not written; set 'ip source-interface' by hand")
 
     def routing_mode(self) -> None:
         routes = [r for r in self.device.static_routes if r.vrf not in self.mgmt_vrfs]
