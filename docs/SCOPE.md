@@ -34,7 +34,7 @@ platform converts to and from all the others.
 | Spanning tree mode, edge ports, BPDU guard | `Device.stp_mode`, `Interface` | 2 |
 | OSPFv2 | `Ospf` | 2 |
 | BGP | `Bgp`, `BgpNeighbor` | 2 |
-| Access lists, standard and extended | `Acl`, `AclEntry` | 2 |
+| Access lists (IPv4 and IPv6) and their interface bindings | `Acl`, `AclEntry`, `Interface.acl_in` ... | 2 (done) |
 | SNMP, local users | `Snmp`, `LocalUser` | 2 |
 | Route maps, prefix lists, AAA/TACACS/RADIUS, QoS, MLAG/VSX/vPC, VXLAN/EVPN | to come | 3+ |
 
@@ -61,6 +61,19 @@ platform converts to and from all the others.
   `link-aggregation mode dynamic` means LACP.
 * BPDU protection is global (`stp bpdu-protection`) and guards every edge port.
 * VRFs are VPN instances, the management VRF included: `M-GigabitEthernet0/0/0` is bound to one like any port.
+
+## Access lists
+
+* Every ACL becomes an extended list: protocol, source, destination, ports (`eq`, `range`, `gt`, `lt`), ICMP type,
+  `established` and `log`. Standard lists become extended lists with `ip` and `any` destination.
+* An entry with several ports, or a range the target can't write in one line, is split into one entry per port.
+  The report marks that as approximated.
+* Sequence numbers are kept when every entry keeps its own line; otherwise the list is renumbered in steps of 10
+  (5 on Comware).
+* Entries the model can't hold (object groups, `neq`, non-contiguous wildcards) are written as a remark and flagged
+  for review, so the rule count and order stay visible.
+* Bindings: `ip access-group` / `ipv6 traffic-filter` (IOS, EOS), `apply access-list` (AOS-CX, `routed-in` on VLAN
+  interfaces), `ip access-group` in the interface or VLAN (AOS-S), `packet-filter` (Comware).
 
 ## Port names
 

@@ -21,10 +21,11 @@ import ipaddress
 import re
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
+from .. import acl as acl_text
 from .. import confparse
 from ..confparse import Node
 from ..errors import ParseError
-from ..model import (Device, Interface, InterfaceKind, LacpMode, Origin, StaticRoute, StpMode, SwitchportMode,
+from ..model import (Acl, AclAction, AclEntry, Device, Interface, InterfaceKind, LacpMode, Origin, StaticRoute, StpMode, SwitchportMode,
                      Unparsed, Vlan)
 from .ioslike import _cidr, _is_address
 
@@ -138,6 +139,7 @@ class _Reader:
             "vlan": self.vlan,
             "stp": self.stp,
             "interface": self.interface,
+            "acl": self.acl,
         }
         for node in roots:
             if node.text.startswith(_NOISE):
@@ -286,6 +288,98 @@ class _Reader:
             return True
         return False
 
+    # access lists ----------------------------------------------------------------------------------------------------
+
+    def acl(self, node: Node) -> bool:
+        """acl [ipv6] advanced|basic name NAME, acl [ipv6] advanced 3000, acl number 3000 [name NAME]."""
+        w = node.words[1:]
+        family = 4
+        if w[:1] == ["ipv6"]:
+            family, w = 6, w[1:]
+        name = ""
+        standard = False
+        if w[:1] == ["number"] and len(w) >= 2:
+            name, standard = w[1], 2000 <= int(w[1]) < 3000
+            w = w[2:]
+        elif w[:1] in (["advanced"], ["basic"]) and len(w) >= 2:
+            standard = w[0] == "basic"
+            if w[1] == "name" and len(w) >= 3:
+                name, w = w[2], w[3:]
+            else:
+                name, w = w[1], w[2:]
+        if w[:1] == ["name"] and len(w) == 2:
+            name, w = w[1], []
+        if not name or w:
+            return False
+        acl = self.device.acls.setdefault(name, Acl(name, family=family))
+        comments: Dict[int, str] = {}
+        for child in node.children:
+            c = child.words
+            if c[0] == "description":
+                continue
+            if c[0] != "rule":
+                self.unparsed(child, node.text)
+                continue
+            sequence: Optional[int] = None
+            args = c[1:]
+            if args and args[0].isdigit():
+                sequence, args = int(args[0]), args[1:]
+            if args[:1] == ["comment"] and sequence is not None:
+                comments[sequence] = " ".join(args[1:])
+                continue
+            try:
+                entry = self._rule(args, family, standard)
+            except (acl_text.Unsupported, ValueError, IndexError, KeyError):
+                entry = acl_text.unsupported_entry(child.text)
+            entry.sequence, entry.origin = sequence, Origin(child.line, child.text)
+            acl.entries.append(entry)
+        # A rule's comment comes before it, as a remark
+        for seq, text in comments.items():
+            at = next((i for i, e in enumerate(acl.entries) if e.sequence == seq), len(acl.entries))
+            acl.entries.insert(at, AclEntry(AclAction.REMARK, remark=text))
+        return True
+
+    def _rule(self, args: List[str], family: int, standard: bool) -> AclEntry:
+        """rule permit tcp source 10.0.0.0 0.0.0.255 destination-port eq 443 logging."""
+        tokens = acl_text.Tokens(args)
+        action = tokens.take()
+        if action not in ("permit", "deny"):
+            raise acl_text.Unsupported(action)
+        entry = AclEntry(AclAction(action))
+        if not standard and tokens.peek() and tokens.peek() not in ("source", "logging", "counting"):
+            proto = tokens.take()
+            entry.protocol = {"ipv6": "ip", "icmpv6": "icmpv6"}.get(proto, proto)
+            if entry.protocol not in acl_text.PROTOCOLS and not entry.protocol.isdigit():
+                raise acl_text.Unsupported(proto)
+        while tokens.words:
+            word = tokens.take()
+            if word in ("source", "destination"):
+                address = tokens.take()
+                if address == "any":
+                    value = "any"
+                elif "/" in address:
+                    value = str(ipaddress.ip_network(address, strict=False))
+                elif ":" in address:
+                    value = str(ipaddress.ip_network(f"{address}/{tokens.take()}", strict=False))
+                else:
+                    value = acl_text.wildcard_prefix(address, tokens.take())
+                setattr(entry, word, value)
+            elif word in ("source-port", "destination-port"):
+                ports = acl_text.read_ports(tokens)
+                setattr(entry, "src_ports" if word == "source-port" else "dst_ports", ports)
+            elif word == "icmp-type" or word == "icmp6-type":
+                kind = tokens.take()
+                entry.icmp_type = int(kind) if kind.isdigit() else acl_text.ICMP_TYPES[kind]
+            elif word == "established":
+                entry.established = True
+            elif word == "logging":
+                entry.log = True
+            elif word == "counting":
+                pass
+            else:
+                raise acl_text.Unsupported(word)
+        return entry
+
     # interfaces ------------------------------------------------------------------------------------------------------
 
     def interface(self, node: Node) -> bool:
@@ -370,6 +464,14 @@ class _Reader:
             pass
         elif w[:3] == ["dhcp", "relay", "server-address"] and n == 4:
             iface.helper_addresses.append(w[3])
+        elif w[0] == "packet-filter" and w[-1] in ("inbound", "outbound"):
+            v6 = w[1:2] == ["ipv6"]
+            args = w[2:-1] if v6 else w[1:-1]
+            if args[:1] == ["name"]:
+                args = args[1:]
+            if len(args) != 1:
+                return False
+            setattr(iface, f"acl{'6' if v6 else ''}_{'in' if w[-1] == 'inbound' else 'out'}", args[0])
         elif w[:3] == ["vlan-type", "dot1q", "vid"] and n == 4:
             iface.encapsulation_vlan = int(w[3])
         elif w[0] == "speed" and n == 2:

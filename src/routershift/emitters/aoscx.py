@@ -9,6 +9,7 @@ from __future__ import annotations
 import ipaddress
 from typing import Callable, Dict, List
 
+from .. import acl as acl_text
 from ..model import Device, Interface, InterfaceKind, LacpMode, StaticRoute, StpMode, SwitchportMode
 from ..names import PortMapper
 from ..report import Report, Severity
@@ -39,6 +40,7 @@ class Writer:
         self.system()
         self.vrfs()
         self.spanning_tree()
+        self.acls()
         self.vlans()
         # a LAG exists before the ports that join it
         order = {InterfaceKind.MANAGEMENT: 0, InterfaceKind.LAG: 1}
@@ -127,6 +129,17 @@ class Writer:
         self.report.add("system", "spanning-tree mode", Severity.APPROX, "stp-mode",
                         f"{mode.value} is not available on AOS-CX, written as {target}")
 
+    def acls(self) -> None:
+        for acl in self.device.acls.values():
+            name = acl_text.safe_name(acl.name)
+            label = acl.name if name == acl.name else f"{acl.name} -> {name}"
+            self.report.item("acl", label)
+            self.out.append(f"access-list {'ipv6' if acl.family == 6 else 'ip'} {name}")
+            lines = acl_text.cisco_lines(acl, self.report, label, "mask", any_protocol="any", icmp6="icmpv6",
+                                         icmp_names=True, icmp_keyword="icmp-type", remark="comment",
+                                         established=False)
+            self.out += [_IND + line for line in lines]
+
     def vlans(self) -> None:
         voice = {i.voice_vlan for i in self.device.interfaces.values() if i.voice_vlan is not None}
         for vlan in sorted(self.device.vlans.values(), key=lambda v: v.vlan_id):
@@ -173,6 +186,15 @@ class Writer:
         if iface.vrf and iface.kind != InterfaceKind.MANAGEMENT:
             lines.append(f"vrf attach {self.vrf(iface.vrf)}")
         lines += self._addresses(iface, add)
+        for attr, family, direction in (("acl_in", "ip", "in"), ("acl_out", "ip", "out"), ("acl6_in", "ipv6", "in"),
+                                        ("acl6_out", "ipv6", "out")):
+            acl_name = getattr(iface, attr)
+            if acl_name and acl_name in self.device.acls:
+                if iface.kind == InterfaceKind.VLAN:
+                    direction = f"routed-{direction}"  # a router ACL; "in" on a VLAN would filter switched traffic
+                lines.append(f"apply access-list {family} {acl_text.safe_name(acl_name)} {direction}")
+            elif acl_name:
+                add(Severity.REVIEW, "acl-missing", f"ACL {acl_name} is applied but not defined; left out")
         if iface.stp_portfast:
             lines.append("spanning-tree port-type admin-edge")
         if iface.stp_bpduguard:
