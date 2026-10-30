@@ -24,10 +24,11 @@ from typing import Callable, Dict, List, Optional, Set, Tuple
 from .. import acl as acl_text
 from .. import bgp as bgp_text
 from .. import confparse
+from .. import dhcp as dhcp_text
 from .. import ospf as ospf_text
 from ..confparse import Node
 from ..errors import ParseError
-from ..model import (Acl, AclAction, AclEntry, Device, FhrpGroup, Interface, InterfaceKind, LacpMode, Origin, Ospf,
+from ..model import (Acl, AclAction, AclEntry, Device, DhcpPool, FhrpGroup, Interface, InterfaceKind, LacpMode, Origin, Ospf,
                      OspfNetwork, StaticRoute, StpMode, SwitchportMode, Unparsed, Vlan)
 from .ioslike import _cidr, _is_address
 
@@ -117,6 +118,7 @@ class _Reader:
         self._bpdu_protection = False
         self._vrrp_version = 3  # the Comware 7 default
         self._ospf_areas: List[Tuple[str, str, str]] = []
+        self._dhcp_excluded: Dict[str, List[Tuple[str, str]]] = {}  # VRF -> forbidden ranges
 
     def unparsed(self, node: Node, section: str = "") -> None:
         self.device.unparsed.append(Unparsed(node.line, node.text, section))
@@ -147,6 +149,7 @@ class _Reader:
             "vrrp": self.vrrp_version,
             "ospf": self.ospf,
             "bgp": self.bgp,
+            "dhcp": self.dhcp,
         }
         for node in roots:
             if node.text.startswith(_NOISE):
@@ -388,6 +391,52 @@ class _Reader:
         return entry
 
     # interfaces ------------------------------------------------------------------------------------------------------
+
+    def dhcp(self, node: Node) -> bool:
+        """dhcp enable, dhcp server forbidden-ip, dhcp server ip-pool NAME."""
+        w = node.words
+        if w[1:] == ["enable"]:
+            return True
+        if w[1:3] == ["server", "forbidden-ip"] and len(w) >= 4:
+            args = w[3:]
+            vrf = ""
+            if args[-2:-1] == ["vpn-instance"]:
+                vrf, args = args[-1], args[:-2]
+            if len(args) not in (1, 2):
+                return False
+            addresses = [str(ipaddress.IPv4Address(a)) for a in args]
+            self._dhcp_excluded.setdefault(vrf, []).append((addresses[0], addresses[-1]))
+            return True
+        if w[1:3] != ["server", "ip-pool"] or len(w) != 4:
+            return False
+        pool = DhcpPool(w[3], origin=Origin(node.line, node.text))
+        self.device.dhcp_pools.append(pool)
+        for child in node.children:
+            c = child.words
+            try:
+                if c[0] == "network" and len(c) == 4 and c[2] == "mask":
+                    pool.network = str(ipaddress.ip_network(f"{c[1]}/{c[3]}"))
+                elif c[:2] == ["address", "range"] and len(c) == 4:
+                    pool.ranges.append((str(ipaddress.IPv4Address(c[2])), str(ipaddress.IPv4Address(c[3]))))
+                elif c[0] == "gateway-list" and len(c) >= 2:
+                    pool.default_routers += [str(ipaddress.IPv4Address(a)) for a in c[1:]]
+                elif c[0] == "dns-list" and len(c) >= 2:
+                    pool.dns_servers += [str(ipaddress.IPv4Address(a)) for a in c[1:]]
+                elif c[0] == "domain-name" and len(c) == 2:
+                    pool.domain_name = c[1]
+                elif c == ["expired", "unlimited"]:
+                    pool.lease_seconds = 0
+                elif c[0] == "expired" and len(c) in (3, 5, 7):
+                    units = {unit: int(value) for unit, value in zip(c[1::2], c[2::2])}
+                    pool.lease_seconds = dhcp_text.lease_seconds(units.get("day", 0), units.get("hour", 0),
+                                                                 units.get("minute", 0))
+                elif c[0] == "vpn-instance" and len(c) == 2:
+                    pool.vrf = c[1]
+                else:
+                    self.unparsed(child, node.text)
+            except ValueError:
+                self.unparsed(child, node.text)
+        return True
 
     def bgp(self, node: Node) -> bool:
         """bgp AS, with groups, peers and address families inside."""
@@ -674,6 +723,9 @@ class _Reader:
 
     def _finish(self) -> None:
         ospf_text.attach(self.device, self._ospf_areas, {})
+        for pool in self.device.dhcp_pools:
+            if pool.network:
+                pool.ranges = dhcp_text.subtract(pool.network, pool.ranges, self._dhcp_excluded.get(pool.vrf, []))
         for iface in self.device.interfaces.values():
             for group in iface.fhrp:
                 group.version = self._vrrp_version

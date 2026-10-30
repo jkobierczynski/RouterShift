@@ -20,9 +20,10 @@ from .. import bgp as bgp_text
 from .. import fhrp
 from .. import ospf as ospf_text
 from .. import confparse, names
+from .. import dhcp as dhcp_text
 from ..confparse import Node
 from ..errors import ParseError
-from ..model import (Acl, Device, FhrpGroup, Interface, InterfaceKind, LacpMode, Origin, Ospf, OspfNetwork,
+from ..model import (Acl, Device, DhcpPool, FhrpGroup, Interface, InterfaceKind, LacpMode, Origin, Ospf, OspfNetwork,
                      StaticRoute, StpMode, SwitchportMode, Unparsed, Vlan)
 
 # Lines that only describe the file or the software, not the device's behaviour.
@@ -67,6 +68,7 @@ class _Reader:
         self._varp_mac = ""  # EOS: ip virtual-router mac-address
         self._vrrp_v3 = False  # IOS XE: fhrp version vrrp v3
         self._ospf_areas: List[Tuple[str, str, str]] = []  # interface, process ("" = the interface's VRF), area
+        self._dhcp_excluded: Dict[str, List[Tuple[str, str]]] = {}  # VRF -> excluded ranges
 
     def unparsed(self, node: Node, section: str = "") -> None:
         self.device.unparsed.append(Unparsed(node.line, node.text, section))
@@ -103,6 +105,8 @@ class _Reader:
             "access-list": self.numbered_acl,
             "fhrp": self.fhrp_version,
             "router": self.router,
+            "dhcp": self.eos_dhcp,
+            "service": lambda node: node.words == ["service", "dhcp"],
         }
         for node in roots:
             if node.text.startswith(_NOISE) or node.text == "end":
@@ -179,6 +183,17 @@ class _Reader:
             return self.route(node, w[2:], 4)
         if w[1:2] == ["access-list"] and len(w) >= 3:
             return self.acl(node, 4)
+        if w[1:3] == ["dhcp", "pool"] and len(w) == 4:
+            return self.dhcp_pool(node, w[3])
+        if w[1:3] == ["dhcp", "excluded-address"] and len(w) >= 4:
+            args, vrf = w[3:], ""
+            if args[0] == "vrf" and len(args) >= 3:
+                vrf, args = args[1], args[2:]
+            if len(args) not in (1, 2):
+                return False
+            addresses = [str(ipaddress.IPv4Address(a)) for a in args]
+            self._dhcp_excluded.setdefault(vrf, []).append((addresses[0], addresses[-1]))
+            return True
         if w[1:3] == ["virtual-router", "mac-address"] and len(w) == 4:  # EOS VARP
             self._varp_mac = fhrp.mac(w[3])
             return True
@@ -196,6 +211,97 @@ class _Reader:
         if w[1:2] == ["access-list"] and len(w) >= 3:
             return self.acl(node, 6)
         return False
+
+    # DHCP server ------------------------------------------------------------------------------------------------------
+
+    def dhcp_pool(self, node: Node, name: str) -> bool:
+        """IOS: ip dhcp pool NAME"""
+        pool = DhcpPool(name, origin=Origin(node.line, node.text))
+        self.device.dhcp_pools.append(pool)
+        for child in node.children:
+            w = child.words
+            n = len(w)
+            try:
+                if w[0] == "network" and n == 3:
+                    mask = w[2].lstrip("/")
+                    pool.network = str(ipaddress.ip_network(f"{w[1]}/{mask}"))
+                elif w[0] == "default-router" and n >= 2:
+                    pool.default_routers += [str(ipaddress.IPv4Address(a)) for a in w[1:]]
+                elif w[0] == "dns-server" and n >= 2:
+                    pool.dns_servers += [str(ipaddress.IPv4Address(a)) for a in w[1:]]
+                elif w[0] == "domain-name" and n == 2:
+                    pool.domain_name = w[1]
+                elif w == ["lease", "infinite"]:
+                    pool.lease_seconds = 0
+                elif w[0] == "lease" and 2 <= n <= 4:
+                    pool.lease_seconds = dhcp_text.lease_seconds(*(int(v) for v in w[1:]))
+                elif w[0] == "vrf" and n == 2:
+                    pool.vrf = w[1]
+                else:
+                    self.unparsed(child, node.text)
+            except ValueError:
+                self.unparsed(child, node.text)
+        return True
+
+    def eos_dhcp(self, node: Node) -> bool:
+        """EOS: dhcp server [vrf V], with subnets inside."""
+        w = node.words
+        if w[1:2] != ["server"] or len(w) not in (2, 4) or (len(w) == 4 and w[2] != "vrf"):
+            return False
+        vrf = w[3] if len(w) == 4 else ""
+        lease: Optional[int] = None
+        domain = ""
+        dns: List[str] = []
+        pools: List[DhcpPool] = []
+        for child in node.children:
+            c = child.words
+            try:
+                if c[:3] == ["lease", "time", "ipv4"]:
+                    lease = self._eos_lease(c[3:])
+                elif c[:4] == ["dns", "domain", "name", "ipv4"] and len(c) == 5:
+                    domain = c[4]
+                elif c[:3] == ["dns", "server", "ipv4"] and len(c) >= 4:
+                    dns = [str(ipaddress.IPv4Address(a)) for a in c[3:]]
+                elif c[0] == "subnet" and len(c) == 2:
+                    pools.append(self._eos_subnet(child, vrf))
+                else:
+                    self.unparsed(child, node.text)
+            except (ValueError, IndexError):
+                self.unparsed(child, node.text)
+        for pool in pools:
+            pool.lease_seconds = pool.lease_seconds if pool.lease_seconds is not None else lease
+            pool.domain_name = pool.domain_name or domain
+            pool.dns_servers = pool.dns_servers or list(dns)
+        self.device.dhcp_pools += pools
+        return True
+
+    @staticmethod
+    def _eos_lease(w: List[str]) -> int:
+        """1 days 0 hours 0 minutes"""
+        values = {unit: int(value) for value, unit in zip(w[::2], w[1::2])}
+        return dhcp_text.lease_seconds(values.get("days", 0), values.get("hours", 0), values.get("minutes", 0))
+
+    def _eos_subnet(self, node: Node, vrf: str) -> DhcpPool:
+        network = str(ipaddress.ip_network(node.words[1]))
+        pool = DhcpPool(f"subnet-{network}", network=network, vrf=vrf, origin=Origin(node.line, node.text))
+        for child in node.children:
+            c = child.words
+            try:
+                if c[0] == "range" and len(c) == 3:
+                    pool.ranges.append((str(ipaddress.IPv4Address(c[1])), str(ipaddress.IPv4Address(c[2]))))
+                elif c[0] == "default-gateway" and len(c) == 2:
+                    pool.default_routers.append(str(ipaddress.IPv4Address(c[1])))
+                elif c[:2] == ["dns", "server"] and len(c) >= 3:
+                    pool.dns_servers = [str(ipaddress.IPv4Address(a)) for a in c[2:]]
+                elif c[0] == "name" and len(c) == 2:
+                    pool.name = c[1]
+                elif c[:2] == ["lease", "time"]:
+                    pool.lease_seconds = self._eos_lease(c[2:])
+                else:
+                    self.unparsed(child, node.text)
+            except (ValueError, IndexError):
+                self.unparsed(child, node.text)
+        return pool
 
     def fhrp_version(self, node: Node) -> bool:
         if node.words[1:] == ["version", "vrrp", "v3"]:
@@ -680,6 +786,8 @@ class _Reader:
             if not tag.isdigit():
                 return False
             iface.encapsulation_vlan = int(tag)
+        elif w[:3] == ["dhcp", "server", "ipv4"] and n == 3:
+            pass  # EOS: the interface serves the subnet it is in
         elif w[:2] == ["ip", "ospf"] and n >= 4 and w[-2] == "area" and n in (4, 5):
             self._ospf_areas.append((iface.name, w[2] if n == 5 else "", ospf_text.area(w[-1])))
         elif w[:3] == ["ip", "ospf", "cost"] and n == 4:
@@ -738,6 +846,9 @@ class _Reader:
         return len(args) in (1, 2)
 
     def _finish(self) -> None:
+        for pool in self.device.dhcp_pools:
+            if pool.network:
+                pool.ranges = dhcp_text.subtract(pool.network, pool.ranges, self._dhcp_excluded.get(pool.vrf, []))
         for iface in self.device.interfaces.values():
             for group in iface.fhrp:
                 if group.protocol == "anycast":

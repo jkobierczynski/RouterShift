@@ -50,6 +50,11 @@ def test_converts_and_reads_back(source: str, target: str) -> None:
         assert other.redistribute == p.redistribute and other.area_types == p.area_types
     costs = lambda dev: sorted(i.ospf_cost for i in dev.interfaces.values() if i.ospf_cost)  # noqa: E731
     assert costs(first) == costs(back)
+    # DHCP pools keep their addresses and options (AOS-S has no VRFs)
+    pools = lambda dev: sorted(  # noqa: E731
+        (p.network, p.ranges, p.default_routers, p.dns_servers, p.domain_name, p.lease_seconds,
+         p.vrf if target != "aoss" else "") for p in dev.dhcp_pools)
+    assert pools(first) == pools(back)
     # BGP keeps every neighbor with its settings (peer groups may be written out on their members), networks and
     # redistribution; AOS-S leaves it to a person
     if first.bgp is not None and target == "aoss":

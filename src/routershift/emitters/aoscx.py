@@ -11,6 +11,7 @@ from typing import Callable, Dict, List, Tuple
 
 from .. import acl as acl_text
 from .. import bgp as bgp_text
+from .. import dhcp as dhcp_text
 from .. import fhrp
 from .. import ospf as ospf_text
 from ..model import Device, Interface, Ospf, InterfaceKind, LacpMode, StaticRoute, StpMode, SwitchportMode
@@ -57,6 +58,7 @@ class Writer:
         for iface in sorted(self.device.interfaces.values(), key=lambda i: order.get(i.kind, 2)):
             self.interface(iface)
         self.routes()
+        self.dhcp()
         if self.device.bgp is not None:
             self.bgp()
         self.report.unparsed(self.device.unparsed)
@@ -272,6 +274,33 @@ class Writer:
             kind = p.area_types.get(dotted)
             lines.append(f"area {dotted}" + (f" {kind}" if kind else ""))
         self.out += [_IND + line for line in lines]
+
+    def dhcp(self) -> None:
+        for vrf in sorted({p.vrf for p in self.device.dhcp_pools}):
+            self.out.append(f"dhcp-server vrf {self.vrf(vrf) if vrf else 'default'}")
+            for pool in (p for p in self.device.dhcp_pools if p.vrf == vrf):
+                label = dhcp_text.label(pool)
+                if not pool.network:
+                    self.report.skip("dhcp", label, "dhcp-network",
+                                     "a pool without a network (a host binding) is not written")
+                    continue
+                self.report.item("dhcp", label)
+                lines = [f"range {first} {last} prefix-len {dhcp_text.prefix_len(pool)}" for first, last in pool.ranges]
+                if pool.default_routers:
+                    lines.append("default-router " + " ".join(pool.default_routers))
+                if pool.dns_servers:
+                    lines.append("dns-server " + " ".join(pool.dns_servers))
+                if pool.domain_name:
+                    lines.append(f"domain-name {pool.domain_name}")
+                if pool.lease_seconds == 0:
+                    lines.append("lease infinite")
+                elif pool.lease_seconds is not None:
+                    days, hours, minutes = dhcp_text.lease_parts(pool.lease_seconds)
+                    lines.append(f"lease {days:02d}:{hours:02d}:{minutes:02d}")
+                lines.append("exit")
+                self.out.append(f"{_IND}pool {pool.name.replace(' ', '_')}")
+                self.out += [_IND * 2 + line for line in lines]
+            self.out.append(f"{_IND}enable")
 
     def bgp(self) -> None:
         bgp = self.device.bgp

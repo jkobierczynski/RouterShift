@@ -22,12 +22,13 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 from .. import acl as acl_text
 from .. import bgp as bgp_text
+from .. import dhcp as dhcp_text
 from .. import fhrp
 from .. import ospf as ospf_text
 from .. import confparse
 from ..confparse import Node
 from ..errors import ParseError
-from ..model import (Acl, Device, FhrpGroup, Interface, InterfaceKind, LacpMode, Origin, Ospf, StaticRoute,
+from ..model import (Acl, Device, DhcpPool, FhrpGroup, Interface, InterfaceKind, LacpMode, Origin, Ospf, StaticRoute,
                      StpMode, SwitchportMode, Unparsed, Vlan)
 from .ioslike import _is_address, _vlan_ids
 
@@ -91,6 +92,7 @@ class _Reader:
             "interface": self.interface,
             "access-list": self.acl,
             "router": self.router,
+            "dhcp-server": self.dhcp_server,
         }
         for node in roots:
             if node.text.startswith(_NOISE):
@@ -237,6 +239,49 @@ class _Reader:
         return True
 
     # interfaces ------------------------------------------------------------------------------------------------------
+
+    def dhcp_server(self, node: Node) -> bool:
+        """dhcp-server vrf V, with pools inside."""
+        w = node.words
+        if len(w) != 3 or w[1] != "vrf":
+            return False
+        vrf = "" if w[2] == "default" else w[2]
+        for child in node.children:
+            if child.words == ["enable"]:
+                continue
+            if child.words[0] == "pool" and len(child.words) == 2:
+                self._dhcp_pool(child, vrf)
+            else:
+                self.unparsed(child, node.text)
+        return True
+
+    def _dhcp_pool(self, node: Node, vrf: str) -> None:
+        pool = DhcpPool(node.words[1], vrf=vrf, origin=Origin(node.line, node.text))
+        self.device.dhcp_pools.append(pool)
+        for child in node.children:
+            c = child.words
+            try:
+                if c == ["exit"]:
+                    continue
+                if c[0] == "range" and len(c) == 5 and c[3] == "prefix-len":
+                    first, last = str(ipaddress.IPv4Address(c[1])), str(ipaddress.IPv4Address(c[2]))
+                    pool.ranges.append((first, last))
+                    pool.network = str(ipaddress.ip_network(f"{first}/{c[4]}", strict=False))
+                elif c[0] == "default-router" and len(c) >= 2:
+                    pool.default_routers += [str(ipaddress.IPv4Address(a)) for a in c[1:]]
+                elif c[0] == "dns-server" and len(c) >= 2:
+                    pool.dns_servers += [str(ipaddress.IPv4Address(a)) for a in c[1:]]
+                elif c[0] == "domain-name" and len(c) == 2:
+                    pool.domain_name = c[1]
+                elif c == ["lease", "infinite"]:
+                    pool.lease_seconds = 0
+                elif c[0] == "lease" and len(c) == 2:
+                    days, hours, minutes = (int(v) for v in c[1].split(":"))
+                    pool.lease_seconds = dhcp_text.lease_seconds(days, hours, minutes)
+                else:
+                    self.unparsed(child, node.text)
+            except ValueError:
+                self.unparsed(child, node.text)
 
     def router(self, node: Node) -> bool:
         w = node.words

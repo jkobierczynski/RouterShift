@@ -17,6 +17,7 @@ import re
 from typing import Dict, List, Optional, Set, Tuple
 
 from .. import acl as acl_text
+from .. import dhcp as dhcp_text
 from .. import fhrp
 from .. import ospf as ospf_text
 from ..model import Device, FhrpGroup, Interface, InterfaceKind, LacpMode, StaticRoute, StpMode, SwitchportMode, Vlan
@@ -88,6 +89,7 @@ class Writer:
         self.routes()
         self.vlan_blocks()
         self.spanning_tree()
+        self.dhcp()
         if self.device.bgp is not None:
             self.report.skip("bgp", f"bgp {self.device.bgp.local_as}", "bgp",
                              "not written: BGP on AOS-S depends on the model and release; configure it by hand")
@@ -426,6 +428,35 @@ class Writer:
         lines += ["enable", "exit"]
         self.out.append("router ospf")
         self.out += [_IND + line for line in lines]
+
+    def dhcp(self) -> None:
+        if not self.device.dhcp_pools:
+            return
+        for pool in self.device.dhcp_pools:
+            label = dhcp_text.label(pool)
+            if not pool.network:
+                self.report.skip("dhcp", label, "dhcp-network", "a pool without a network (a host binding) is not written")
+                continue
+            self.report.item("dhcp", label)
+            if pool.vrf and pool.vrf not in self.mgmt_vrfs:
+                self.report.add("dhcp", label, Severity.APPROX, "vrf", f"VRF {pool.vrf} does not exist on AOS-S")
+            net = ipaddress.ip_network(pool.network)
+            lines = [f"network {net.network_address} {net.netmask}"]
+            lines += [f"range {first} {last}" for first, last in pool.ranges]
+            if pool.default_routers:
+                lines.append("default-router " + " ".join(pool.default_routers))
+            if pool.dns_servers:
+                lines.append("dns-server " + " ".join(pool.dns_servers))
+            if pool.domain_name:
+                lines.append(f"domain-name {_quote(pool.domain_name)}")
+            if pool.lease_seconds == 0:
+                lines.append("lease infinite")
+            elif pool.lease_seconds is not None:
+                days, hours, minutes = dhcp_text.lease_parts(pool.lease_seconds)
+                lines.append(f"lease {days:02d}:{hours:02d}:{minutes:02d}")
+            self.out.append(f"dhcp-server pool {_quote(pool.name)}")
+            self.out += [_IND + line for line in lines] + [_IND + "exit"]
+        self.out.append("dhcp-server enable")
 
     def _svi_ospf(self, vid: int, svi: Interface) -> List[str]:
         name = self.svi_source.get(vid, svi.name)
