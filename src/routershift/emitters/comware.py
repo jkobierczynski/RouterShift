@@ -7,14 +7,15 @@
 from __future__ import annotations
 
 import ipaddress
-from typing import Callable, List, Tuple
+from typing import Callable, Dict, List, Tuple
 
 from .. import acl as acl_text
 from .. import dhcp as dhcp_text
 from .. import fhrp
+from .. import nat as nat_text
 from .. import ospf as ospf_text
-from ..model import (AclAction, AclEntry, BgpNeighbor, Device, FhrpGroup, Interface, InterfaceKind, LacpMode, Ospf,
-                     StaticRoute, StpMode, SwitchportMode)
+from ..model import (AclAction, AclEntry, BgpNeighbor, Device, FhrpGroup, Interface, InterfaceKind, LacpMode, NatRule,
+                     Ospf, StaticRoute, StpMode, SwitchportMode)
 from ..names import PortMapper
 from ..parsers.comware import ranges
 from ..parsers.ioslike import _vlan_ids
@@ -54,6 +55,7 @@ class Writer:
         for p in self.device.ospf:
             self.ospf(p)
         self.dhcp()
+        self.nat()
         order = {InterfaceKind.LAG: 0}
         for iface in sorted(self.device.interfaces.values(), key=lambda i: order.get(i.kind, 1)):
             self.interface(iface)
@@ -263,6 +265,7 @@ class Writer:
             lines.append(f"ospf cost {iface.ospf_cost}")
         if iface.ospf_network:
             lines.append(f"ospf network-type {'p2p' if iface.ospf_network == 'point-to-point' else 'broadcast'}")
+        lines += self._nat_interface(iface)
         if iface.helper_addresses:
             lines.append("dhcp select relay")
             lines += [f"dhcp relay server-address {helper}" for helper in iface.helper_addresses]
@@ -339,6 +342,70 @@ class Writer:
             self.out.append(f"dhcp server ip-pool {pool.name.replace(' ', '_')}")
             self.out += [_IND + line for line in lines]
             self.block_end()
+
+    def nat(self) -> None:
+        """Address groups and one-to-one rules; the rest goes on the outside interfaces."""
+        self.nat_groups = {}
+        taken = {int(name) for name in self.device.nat_pools if name.isdigit()}
+        number = 0
+        for pool in self.device.nat_pools.values():
+            if pool.name.isdigit():
+                group = pool.name
+            else:
+                number = min(n for n in range(number + 1, number + len(taken) + 2) if n not in taken)
+                group = str(number)
+                self.report.add("nat", f"pool {pool.name}", Severity.APPROX, "nat-pool",
+                                f"written as address group {group}; Comware numbers its address groups")
+            self.nat_groups[pool.name] = group
+            self.out += [f"nat address-group {group}", f"{_IND}address {pool.first} {pool.last}"]
+            self.block_end()
+        self.nat_outside: Dict[str, List[NatRule]] = {}
+        static = []
+        for rule in self.device.nat_rules:
+            label = nat_text.label(rule)
+            self.report.item("nat", label)
+            if rule.acl and rule.acl not in self.device.acls:
+                self.report.skip("nat", label, "acl-missing", f"ACL {rule.acl} is not defined; the rule is left out")
+                continue
+            if rule.kind == "dynamic" and rule.vrf:
+                self.report.add("nat", label, Severity.REVIEW, "nat-vrf",
+                                f"the sources are in VRF {rule.vrf}; check the outside interface binds that VPN")
+            outside = nat_text.outside(self.device, rule)
+            if not outside:
+                self.report.skip("nat", label, "nat-outside", "no outside interface is marked; the rule is left out")
+                continue
+            if rule.kind == "static" and not rule.protocol and not rule.interface:
+                static.append(rule)
+            for name in outside:
+                self.nat_outside.setdefault(name, []).append(rule)
+        for rule in static:
+            vpn = f" vpn-instance {rule.vrf}" if rule.vrf else ""
+            self.out.append(f"{_IND}nat static outbound {rule.local}{vpn} {rule.translated}")
+        if static:
+            self.block_end()
+
+    def _nat_interface(self, iface: Interface) -> List[str]:
+        lines = []
+        for rule in self.nat_outside.get(iface.name, []):
+            if rule.kind == "dynamic":
+                words = ["nat outbound"]
+                if rule.acl:
+                    words.append(f"name {acl_text.safe_name(rule.acl)}")
+                if rule.pool:
+                    words.append(f"address-group {self.nat_groups.get(rule.pool, rule.pool)}")
+                    if not rule.overload:
+                        words.append("no-pat")
+                lines.append(" ".join(words))
+            elif rule.protocol:
+                vpn = f" vpn-instance {rule.vrf}" if rule.vrf else ""
+                lines.append(f"nat server protocol {rule.protocol} global {rule.translated} {rule.translated_port} "
+                             f"inside {rule.local} {rule.local_port}{vpn}")
+            elif rule.interface:
+                vpn = f" vpn-instance {rule.vrf}" if rule.vrf else ""
+                lines.append(f"nat server global {rule.translated} inside {rule.local}{vpn}")
+            elif "nat static enable" not in lines:
+                lines.append("nat static enable")
+        return lines
 
     def bgp(self) -> None:
         bgp = self.device.bgp

@@ -129,6 +129,7 @@ class Interface:
     stp_portfast: Optional[bool] = None
     stp_bpduguard: Optional[bool] = None
     fhrp: List["FhrpGroup"] = field(default_factory=list)
+    nat: str = ""  # "inside", "outside" or ""
     ospf_cost: Optional[int] = None
     ospf_network: str = ""  # "", "point-to-point", "broadcast"
     origin: Origin = field(default_factory=Origin)
@@ -255,6 +256,32 @@ class Acl:
 
 
 @dataclass
+class NatPool:
+    name: str
+    first: str
+    last: str
+    prefix_len: int = 0  # 0 = unknown (Comware address groups have no mask)
+
+
+@dataclass
+class NatRule:
+    """Source NAT of traffic going from the inside to the outside."""
+
+    kind: str  # "static" (one address, or one port, to another) or "dynamic" (sources picked by an ACL)
+    local: str = ""  # static: the inside address
+    translated: str = ""  # static: the address it becomes
+    protocol: str = ""  # static port forwarding: "tcp" or "udp"
+    local_port: Optional[int] = None
+    translated_port: Optional[int] = None
+    acl: str = ""  # dynamic: the sources
+    pool: str = ""  # dynamic: the addresses to use; "" = the outside interface's own address
+    overload: bool = False  # dynamic: PAT
+    interface: str = ""  # the outside interface it applies on (canonical); "" = every outside interface
+    vrf: str = ""
+    origin: Origin = field(default_factory=Origin)
+
+
+@dataclass
 class DhcpPool:
     """A DHCP server pool. Addresses are handed out from ``ranges``; platforms that exclude addresses instead
     (IOS, Comware) are read into ranges and written back as exclusions."""
@@ -307,6 +334,8 @@ class Device:
     bgp: Optional[Bgp] = None
     acls: Dict[str, Acl] = field(default_factory=dict)
     dhcp_pools: List[DhcpPool] = field(default_factory=list)
+    nat_pools: Dict[str, NatPool] = field(default_factory=dict)
+    nat_rules: List[NatRule] = field(default_factory=list)
     stp_mode: Optional[StpMode] = None
     snmp: Snmp = field(default_factory=Snmp)
     users: List[LocalUser] = field(default_factory=list)

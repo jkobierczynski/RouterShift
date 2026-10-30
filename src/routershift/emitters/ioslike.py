@@ -13,8 +13,9 @@ from .. import acl as acl_text
 from .. import bgp as bgp_text
 from .. import dhcp as dhcp_text
 from .. import fhrp
+from .. import nat as nat_text
 from .. import ospf as ospf_text
-from ..model import (AclAction, Bgp, BgpNeighbor, Device, DhcpPool, FhrpGroup, Interface, InterfaceKind, LacpMode, Ospf,
+from ..model import (AclAction, Bgp, BgpNeighbor, Device, DhcpPool, NatRule, FhrpGroup, Interface, InterfaceKind, LacpMode, Ospf,
                      StaticRoute, StpMode, SwitchportMode)
 from ..names import PortMapper
 from ..report import Report, Severity
@@ -57,6 +58,12 @@ class Writer:
                        for i in self.device.interfaces.values() if i.fhrp}
         self.vrrp_v3 = self.ios and any(
             g.protocol == "vrrp" and g.version == 3 for gs in self.groups.values() for g in gs)
+        self.nat_outside: Dict[str, List[NatRule]] = {}
+        for rule in self.device.nat_rules:
+            if nat_text.needs_acl(rule):
+                continue
+            for name in nat_text.outside(self.device, rule):
+                self.nat_outside.setdefault(name, []).append(rule)
         self.system()
         self.spanning_tree()
         self.vrfs()
@@ -65,6 +72,7 @@ class Writer:
             self.interface(iface)
         self.routing()
         self.acls()
+        self.nat()
         self.dhcp()
         self.services()
         self.banner()
@@ -176,6 +184,7 @@ class Writer:
         lines += self._addresses(iface)
         lines += self._acl_bindings(iface, add)
         lines += self._fhrp(iface, name)
+        lines += self._nat_interface(iface)
         lines += self._ospf_interface(iface)
         if not self.ios and any(self._serves(pool, iface) for pool in self.device.dhcp_pools):
             lines.append("dhcp server ipv4")
@@ -379,6 +388,72 @@ class Writer:
             body.append("shutdown")
         return [f"vrrp {g.group} address-family ipv4"] + [f"{self.ind}{line}" for line in body] + [
             f"{self.ind}exit-vrrp"]
+
+    # NAT --------------------------------------------------------------------------------------------------------------
+
+    def _nat_interface(self, iface: Interface) -> List[str]:
+        if self.ios:
+            side = iface.nat or ("outside" if iface.name in self.nat_outside else "")
+            return [f"ip nat {side}"] if side else []
+        lines = []
+        for rule in self.nat_outside.get(iface.name, []):
+            label = nat_text.label(rule)
+            acl = acl_text.safe_name(rule.acl)
+            if rule.kind == "dynamic" and rule.pool:
+                lines.append(f"ip nat source dynamic access-list {acl} pool {rule.pool}" +
+                             (" overload" if rule.overload else ""))
+            elif rule.kind == "dynamic":
+                lines.append(f"ip nat source dynamic access-list {acl} overload")
+            elif rule.protocol:
+                self.report.skip("nat", label, "nat-port",
+                                 "static port forwarding is not written for EOS; add 'ip nat source static' by hand")
+            else:
+                lines.append(f"ip nat source static {rule.local} {rule.translated}")
+        return lines
+
+    def nat(self) -> None:
+        for pool in self.device.nat_pools.values():
+            if not pool.prefix_len:
+                self.report.add("nat", f"pool {pool.name}", Severity.REVIEW, "nat-mask",
+                                "the source gives no mask for the pool; /24 is written, check it")
+            self.out.append(f"ip nat pool {pool.name} {pool.first} {pool.last} prefix-length {pool.prefix_len or 24}")
+        for rule in self.device.nat_rules:
+            label = nat_text.label(rule)
+            if nat_text.needs_acl(rule):
+                self.report.skip("nat", label, "nat-acl", "the rule translates every source; write an ACL for the "
+                                 "inside networks and add the rule by hand")
+                continue
+            self.report.item("nat", label)
+            if rule.acl and rule.acl not in self.device.acls:
+                self.report.add("nat", label, Severity.REVIEW, "acl-missing", f"ACL {rule.acl} is not defined")
+            if not nat_text.outside(self.device, rule):
+                self.report.add("nat", label, Severity.REVIEW, "nat-outside",
+                                "no outside interface is marked; the rule has nowhere to apply")
+            if self.ios:
+                self.out.append(self._ios_nat(rule))
+        if self.ios and nat_text.inside_unknown(self.device):
+            self.report.add("nat", "inside interfaces", Severity.REVIEW, "nat-inside",
+                            "the source does not mark inside interfaces; add 'ip nat inside' to them")
+        if self.device.nat_rules or self.device.nat_pools:
+            self.out.append("!")
+
+    def _ios_nat(self, rule: NatRule) -> str:
+        vrf = f" vrf {self.vrf(rule.vrf)}" if rule.vrf else ""
+        if rule.kind == "static":
+            if rule.protocol:
+                return (f"ip nat inside source static {rule.protocol} {rule.local} {rule.local_port} "
+                        f"{rule.translated} {rule.translated_port}{vrf}")
+            return f"ip nat inside source static {rule.local} {rule.translated}{vrf}"
+        acl = acl_text.safe_name(rule.acl)
+        if rule.pool:
+            return f"ip nat inside source list {acl} pool {rule.pool}" + (" overload" if rule.overload else "") + vrf
+        outside = nat_text.outside(self.device, rule)
+        if len(outside) > 1:
+            self.report.add("nat", nat_text.label(rule), Severity.REVIEW, "nat-outside",
+                            f"IOS overloads onto one interface; {self.port(outside[0])} is used, not "
+                            + ", ".join(self.port(n) for n in outside[1:]))
+        where = self.port(outside[0]) if outside else "OUTSIDE-INTERFACE"
+        return f"ip nat inside source list {acl} interface {where} overload{vrf}"
 
     # DHCP server ------------------------------------------------------------------------------------------------------
 

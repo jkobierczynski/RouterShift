@@ -37,6 +37,7 @@ platform converts to and from all the others.
 | OSPFv2: processes per VRF, areas and area types, passive interfaces, redistribution, cost, network type | `Ospf`, `Interface.ospf_cost` | 2 (done) |
 | BGP: neighbors, peer groups, IPv4/IPv6 activation, networks, redistribution | `Bgp`, `BgpNeighbor` | 2 (done) |
 | Access lists (IPv4 and IPv6) and their interface bindings | `Acl`, `AclEntry`, `Interface.acl_in` ... | 2 (done) |
+| NAT: pools, dynamic source NAT and PAT, one-to-one and port forwarding rules, inside/outside interfaces | `NatPool`, `NatRule`, `Interface.nat` | 2 (done) |
 | SNMP, local users | `Snmp`, `LocalUser` | 2 |
 | Route maps, prefix lists, AAA/TACACS/RADIUS, QoS, MLAG/VSX/vPC, VXLAN/EVPN | to come | 3+ |
 
@@ -132,6 +133,21 @@ platform converts to and from all the others.
   pool's subnet. It takes one gateway per subnet and one domain name per VRF; anything more is reported.
 * Pools without a network (static host bindings), DHCP options and IPv6 pools are listed under "Not understood" for
   now.
+
+## NAT
+
+* Source NAT from inside to outside: dynamic rules (an ACL for the sources, onto a pool or the outside interface,
+  with or without PAT), one-to-one static rules and static port forwarding (TCP/UDP).
+* IOS marks interfaces `ip nat inside`/`outside` and writes the rules globally. EOS and Comware put the rules on the
+  outside interface (`ip nat source ...`, `nat outbound`, `nat server`, `nat static enable`). When the source names
+  no inside interfaces, the IOS writer asks a person to mark them.
+* Comware numbers its address groups; a named pool becomes the next free number (reported), and since an address
+  group has no mask, the reader takes it from the interface subnet the addresses sit in, or asks a person to check
+  the /24 that IOS and EOS are then given.
+* EOS port forwarding and a Comware `nat outbound` without an ACL (which IOS and EOS cannot express) are reported
+  and left out. AOS-CX and AOS-S switches have no NAT: every rule is reported, to move to a router or firewall.
+* Destination NAT other than port forwarding, NAT for IPv6 (NAT64, NPTv6), route maps in NAT rules and NAT
+  timeouts are listed under "Not understood" for now.
 
 ## Port names
 

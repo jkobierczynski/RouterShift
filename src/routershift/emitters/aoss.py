@@ -18,6 +18,7 @@ from typing import Dict, List, Optional, Set, Tuple
 
 from .. import acl as acl_text
 from .. import dhcp as dhcp_text
+from .. import nat as nat_text
 from .. import fhrp
 from .. import ospf as ospf_text
 from ..model import Device, FhrpGroup, Interface, InterfaceKind, LacpMode, StaticRoute, StpMode, SwitchportMode, Vlan
@@ -90,6 +91,7 @@ class Writer:
         self.vlan_blocks()
         self.spanning_tree()
         self.dhcp()
+        nat_text.skip_all(self.device, self.report, "AOS-S")
         if self.device.bgp is not None:
             self.report.skip("bgp", f"bgp {self.device.bgp.local_as}", "bgp",
                              "not written: BGP on AOS-S depends on the model and release; configure it by hand")
