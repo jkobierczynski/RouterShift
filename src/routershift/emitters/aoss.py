@@ -16,6 +16,7 @@ import ipaddress
 import re
 from typing import Dict, List, Optional, Set, Tuple
 
+from .. import acl as acl_text
 from ..model import Device, Interface, InterfaceKind, LacpMode, StaticRoute, StpMode, SwitchportMode, Vlan
 from ..names import PortMapper
 from ..parsers.ioslike import _vlan_ids
@@ -78,6 +79,7 @@ class Writer:
         self.routing_mode()
         self.trunks()
         self.oobm()
+        self.acls()
         self.interfaces()
         self.routes()
         self.vlan_blocks()
@@ -109,7 +111,8 @@ class Writer:
                 self.vlans[vid] = Vlan(vid, name=f"routed {name}")
                 svi = Interface(f"Vlan{vid}", InterfaceKind.VLAN, ipv4=list(iface.ipv4), ipv6=list(iface.ipv6),
                                 dhcp_client=iface.dhcp_client, helper_addresses=list(iface.helper_addresses),
-                                vrf=iface.vrf)
+                                vrf=iface.vrf, acl_in=iface.acl_in, acl_out=iface.acl_out,
+                                acl6_in=iface.acl6_in, acl6_out=iface.acl6_out)
                 self.svis[vid] = svi
                 self.untagged.setdefault(vid, []).append(name)
                 self.add(iface, Severity.APPROX, "routed-port",
@@ -253,6 +256,8 @@ class Writer:
             lines: List[str] = []
             if iface.description:
                 lines.append(f"name {_quote(iface.description)}")
+            if iface.mode != SwitchportMode.ROUTED:  # a routed port's lists go to its VLAN
+                lines += self._acl_bindings(iface)
             if iface.shutdown:
                 lines.append("disable")
             if iface.speed is not None:
@@ -350,7 +355,32 @@ class Writer:
             lines.append(f"ipv6 address {cidr}")
         for helper in svi.helper_addresses:
             lines.append(f"ip helper-address {helper}")
+        lines += self._acl_bindings(svi)
         return lines
+
+    def _acl_bindings(self, iface: Interface) -> List[str]:
+        lines = []
+        for attr, family, direction in (("acl_in", "ip", "in"), ("acl_out", "ip", "out"), ("acl6_in", "ipv6", "in"),
+                                        ("acl6_out", "ipv6", "out")):
+            name = getattr(iface, attr)
+            if name and name in self.device.acls:
+                lines.append(f"{family} access-group {_quote(acl_text.safe_name(name))} {direction}")
+            elif name:
+                self.report.add("interface", self.label(iface), Severity.REVIEW, "acl-missing",
+                                f"ACL {name} is applied but not defined; left out")
+        return lines
+
+    def acls(self) -> None:
+        for acl in self.device.acls.values():
+            name = acl_text.safe_name(acl.name)
+            label = acl.name if name == acl.name else f"{acl.name} -> {name}"
+            self.report.item("acl", label)
+            header = f"ipv6 access-list {_quote(name)}" if acl.family == 6 else f"ip access-list extended {_quote(name)}"
+            self.out.append(header)
+            lines = acl_text.cisco_lines(acl, self.report, label, "wildcard", any_protocol="ipv6" if acl.family == 6
+                                         else "ip", icmp6="icmp", icmp_names=False, quote_remark=True)
+            self.out += [_IND + line for line in lines]
+            self.out.append(_IND + "exit")
 
     def spanning_tree(self) -> None:
         mode = self.device.stp_mode

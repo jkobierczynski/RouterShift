@@ -15,10 +15,11 @@ from __future__ import annotations
 import ipaddress
 from typing import Callable, Dict, List, Optional
 
+from .. import acl as acl_text
 from .. import confparse, names
 from ..confparse import Node
 from ..errors import ParseError
-from ..model import (Device, Interface, InterfaceKind, LacpMode, Origin, StaticRoute, StpMode, SwitchportMode,
+from ..model import (Acl, Device, Interface, InterfaceKind, LacpMode, Origin, StaticRoute, StpMode, SwitchportMode,
                      Unparsed, Vlan)
 
 # Lines that only describe the file or the software, not the device's behaviour.
@@ -93,6 +94,7 @@ class _Reader:
             "interface": self.interface,
             "vrf": self.vrf,
             "spanning-tree": self.spanning_tree,
+            "access-list": self.numbered_acl,
         }
         for node in roots:
             if node.text.startswith(_NOISE) or node.text == "end":
@@ -167,6 +169,8 @@ class _Reader:
             return True
         if w[1:2] == ["route"]:
             return self.route(node, w[2:], 4)
+        if w[1:2] == ["access-list"] and len(w) >= 3:
+            return self.acl(node, 4)
         if w[1:2] == ["vrf"] and len(w) == 3:  # IOS classic: ip vrf NAME
             self._add_vrf(w[2])
             return all(c.words[0] in ("rd", "route-target", "description") for c in node.children)
@@ -178,7 +182,53 @@ class _Reader:
             return True
         if w[1:2] == ["route"]:
             return self.route(node, w[2:], 6)
+        if w[1:2] == ["access-list"] and len(w) >= 3:
+            return self.acl(node, 6)
         return False
+
+    # access lists ----------------------------------------------------------------------------------------------------
+
+    def acl(self, node: Node, family: int) -> bool:
+        """ip access-list [standard|extended] NAME (IOS, EOS), ipv6 access-list NAME."""
+        w = node.words[2:]
+        standard = w[0] == "standard"
+        if w[0] in ("standard", "extended"):
+            w = w[1:]
+        if len(w) != 1:
+            return False
+        acl = self.device.acls.setdefault(w[0], Acl(w[0], family=family))
+        for child in node.children:
+            words = child.words
+            sequence: Optional[int] = None
+            if words[0] == "sequence" and len(words) > 1:  # IOS IPv6
+                words = words[1:]
+            if words[0].isdigit():
+                sequence, words = int(words[0]), words[1:]
+            if words[:1] == ["statistics"] or words[:1] == ["counters"]:
+                continue
+            try:
+                entry = acl_text.read_entry(words, family, wildcards=True, standard=standard)
+            except (acl_text.Unsupported, ValueError, IndexError):
+                entry = acl_text.unsupported_entry(child.text, sequence)
+            entry.sequence, entry.origin = sequence, Origin(child.line, child.text)
+            acl.entries.append(entry)
+        return True
+
+    def numbered_acl(self, node: Node) -> bool:
+        """access-list 10 permit 10.0.0.0 0.0.0.255, access-list 101 permit tcp any any eq 80 (IOS)."""
+        w = node.words
+        if len(w) < 3 or not w[1].isdigit():
+            return False
+        number = int(w[1])
+        standard = number < 100 or 1300 <= number < 2000
+        acl = self.device.acls.setdefault(w[1], Acl(w[1]))
+        try:
+            entry = acl_text.read_entry(w[2:], 4, wildcards=True, standard=standard)
+        except (acl_text.Unsupported, ValueError, IndexError):
+            entry = acl_text.unsupported_entry(node.text)
+        entry.origin = Origin(node.line, node.text)
+        acl.entries.append(entry)
+        return True
 
     def _add_vrf(self, name: str) -> None:
         if name not in self.device.vrfs:
@@ -356,6 +406,10 @@ class _Reader:
             iface.ipv6.append(str(ipaddress.ip_interface(w[2])))
         elif w == ["ipv6", "enable"]:
             pass
+        elif w[:2] == ["ip", "access-group"] and n == 4 and w[3] in ("in", "out"):
+            setattr(iface, f"acl_{w[3]}", w[2])
+        elif w[:2] in (["ipv6", "traffic-filter"], ["ipv6", "access-group"]) and n == 4 and w[3] in ("in", "out"):
+            setattr(iface, f"acl6_{w[3]}", w[2])
         elif w[:2] == ["ip", "helper-address"] and n >= 3:
             iface.helper_addresses.append(w[-1])
             return n == 3

@@ -20,10 +20,11 @@ from __future__ import annotations
 import ipaddress
 from typing import Callable, Dict, List, Optional, Tuple
 
+from .. import acl as acl_text
 from .. import confparse
 from ..confparse import Node
 from ..errors import ParseError
-from ..model import (Device, Interface, InterfaceKind, LacpMode, Origin, StaticRoute, StpMode, SwitchportMode,
+from ..model import (Acl, Device, Interface, InterfaceKind, LacpMode, Origin, StaticRoute, StpMode, SwitchportMode,
                      Unparsed, Vlan)
 from .ioslike import _is_address, _vlan_ids
 
@@ -83,6 +84,7 @@ class _Reader:
             "vlan": self.vlan,
             "spanning-tree": self.spanning_tree,
             "interface": self.interface,
+            "access-list": self.acl,
         }
         for node in roots:
             if node.text.startswith(_NOISE):
@@ -218,6 +220,16 @@ class _Reader:
             self.device.unparsed.append(Unparsed(node.line, node.text, "ip route (options not converted)"))
         return True
 
+    def acl(self, node: Node) -> bool:
+        """access-list ip NAME / access-list ipv6 NAME, entries "10 permit tcp 10.0.0.0/255.255.255.0 any eq 443"."""
+        w = node.words
+        if len(w) != 3 or w[1] not in ("ip", "ipv6"):
+            return False
+        family = 6 if w[1] == "ipv6" else 4
+        acl = self.device.acls.setdefault(w[2], Acl(w[2], family=family))
+        acl_text.read_block(acl, node.children, wildcards=False)
+        return True
+
     # interfaces ------------------------------------------------------------------------------------------------------
 
     def interface(self, node: Node) -> bool:
@@ -293,6 +305,9 @@ class _Reader:
             iface.dhcp_client = True
         elif w[:2] == ["ipv6", "address"] and n == 3 and "/" in w[2]:
             iface.ipv6.append(str(ipaddress.ip_interface(w[2])))
+        elif w[:2] == ["apply", "access-list"] and n == 5 and w[2] in ("ip", "ipv6") and w[4] in (
+                "in", "out", "routed-in", "routed-out"):
+            setattr(iface, f"acl{'6' if w[2] == 'ipv6' else ''}_{w[4].replace('routed-', '')}", w[3])
         elif w[:2] == ["ip", "helper-address"] and n >= 3:
             iface.helper_addresses.append(w[2])
             if n == 5 and w[3] == "vrf":

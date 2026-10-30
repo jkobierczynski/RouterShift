@@ -9,7 +9,8 @@ from __future__ import annotations
 import ipaddress
 from typing import Callable, Dict, List
 
-from ..model import Device, Interface, InterfaceKind, LacpMode, StaticRoute, StpMode, SwitchportMode
+from .. import acl as acl_text
+from ..model import AclAction, Device, Interface, InterfaceKind, LacpMode, StaticRoute, StpMode, SwitchportMode
 from ..names import PortMapper
 from ..report import Report, Severity
 from ..timezones import offset_minutes
@@ -54,6 +55,7 @@ class Writer:
         for iface in self.device.interfaces.values():
             self.interface(iface)
         self.routing()
+        self.acls()
         self.services()
         self.banner()
         self.out.append("end")
@@ -159,6 +161,7 @@ class Writer:
             vrf = self.vrf(iface.vrf)
             lines.append(f"vrf forwarding {vrf}" if self.ios else f"vrf {vrf}")
         lines += self._addresses(iface)
+        lines += self._acl_bindings(iface, add)
         if iface.mtu is not None:
             mtu = iface.mtu
             if self.ios and mtu > _IOS_MAX_MTU:
@@ -248,6 +251,52 @@ class Writer:
             word = word.replace("full", "half")
         add(Severity.APPROX, "speed", "forced speed: check that the transceiver and EOS release take it")
         return [f"speed forced {word}"]
+
+    def _acl_bindings(self, iface: Interface, add: "_Add") -> List[str]:
+        lines = []
+        for attr, direction in (("acl_in", "in"), ("acl_out", "out"), ("acl6_in", "in"), ("acl6_out", "out")):
+            name = getattr(iface, attr)
+            if not name:
+                continue
+            if name not in self.device.acls:
+                add(Severity.REVIEW, "acl-missing", f"ACL {name} is applied but not defined; left out")
+                continue
+            if attr.startswith("acl6"):
+                word = "ipv6 traffic-filter" if self.ios else "ipv6 access-group"
+            else:
+                word = "ip access-group"
+            lines.append(f"{word} {acl_text.safe_name(name)} {direction}")
+        return lines
+
+    # access lists ----------------------------------------------------------------------------------------------------
+
+    def acls(self) -> None:
+        for acl in self.device.acls.values():
+            name = acl_text.safe_name(acl.name)
+            label = acl.name if name == acl.name else f"{acl.name} -> {name}"
+            self.report.item("acl", label)
+            if acl.family == 6:
+                self.out.append(f"ipv6 access-list {name}")
+            else:
+                self.out.append(f"ip access-list extended {name}" if self.ios else f"ip access-list {name}")
+            style = "wildcard" if self.ios and acl.family == 4 else "prefix"
+            for seq, entry, src, dst in acl_text.numbered(acl):
+                if entry.unsupported:
+                    seq_word = "" if self.ios else f"{seq} "
+                    self.out.append(f"{self.ind}{seq_word}remark RouterShift could not convert: {entry.unsupported}")
+                    self.report.add("acl", label, Severity.REVIEW, "acl-entry",
+                                    f"entry '{entry.unsupported}' not converted; its place is marked by a remark")
+                    continue
+                words = acl_text.cisco_entry(entry, acl.family, src, dst, style,
+                                             any_protocol="ipv6" if acl.family == 6 else "ip",
+                                             icmp6="icmp" if self.ios else "icmpv6", icmp_names=True)
+                if self.ios and entry.action == AclAction.REMARK:
+                    self.out.append(f"{self.ind}{' '.join(words)}")
+                elif self.ios and acl.family == 6:
+                    self.out.append(f"{self.ind}sequence {seq} {' '.join(words)}")
+                else:
+                    self.out.append(f"{self.ind}{seq} {' '.join(words)}")
+            self.out.append("!")
 
     # routing ---------------------------------------------------------------------------------------------------------
 

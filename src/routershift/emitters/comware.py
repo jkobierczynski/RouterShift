@@ -7,9 +7,10 @@
 from __future__ import annotations
 
 import ipaddress
-from typing import Callable, List
+from typing import Callable, List, Tuple
 
-from ..model import Device, Interface, InterfaceKind, LacpMode, StaticRoute, StpMode, SwitchportMode
+from .. import acl as acl_text
+from ..model import AclAction, AclEntry, Device, Interface, InterfaceKind, LacpMode, StaticRoute, StpMode, SwitchportMode
 from ..names import PortMapper
 from ..parsers.comware import ranges
 from ..parsers.ioslike import _vlan_ids
@@ -38,6 +39,7 @@ class Writer:
         self.vrfs()
         self.vlans()
         self.spanning_tree()
+        self.acls()
         order = {InterfaceKind.LAG: 0}
         for iface in sorted(self.device.interfaces.values(), key=lambda i: order.get(i.kind, 1)):
             self.interface(iface)
@@ -136,6 +138,53 @@ class Writer:
         self.out.append(f"{_IND}stp global enable")
         self.block_end()
 
+    # access lists ----------------------------------------------------------------------------------------------------
+
+    def acls(self) -> None:
+        for acl in self.device.acls.values():
+            name = acl_text.safe_name(acl.name)
+            label = acl.name if name == acl.name else f"{acl.name} -> {name}"
+            self.report.item("acl", label)
+            self.out.append(f"acl {'ipv6 ' if acl.family == 6 else ''}advanced name {name}")
+            pending: List[str] = []  # remarks, written as the comment of the next rule
+            for seq, entry, src, dst in acl_text.numbered(acl, step=5):
+                if entry.unsupported:
+                    self.report.add("acl", label, Severity.REVIEW, "acl-entry",
+                                    f"entry '{entry.unsupported}' not converted; add it by hand after rule "
+                                    f"{seq - 5}")
+                    continue
+                if entry.action == AclAction.REMARK:
+                    pending.append(entry.remark)
+                    continue
+                self.out.append(f"{_IND}rule {seq} {self._rule(entry, acl.family, src, dst)}")
+                if pending:
+                    self.out.append(f"{_IND}rule {seq} comment {' '.join(pending)}")
+                    pending = []
+            self.block_end()
+
+    def _rule(self, entry: AclEntry, family: int, src: Tuple[str, List[int]], dst: Tuple[str, List[int]]) -> str:
+        words = [entry.action.value]
+        proto = entry.protocol
+        if proto == "ip":
+            proto = "ipv6" if family == 6 else "ip"
+        words.append(proto)
+        for side, address, ports in (("source", entry.source, src), ("destination", entry.destination, dst)):
+            if address != "any":
+                net = ipaddress.ip_network(address)
+                if net.version == 4:
+                    words += [side, str(net.network_address), str(net.hostmask)]
+                else:
+                    words += [side, str(net.network_address), str(net.prefixlen)]
+            if ports[0]:
+                words += [f"{side}-port"] + acl_text.cisco_ports(ports)
+        if entry.icmp_type is not None:
+            words += ["icmp6-type" if family == 6 else "icmp-type", str(entry.icmp_type)]
+        if entry.established:
+            words.append("established")
+        if entry.log:
+            words.append("logging")
+        return " ".join(words)
+
     # interfaces ------------------------------------------------------------------------------------------------------
 
     def interface(self, iface: Interface) -> None:
@@ -182,6 +231,13 @@ class Writer:
             lines.append(f"ip address {net.ip} {net.netmask}" + (" sub" if n else ""))
         for cidr in iface.ipv6:
             lines.append(f"ipv6 address {cidr}")
+        for attr, v6, direction in (("acl_in", "", "inbound"), ("acl_out", "", "outbound"),
+                                    ("acl6_in", "ipv6 ", "inbound"), ("acl6_out", "ipv6 ", "outbound")):
+            acl_name = getattr(iface, attr)
+            if acl_name and acl_name in self.device.acls:
+                lines.append(f"packet-filter {v6}name {acl_text.safe_name(acl_name)} {direction}")
+            elif acl_name:
+                add(Severity.REVIEW, "acl-missing", f"ACL {acl_name} is applied but not defined; left out")
         if iface.helper_addresses:
             lines.append("dhcp select relay")
             lines += [f"dhcp relay server-address {helper}" for helper in iface.helper_addresses]

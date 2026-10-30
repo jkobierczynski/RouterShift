@@ -122,8 +122,10 @@ class Interface:
     ipv6: List[str] = field(default_factory=list)
     dhcp_client: bool = False
     helper_addresses: List[str] = field(default_factory=list)
-    acl_in: str = ""
+    acl_in: str = ""  # IPv4 ACLs applied to the interface
     acl_out: str = ""
+    acl6_in: str = ""  # IPv6 ACLs
+    acl6_out: str = ""
     stp_portfast: Optional[bool] = None
     stp_bpduguard: Optional[bool] = None
     origin: Origin = field(default_factory=Origin)
@@ -188,14 +190,18 @@ class Bgp:
 class AclEntry:
     action: AclAction
     sequence: Optional[int] = None
-    protocol: str = "ip"  # "ip", "tcp", "udp", "icmp" or a number
+    protocol: str = "ip"  # "ip" (any protocol, either family), "tcp", "udp", "icmp", "icmpv6" or a number
     source: str = "any"  # "any" or CIDR
     destination: str = "any"
-    src_ports: str = ""  # "80,443,1000-2000"
+    src_ports: str = ""  # "80,443,1000-2000"; "" = any
     dst_ports: str = ""
+    icmp_type: Optional[int] = None
     established: bool = False
     log: bool = False
-    remark: str = ""
+    remark: str = ""  # REMARK entries
+    # Non-empty: the entry as the source wrote it, which the model cannot hold (object groups, non-contiguous
+    # wildcards, "neq", ...). Writers keep its place with a comment and the report asks a person to translate it.
+    unsupported: str = ""
     origin: Origin = field(default_factory=Origin)
 
 

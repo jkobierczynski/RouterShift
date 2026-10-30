@@ -21,10 +21,11 @@ import ipaddress
 import re
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
+from .. import acl as acl_text
 from .. import confparse
 from ..confparse import Node
 from ..errors import ParseError
-from ..model import (Device, Interface, InterfaceKind, LacpMode, Origin, StaticRoute, StpMode, SwitchportMode,
+from ..model import (Acl, Device, Interface, InterfaceKind, LacpMode, Origin, StaticRoute, StpMode, SwitchportMode,
                      Unparsed, Vlan)
 from ..timezones import utc
 from .ioslike import _cidr, _is_address
@@ -112,6 +113,7 @@ class _Reader:
             "trunk": self.trunk,
             "oobm": self.oobm,
             "interface": self.interface,
+            "access-list": self.numbered_acl,
             "vlan": self.vlan,
             "spanning-tree": self.spanning_tree,
         }
@@ -181,6 +183,8 @@ class _Reader:
         if w[1:2] == ["default-gateway"] and len(w) == 3:
             self.default_gateway = StaticRoute("0.0.0.0/0", next_hop=w[2], origin=Origin(node.line, node.text))
             return True
+        if w[1:2] == ["access-list"] and len(w) == 4 and w[2] in ("standard", "extended"):
+            return self.acl(node, 4, w[2] == "standard", unquote(w[3]))
         if w[1:2] == ["route"] and len(w) >= 5:
             prefix = str(ipaddress.ip_network(f"{w[2]}/{w[3]}", strict=False))
             return self.route(node, prefix, w[4:])
@@ -188,6 +192,8 @@ class _Reader:
 
     def ipv6(self, node: Node) -> bool:
         w = node.words
+        if w[1:2] == ["access-list"] and len(w) == 3:
+            return self.acl(node, 6, False, unquote(w[2]))
         if w[1:2] == ["route"] and len(w) >= 4:
             return self.route(node, str(ipaddress.ip_network(w[2], strict=False)), w[3:])
         return w[1:] in (["unicast-routing"],)
@@ -213,6 +219,31 @@ class _Reader:
         self.device.static_routes.append(route)
         if not ok:
             self.device.unparsed.append(Unparsed(node.line, node.text, "ip route (options not converted)"))
+        return True
+
+    def acl(self, node: Node, family: int, standard: bool, name: str) -> bool:
+        acl = self.device.acls.setdefault(name, Acl(name, family=family))
+        acl_text.read_block(acl, node.children, wildcards=True, standard=standard)
+        return True
+
+    def numbered_acl(self, node: Node) -> bool:
+        w = node.words
+        if len(w) < 3 or not w[1].isdigit():
+            return False
+        acl = self.device.acls.setdefault(w[1], Acl(w[1]))
+        try:
+            entry = acl_text.read_entry(w[2:], 4, wildcards=True, standard=int(w[1]) < 100)
+        except (acl_text.Unsupported, ValueError, IndexError):
+            entry = acl_text.unsupported_entry(node.text)
+        entry.origin = Origin(node.line, node.text)
+        acl.entries.append(entry)
+        return True
+
+    def _access_group(self, iface: Interface, w: List[str]) -> bool:
+        """ip access-group "NAME" in|out, ipv6 access-group "NAME" in|out."""
+        if len(w) != 4 or w[3] not in ("in", "out"):
+            return False
+        setattr(iface, f"acl{'6' if w[0] == 'ipv6' else ''}_{w[3]}", unquote(w[2]))
         return True
 
     def trunk(self, node: Node) -> bool:
@@ -282,6 +313,8 @@ class _Reader:
             return True
         if w == ["disable"]:
             iface.shutdown = True
+        elif w[1:2] == ["access-group"] and w[0] in ("ip", "ipv6"):
+            return self._access_group(iface, w)
         elif w[0] == "name" and len(w) >= 2:
             iface.description = unquote(" ".join(w[1:]))
         elif w[0] == "speed-duplex" and len(w) == 2:
@@ -336,6 +369,8 @@ class _Reader:
                     l3().ipv4.append(str(ipaddress.ip_interface(c[2])))
                 elif c[:2] == ["ipv6", "address"] and len(c) == 3 and "/" in c[2]:
                     l3().ipv6.append(str(ipaddress.ip_interface(c[2])))
+                elif c[1:2] == ["access-group"] and c[0] in ("ip", "ipv6") and c[-1] in ("in", "out"):
+                    self._access_group(l3(), c)
                 elif c[:2] == ["ip", "helper-address"] and len(c) == 3:
                     l3().helper_addresses.append(c[2])
                 elif c in (["no", "ip", "address"], ["ipv6", "enable"]):
