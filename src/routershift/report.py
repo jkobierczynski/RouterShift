@@ -58,6 +58,7 @@ _KIND_TITLES = [
     ("bgp", "BGP"),
     ("acl", "Access lists"),
     ("dhcp", "DHCP server"),
+    ("nat", "NAT"),
     ("management", "Management"),
     ("unparsed", "Not understood"),
 ]

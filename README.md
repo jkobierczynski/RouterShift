@@ -20,7 +20,8 @@ domain, DNS, NTP, syslog, banner, spanning-tree mode), VLANs, interfaces
 (switchport access and trunk, voice VLAN, LAGs and LACP, SVIs, loopbacks, the
 management port, subinterfaces), IPv4 and IPv6 addressing, DHCP relay and server, VRFs,
 static routes, IPv4/IPv6 access lists with their interface bindings, gateway
-redundancy (HSRP, VRRP, anycast gateways), OSPF and BGP. Everything else (route
+redundancy (HSRP, VRRP, anycast gateways), OSPF, BGP and NAT (on IOS, EOS and
+Comware; the AOS switches have none). Everything else (route
 maps, SNMP, AAA, ...) is listed in the report under "Not understood", line by
 line, with secrets masked.
 

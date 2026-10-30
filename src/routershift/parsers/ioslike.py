@@ -23,7 +23,7 @@ from .. import confparse, names
 from .. import dhcp as dhcp_text
 from ..confparse import Node
 from ..errors import ParseError
-from ..model import (Acl, Device, DhcpPool, FhrpGroup, Interface, InterfaceKind, LacpMode, Origin, Ospf, OspfNetwork,
+from ..model import (Acl, Device, DhcpPool, FhrpGroup, NatPool, NatRule, Interface, InterfaceKind, LacpMode, Origin, Ospf, OspfNetwork,
                      StaticRoute, StpMode, SwitchportMode, Unparsed, Vlan)
 
 # Lines that only describe the file or the software, not the device's behaviour.
@@ -183,6 +183,13 @@ class _Reader:
             return self.route(node, w[2:], 4)
         if w[1:2] == ["access-list"] and len(w) >= 3:
             return self.acl(node, 4)
+        if w[1:3] == ["nat", "pool"] and len(w) == 8 and w[6] in ("netmask", "prefix-length"):
+            length = w[7] if w[6] == "prefix-length" else str(ipaddress.ip_network(f"0.0.0.0/{w[7]}").prefixlen)
+            first, last = str(ipaddress.IPv4Address(w[4])), str(ipaddress.IPv4Address(w[5]))
+            self.device.nat_pools[w[3]] = NatPool(w[3], first, last, int(length))
+            return True
+        if w[1:4] == ["nat", "inside", "source"] and len(w) >= 6:
+            return self.ios_nat(node, w[4:])
         if w[1:3] == ["dhcp", "pool"] and len(w) == 4:
             return self.dhcp_pool(node, w[3])
         if w[1:3] == ["dhcp", "excluded-address"] and len(w) >= 4:
@@ -211,6 +218,58 @@ class _Reader:
         if w[1:2] == ["access-list"] and len(w) >= 3:
             return self.acl(node, 6)
         return False
+
+    # NAT --------------------------------------------------------------------------------------------------------------
+
+    def ios_nat(self, node: Node, w: List[str]) -> bool:
+        """ip nat inside source list ACL interface X overload | pool P [overload]; static [tcp|udp] A [p] B [q]"""
+        rule = NatRule("dynamic", origin=Origin(node.line, node.text))
+        if w[-2:-1] == ["vrf"]:
+            rule.vrf, w = w[-1], w[:-2]
+        if w[-1:] == ["extendable"]:
+            w = w[:-1]
+        if w[0] == "list" and len(w) >= 4:
+            rule.acl = w[1]
+            rule.overload = w[-1] == "overload"
+            rest = w[2:-1] if rule.overload else w[2:]
+            if rest[0] == "pool" and len(rest) == 2:
+                rule.pool = rest[1]
+            elif rest[0] == "interface" and len(rest) >= 2:
+                rule.interface = names.canonical(" ".join(rest[1:]))[0]
+            else:
+                return False
+        elif w[0] == "static" and len(w) in (3, 6) and (len(w) == 3 or w[1] in ("tcp", "udp")):
+            rule.kind = "static"
+            if len(w) == 6:
+                rule.protocol = w[1]
+                rule.local, rule.local_port = str(ipaddress.IPv4Address(w[2])), int(w[3])
+                rule.translated, rule.translated_port = str(ipaddress.IPv4Address(w[4])), int(w[5])
+            else:
+                rule.local, rule.translated = str(ipaddress.IPv4Address(w[1])), str(ipaddress.IPv4Address(w[2]))
+        else:
+            return False
+        self.device.nat_rules.append(rule)
+        return True
+
+    def eos_nat(self, iface: Interface, w: List[str]) -> bool:
+        """ip nat source dynamic access-list ACL overload | pool P; ip nat source static A B (on the outside)"""
+        rule = NatRule("dynamic", interface=iface.name, vrf=iface.vrf)
+        if w[:2] == ["dynamic", "access-list"] and len(w) in (4, 5, 6):
+            rule.acl = w[2]
+            if w[3:] == ["overload"]:
+                rule.overload = True
+            elif w[3] == "pool" and len(w) >= 5 and w[5:] in ([], ["overload"]):
+                rule.pool, rule.overload = w[4], len(w) == 6
+            else:
+                return False
+        elif w[0] == "static" and len(w) == 3:
+            rule.kind = "static"
+            rule.local, rule.translated = str(ipaddress.IPv4Address(w[1])), str(ipaddress.IPv4Address(w[2]))
+        else:
+            return False
+        iface.nat = "outside"
+        self.device.nat_rules.append(rule)
+        return True
 
     # DHCP server ------------------------------------------------------------------------------------------------------
 
@@ -786,6 +845,10 @@ class _Reader:
             if not tag.isdigit():
                 return False
             iface.encapsulation_vlan = int(tag)
+        elif w[:2] == ["ip", "nat"] and w[2:] in (["inside"], ["outside"]):
+            iface.nat = w[2]
+        elif w[:3] == ["ip", "nat", "source"] and n >= 5:
+            return self.eos_nat(iface, w[3:])
         elif w[:3] == ["dhcp", "server", "ipv4"] and n == 3:
             pass  # EOS: the interface serves the subnet it is in
         elif w[:2] == ["ip", "ospf"] and n >= 4 and w[-2] == "area" and n in (4, 5):

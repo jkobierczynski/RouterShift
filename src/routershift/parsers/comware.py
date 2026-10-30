@@ -28,8 +28,8 @@ from .. import dhcp as dhcp_text
 from .. import ospf as ospf_text
 from ..confparse import Node
 from ..errors import ParseError
-from ..model import (Acl, AclAction, AclEntry, Device, DhcpPool, FhrpGroup, Interface, InterfaceKind, LacpMode, Origin, Ospf,
-                     OspfNetwork, StaticRoute, StpMode, SwitchportMode, Unparsed, Vlan)
+from ..model import (Acl, AclAction, AclEntry, Device, DhcpPool, FhrpGroup, Interface, InterfaceKind, LacpMode, NatPool,
+                     NatRule, Origin, Ospf, OspfNetwork, StaticRoute, StpMode, SwitchportMode, Unparsed, Vlan)
 from .ioslike import _cidr, _is_address
 
 _PREFIXES: List[Tuple[str, InterfaceKind, str]] = [
@@ -119,6 +119,7 @@ class _Reader:
         self._vrrp_version = 3  # the Comware 7 default
         self._ospf_areas: List[Tuple[str, str, str]] = []
         self._dhcp_excluded: Dict[str, List[Tuple[str, str]]] = {}  # VRF -> forbidden ranges
+        self._nat_groups: Dict[str, str] = {}  # address-group number -> pool name
 
     def unparsed(self, node: Node, section: str = "") -> None:
         self.device.unparsed.append(Unparsed(node.line, node.text, section))
@@ -150,6 +151,7 @@ class _Reader:
             "ospf": self.ospf,
             "bgp": self.bgp,
             "dhcp": self.dhcp,
+            "nat": self.nat,
         }
         for node in roots:
             if node.text.startswith(_NOISE):
@@ -438,6 +440,75 @@ class _Reader:
                 self.unparsed(child, node.text)
         return True
 
+    def nat(self, node: Node) -> bool:
+        """nat address-group N [name X] / address A B; nat static outbound A [vpn-instance V] B."""
+        w = node.words
+        if w[1] == "address-group" and len(w) in (3, 5) and w[2].isdigit():
+            name = w[4] if len(w) == 5 and w[3] == "name" else w[2]
+            if len(w) == 5 and w[3] != "name":
+                return False
+            self._nat_groups[w[2]] = name
+            for child in node.children:
+                c = child.words
+                if c[0] == "address" and len(c) == 3 and name not in self.device.nat_pools:
+                    first, last = (str(ipaddress.IPv4Address(a)) for a in c[1:])
+                    self.device.nat_pools[name] = NatPool(name, first, last)
+                else:
+                    self.unparsed(child, node.text)
+            return True
+        if w[1:3] == ["static", "outbound"] and len(w) in (5, 7):
+            vrf = w[5] if len(w) == 7 and w[4] == "vpn-instance" else ""
+            if len(w) == 7 and not vrf:
+                return False
+            rule = NatRule("static", str(ipaddress.IPv4Address(w[3])), str(ipaddress.IPv4Address(w[-1])), vrf=vrf,
+                           origin=Origin(node.line, node.text))
+            self.device.nat_rules.append(rule)
+            return True
+        return False
+
+    def nat_interface(self, iface: Interface, w: List[str]) -> bool:
+        """nat outbound [ACL|name ACL] [address-group G] [no-pat]; nat static enable; nat server ... (outside)."""
+        if w == ["nat", "static", "enable"]:
+            iface.nat = "outside"
+            return True
+        if w[1] == "outbound":
+            rule = NatRule("dynamic", interface=iface.name, overload=True)
+            args = w[2:]
+            if args[:1] == ["name"] and len(args) >= 2:
+                rule.acl, args = args[1], args[2:]
+            elif args[:1] and args[0].isdigit():
+                rule.acl, args = args[0], args[1:]
+            if args[:1] == ["address-group"] and len(args) >= 2:
+                group = args[2] if args[1] == "name" else args[1]
+                rule.pool = group  # the number, named in _finish
+                args = args[3:] if args[1] == "name" else args[2:]
+            if args == ["no-pat"]:
+                rule.overload = False
+            elif args:
+                return False
+        elif w[1] == "server":
+            rule = NatRule("static", interface=iface.name)
+            args = w[2:]
+            if args[:1] == ["protocol"] and len(args) >= 8 and args[1] in ("tcp", "udp"):
+                rule.protocol = args[1]
+                args = args[2:]
+            if args[:1] != ["global"] or "inside" not in args:
+                return False
+            split = args.index("inside")
+            outside, inside = args[1:split], args[split + 1:]
+            if inside[-2:-1] == ["vpn-instance"]:
+                rule.vrf, inside = inside[-1], inside[:-2]
+            if len(outside) != len(inside) or len(outside) != (2 if rule.protocol else 1):
+                return False
+            rule.translated, rule.local = (str(ipaddress.IPv4Address(a[0])) for a in (outside, inside))
+            if rule.protocol:
+                rule.translated_port, rule.local_port = int(outside[1]), int(inside[1])
+        else:
+            return False
+        iface.nat = "outside"
+        self.device.nat_rules.append(rule)
+        return True
+
     def bgp(self, node: Node) -> bool:
         """bgp AS, with groups, peers and address families inside."""
         if len(node.words) != 2 or self.device.bgp is not None:
@@ -699,6 +770,8 @@ class _Reader:
             iface.ospf_cost = int(w[2])
         elif w[:2] == ["ospf", "network-type"] and n == 3 and w[2] in ("p2p", "broadcast"):
             iface.ospf_network = "point-to-point" if w[2] == "p2p" else "broadcast"
+        elif w[0] == "nat" and n >= 2:
+            return self.nat_interface(iface, w)
         elif w[:2] == ["vrrp", "vrid"]:
             return self._vrrp(iface, w[2:])
         elif w[:3] == ["undo", "vrrp", "vrid"]:
@@ -723,6 +796,13 @@ class _Reader:
 
     def _finish(self) -> None:
         ospf_text.attach(self.device, self._ospf_areas, {})
+        for rule in self.device.nat_rules:
+            rule.pool = self._nat_groups.get(rule.pool, rule.pool)
+        for nat_pool in self.device.nat_pools.values():  # an address group has no mask; take it from the interface
+            for iface in self.device.interfaces.values():
+                for address in iface.ipv4:
+                    if ipaddress.IPv4Address(nat_pool.first) in ipaddress.ip_interface(address).network:
+                        nat_pool.prefix_len = ipaddress.ip_interface(address).network.prefixlen
         for pool in self.device.dhcp_pools:
             if pool.network:
                 pool.ranges = dhcp_text.subtract(pool.network, pool.ranges, self._dhcp_excluded.get(pool.vrf, []))

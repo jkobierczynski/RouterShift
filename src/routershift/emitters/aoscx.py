@@ -12,6 +12,7 @@ from typing import Callable, Dict, List, Tuple
 from .. import acl as acl_text
 from .. import bgp as bgp_text
 from .. import dhcp as dhcp_text
+from .. import nat as nat_text
 from .. import fhrp
 from .. import ospf as ospf_text
 from ..model import Device, Interface, Ospf, InterfaceKind, LacpMode, StaticRoute, StpMode, SwitchportMode
@@ -59,6 +60,7 @@ class Writer:
             self.interface(iface)
         self.routes()
         self.dhcp()
+        nat_text.skip_all(self.device, self.report, "AOS-CX")
         if self.device.bgp is not None:
             self.bgp()
         self.report.unparsed(self.device.unparsed)

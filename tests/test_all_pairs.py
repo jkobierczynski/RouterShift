@@ -2,10 +2,11 @@ import pytest
 from helpers import DATA
 
 from routershift import bgp as bgp_text
+from routershift import nat as nat_text
 from routershift import ospf as ospf_text
 from routershift.acl import safe_name
 from routershift.convert import PLATFORMS, convert, parse
-from routershift.model import AclAction
+from routershift.model import AclAction, Device
 
 SAMPLES = {"ios": "ios_access.cfg", "eos": "eos_leaf.cfg", "aoscx": "aoscx_access.cfg", "aoss": "aoss_edge.cfg",
            "comware": "comware_access.cfg"}
@@ -55,6 +56,18 @@ def test_converts_and_reads_back(source: str, target: str) -> None:
         (p.network, p.ranges, p.default_routers, p.dns_servers, p.domain_name, p.lease_seconds,
          p.vrf if target != "aoss" else "") for p in dev.dhcp_pools)
     assert pools(first) == pools(back)
+    # NAT rules keep their addresses, sources and pools; EOS has no static port forwarding and the AOS switches
+    # have no NAT, which the report says
+    def nat(dev: Device) -> list:
+        pool = lambda name: (dev.nat_pools[name].first, dev.nat_pools[name].last) if name else ()  # noqa: E731
+        return sorted((r.kind, r.local, r.translated, r.protocol, r.local_port, r.translated_port,
+                       safe_name(r.acl) if r.acl else "", pool(r.pool), r.overload) for r in dev.nat_rules
+                      if not (target == "eos" and r.protocol))
+    if target in nat_text.SUPPORTED:
+        assert nat(first) == nat(back)
+    else:
+        assert not back.nat_rules
+        assert not first.nat_rules or "do not do NAT" in report.to_text()
     # BGP keeps every neighbor with its settings (peer groups may be written out on their members), networks and
     # redistribution; AOS-S leaves it to a person
     if first.bgp is not None and target == "aoss":
