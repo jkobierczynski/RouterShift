@@ -18,6 +18,7 @@ from typing import Dict, List, Optional, Set, Tuple
 
 from .. import acl as acl_text
 from .. import fhrp
+from .. import ospf as ospf_text
 from ..model import Device, FhrpGroup, Interface, InterfaceKind, LacpMode, StaticRoute, StpMode, SwitchportMode, Vlan
 from ..names import PortMapper
 from ..parsers.ioslike import _vlan_ids
@@ -65,6 +66,8 @@ class Writer:
         self.tagged: Dict[int, List[str]] = {}
         self.no_untagged: List[str] = []
         self.svis: Dict[int, Interface] = {}
+        self.svi_source: Dict[int, str] = {}  # VLAN of a routed port -> the port
+        self.ospf_areas: Dict[str, str] = {}  # interface -> area, of the one process AOS-S runs
         self.voice: Set[int] = set()
         self.gateway_only: Optional[StaticRoute] = None  # the one default route, written as ip default-gateway
 
@@ -113,8 +116,10 @@ class Writer:
                 svi = Interface(f"Vlan{vid}", InterfaceKind.VLAN, ipv4=list(iface.ipv4), ipv6=list(iface.ipv6),
                                 dhcp_client=iface.dhcp_client, helper_addresses=list(iface.helper_addresses),
                                 vrf=iface.vrf, acl_in=iface.acl_in, acl_out=iface.acl_out,
-                                acl6_in=iface.acl6_in, acl6_out=iface.acl6_out, fhrp=list(iface.fhrp))
+                                acl6_in=iface.acl6_in, acl6_out=iface.acl6_out, fhrp=list(iface.fhrp),
+                                ospf_cost=iface.ospf_cost, ospf_network=iface.ospf_network)
                 self.svis[vid] = svi
+                self.svi_source[vid] = iface.name
                 self.untagged.setdefault(vid, []).append(name)
                 self.add(iface, Severity.APPROX, "routed-port",
                          f"AOS-S has no routed ports: the port is untagged in VLAN {vid} of its own, which carries "
@@ -194,7 +199,7 @@ class Writer:
         routes = [r for r in self.device.static_routes if r.vrf not in self.mgmt_vrfs]
         l3_vlans = [v for v in self.svis.values() if v.ipv4 or v.dhcp_client]
         default = [r for r in routes if r.prefix == "0.0.0.0/0" and r.next_hop]
-        vrrp = any(self.groups.values())
+        vrrp = any(self.groups.values()) or bool(self.device.ospf)
         if len(routes) == 1 and default and len(l3_vlans) <= 1 and not vrrp:
             self.out.append(f"ip default-gateway {default[0].next_hop}")  # a layer 2 switch
             self.report.item("route", "0.0.0.0/0")
@@ -202,8 +207,9 @@ class Writer:
             return
         if routes or len(l3_vlans) > 1 or vrrp:
             self.out.append("ip routing")
-        if vrrp:
+        if any(self.groups.values()):
             self.out += ["router vrrp", f"{_IND}ipv4 enable", f"{_IND}exit"]
+        self.ospf()
 
     def trunks(self) -> None:
         lags: Dict[str, List[Interface]] = {}
@@ -363,8 +369,75 @@ class Writer:
             lines.append(f"ip helper-address {helper}")
         lines += self._acl_bindings(svi)
         vid = int(svi.name[len("Vlan"):])
+        lines += self._svi_ospf(vid, svi)
         for g in self.groups.get(vid, []):
             lines += self._vrrp(svi, g, fhrp.adder(self.report, f"vlan {vid}", g))
+        return lines
+
+    def ospf(self) -> None:
+        if not self.device.ospf:
+            return
+        p, *others = self.device.ospf
+        label = ospf_text.label(p)
+        rep = self.report
+        rep.item("ospf", label)
+
+        def add(severity: Severity, code: str, message: str) -> None:
+            rep.add("ospf", label, severity, code, message)
+
+        for other in others:
+            rep.skip("ospf", ospf_text.label(other), "ospf-process", "AOS-S runs one OSPF process; add it by hand")
+        if p.vrf and p.vrf not in self.mgmt_vrfs:
+            add(Severity.APPROX, "vrf", f"VRF {p.vrf} does not exist on AOS-S; OSPF runs in the one routing table")
+        self.ospf_areas = ospf_text.interfaces(self.device, p)
+        if p.networks:
+            add(Severity.APPROX, "ospf-network", "network statements written as areas on the VLANs they match; a VLAN "
+                "added later needs its own 'ip ospf area'")
+        for name, dotted in self.ospf_areas.items():
+            iface = self.device.interfaces.get(name)
+            if iface is not None and iface.kind == InterfaceKind.LOOPBACK:
+                add(Severity.REVIEW, "ospf-loopback",
+                    f"{name} is in area {dotted} on the source; check that AOS-S advertises the loopback address")
+        if p.router_id:
+            self.out.append(f"ip router-id {p.router_id}")
+        lines: List[str] = []
+        for dotted in sorted(set(self.ospf_areas.values()) | set(p.area_types), key=ospf_text.area_number):
+            kind = p.area_types.get(dotted, "")
+            word = "backbone" if dotted == "0.0.0.0" else dotted
+            if kind.startswith("stub"):
+                lines.append(f"area {word} stub 1" + (" no-summary" if kind.endswith("no-summary") else ""))
+            else:
+                lines.append(f"area {word}")
+                if kind:
+                    add(Severity.REVIEW, "ospf-area", f"area {dotted} is {kind} on the source; set its type by hand")
+        for source in p.redistribute:
+            if source in ("connected", "static"):
+                lines.append(f"redistribute {source}")
+            else:
+                add(Severity.REVIEW, "ospf-redistribute", f"redistribution of {source} left out")
+        if p.default_originate:
+            add(Severity.REVIEW, "ospf-default", "the default route the source originates is left out; add it by hand")
+        if p.reference_bandwidth is not None:
+            add(Severity.APPROX, "ospf-bandwidth",
+                f"reference bandwidth {p.reference_bandwidth} Mbit/s left out; set costs on the VLANs if they matter")
+        lines += ["enable", "exit"]
+        self.out.append("router ospf")
+        self.out += [_IND + line for line in lines]
+
+    def _svi_ospf(self, vid: int, svi: Interface) -> List[str]:
+        name = self.svi_source.get(vid, svi.name)
+        lines = []
+        if name in self.ospf_areas:
+            dotted = self.ospf_areas[name]
+            lines.append(f"ip ospf area {'backbone' if dotted == '0.0.0.0' else dotted}")
+            if self.device.ospf[0].passive(name):
+                lines.append("ip ospf passive")
+        if svi.ospf_cost is not None:
+            lines.append(f"ip ospf cost {svi.ospf_cost}")
+        if svi.ospf_network:
+            self.report.add("ospf", ospf_text.label(self.device.ospf[0]) if self.device.ospf else "ospf",
+                            Severity.REVIEW, "ospf-network-type",
+                            f"network type {svi.ospf_network} of VLAN {vid} left out")
         return lines
 
     def _vrrp(self, svi: Interface, g: FhrpGroup, add: fhrp.Add) -> List[str]:

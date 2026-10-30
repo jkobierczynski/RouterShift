@@ -11,7 +11,8 @@ from typing import Callable, Dict, List
 
 from .. import acl as acl_text
 from .. import fhrp
-from ..model import (AclAction, Device, FhrpGroup, Interface, InterfaceKind, LacpMode, StaticRoute, StpMode,
+from .. import ospf as ospf_text
+from ..model import (AclAction, Device, FhrpGroup, Interface, InterfaceKind, LacpMode, Ospf, StaticRoute, StpMode,
                      SwitchportMode)
 from ..names import PortMapper
 from ..report import Report, Severity
@@ -172,6 +173,7 @@ class Writer:
         lines += self._addresses(iface)
         lines += self._acl_bindings(iface, add)
         lines += self._fhrp(iface, name)
+        lines += self._ospf_interface(iface)
         if iface.mtu is not None:
             mtu = iface.mtu
             if self.ios and mtu > _IOS_MAX_MTU:
@@ -418,6 +420,57 @@ class Writer:
             self.out.append("ipv6 unicast-routing")
         for route in self.device.static_routes:
             self.out.append(self._route(route))
+        self.out.append("!")
+        for p in self.device.ospf:
+            self.ospf(p)
+
+    def _area(self, dotted: str) -> str:
+        return ospf_text.area_number(dotted) if self.ios else dotted
+
+    def _ospf_interface(self, iface: Interface) -> List[str]:
+        lines = []
+        for p in self.device.ospf:
+            if iface.name in p.interface_areas:
+                area = self._area(p.interface_areas[iface.name])
+                lines.append(f"ip ospf {p.process} area {area}" if self.ios else f"ip ospf area {area}")
+        if iface.ospf_cost is not None:
+            lines.append(f"ip ospf cost {iface.ospf_cost}")
+        if iface.ospf_network:
+            lines.append(f"ip ospf network {iface.ospf_network}")
+        return lines
+
+    def ospf(self, p: Ospf) -> None:
+        label = ospf_text.label(p)
+        self.report.item("ospf", label)
+        header = f"router ospf {p.process}" + (f" vrf {self.vrf(p.vrf)}" if p.vrf else "")
+        lines: List[str] = []
+        if p.router_id:
+            lines.append(f"router-id {p.router_id}")
+        if p.reference_bandwidth is not None:
+            lines.append(f"auto-cost reference-bandwidth {p.reference_bandwidth}")
+        if p.passive_default:
+            lines.append("passive-interface default")
+            lines += [f"no passive-interface {self.port(n)}" for n in p.active_interfaces]
+        else:
+            lines += [f"passive-interface {self.port(n)}" for n in p.passive_interfaces]
+        for network in p.networks:
+            net = ipaddress.ip_network(network.prefix)
+            where = f"{net.network_address} {net.hostmask}" if self.ios else str(net)
+            lines.append(f"network {where} area {self._area(network.area)}")
+        for area, kind in p.area_types.items():
+            lines.append(f"area {self._area(area)} {kind}")
+        for source in p.redistribute:
+            if source == "bgp":
+                if self.device.bgp is None:
+                    self.report.add("ospf", label, Severity.REVIEW, "ospf-redistribute",
+                                    "redistribution of BGP left out: there is no BGP process")
+                    continue
+                source = f"bgp {self.device.bgp.local_as}" if self.ios else "bgp"
+            lines.append(f"redistribute {source}" + (" subnets" if self.ios else ""))
+        if p.default_originate:
+            lines.append("default-information originate" + (" always" if p.default_originate == "always" else ""))
+        self.out.append(header)
+        self.out += [self.ind + line for line in lines]
         self.out.append("!")
 
     def _route(self, route: StaticRoute) -> str:

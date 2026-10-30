@@ -19,7 +19,7 @@ HPE Comware 7 convert in every direction for the system settings (hostname, doma
 interfaces (switchport access and trunk, voice VLAN, LAGs and LACP, SVIs,
 loopbacks, the management port, subinterfaces), IPv4 and IPv6 addressing, DHCP
 relay, VRFs, static routes, IPv4/IPv6 access lists with their interface
-bindings, and gateway redundancy (HSRP, VRRP, anycast gateways). Everything else (BGP, OSPF, SNMP, AAA, ...)
+bindings, gateway redundancy (HSRP, VRRP, anycast gateways) and OSPF. Everything else (BGP, SNMP, AAA, ...)
 is listed in the report under "Not understood", line by line, with secrets
 masked.
 

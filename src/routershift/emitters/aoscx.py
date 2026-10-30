@@ -7,11 +7,12 @@
 from __future__ import annotations
 
 import ipaddress
-from typing import Callable, Dict, List
+from typing import Callable, Dict, List, Tuple
 
 from .. import acl as acl_text
 from .. import fhrp
-from ..model import Device, Interface, InterfaceKind, LacpMode, StaticRoute, StpMode, SwitchportMode
+from .. import ospf as ospf_text
+from ..model import Device, Interface, Ospf, InterfaceKind, LacpMode, StaticRoute, StpMode, SwitchportMode
 from ..names import PortMapper
 from ..report import Report, Severity
 
@@ -47,6 +48,9 @@ class Writer:
                        for i in self.device.interfaces.values() if i.fhrp}
         if any(g.protocol == "vrrp" for gs in self.groups.values() for g in gs):
             self.out.append("router vrrp enable")
+        self.ospf_areas: Dict[str, List[Tuple[str, str]]] = {}  # interface -> [(process, area)]
+        for p in self.device.ospf:
+            self.ospf(p)
         # a LAG exists before the ports that join it
         order = {InterfaceKind.MANAGEMENT: 0, InterfaceKind.LAG: 1}
         for iface in sorted(self.device.interfaces.values(), key=lambda i: order.get(i.kind, 2)):
@@ -201,6 +205,7 @@ class Writer:
             elif acl_name:
                 add(Severity.REVIEW, "acl-missing", f"ACL {acl_name} is applied but not defined; left out")
         lines += self._fhrp(iface, name)
+        lines += self._ospf_interface(iface)
         if iface.stp_portfast:
             lines.append("spanning-tree port-type admin-edge")
         if iface.stp_bpduguard:
@@ -236,6 +241,46 @@ class Writer:
                 add(Severity.APPROX, "fhrp-name", f"description '{g.name}' left out: AOS-CX has none for a group")
             body.append("shutdown" if g.shutdown else "no shutdown")
             lines += [_IND + line for line in body]
+        return lines
+
+    def ospf(self, p: Ospf) -> None:
+        label = ospf_text.label(p)
+        self.report.item("ospf", label)
+        areas = ospf_text.interfaces(self.device, p)
+        if p.networks:
+            self.report.add("ospf", label, Severity.APPROX, "ospf-network",
+                            "network statements written as areas on the interfaces they match; an interface added "
+                            "later needs its own 'ip ospf area'")
+        for name, dotted in areas.items():
+            self.ospf_areas.setdefault(name, []).append((p.process, dotted))
+        self.out.append(f"router ospf {p.process}" + (f" vrf {self.vrf(p.vrf)}" if p.vrf else ""))
+        lines: List[str] = []
+        if p.router_id:
+            lines.append(f"router-id {p.router_id}")
+        if p.reference_bandwidth is not None:
+            lines.append(f"reference-bandwidth {p.reference_bandwidth}")
+        if p.passive_default:
+            lines.append("passive-interface default")
+        for source in p.redistribute:
+            lines.append(f"redistribute {source}")
+        if p.default_originate:
+            lines.append("default-information originate" + (" always" if p.default_originate == "always" else ""))
+        for dotted in sorted(set(areas.values()) | set(p.area_types), key=ospf_text.area_number):
+            kind = p.area_types.get(dotted)
+            lines.append(f"area {dotted}" + (f" {kind}" if kind else ""))
+        self.out += [_IND + line for line in lines]
+
+    def _ospf_interface(self, iface: Interface) -> List[str]:
+        lines = [f"ip ospf {number} area {dotted}" for number, dotted in self.ospf_areas.get(iface.name, [])]
+        for p in self.device.ospf:
+            if iface.name in p.passive_interfaces and not p.passive_default:
+                lines.append("ip ospf passive")
+            elif iface.name in p.active_interfaces and p.passive_default:
+                lines.append("no ip ospf passive")
+        if iface.ospf_cost is not None:
+            lines.append(f"ip ospf cost {iface.ospf_cost}")
+        if iface.ospf_network:
+            lines.append(f"ip ospf network {iface.ospf_network}")
         return lines
 
     def _layer2(self, iface: Interface, add: _Add) -> List[str]:

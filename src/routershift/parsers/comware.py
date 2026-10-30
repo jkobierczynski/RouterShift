@@ -23,9 +23,10 @@ from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from .. import acl as acl_text
 from .. import confparse
+from .. import ospf as ospf_text
 from ..confparse import Node
 from ..errors import ParseError
-from ..model import (Acl, AclAction, AclEntry, Device, FhrpGroup, Interface, InterfaceKind, LacpMode, Origin, StaticRoute, StpMode, SwitchportMode,
+from ..model import (Acl, AclAction, AclEntry, Device, FhrpGroup, Interface, Ospf, OspfNetwork, InterfaceKind, LacpMode, Origin, StaticRoute, StpMode, SwitchportMode,
                      Unparsed, Vlan)
 from .ioslike import _cidr, _is_address
 
@@ -114,6 +115,7 @@ class _Reader:
         self._dynamic_lags: Set[str] = set()
         self._bpdu_protection = False
         self._vrrp_version = 3  # the Comware 7 default
+        self._ospf_areas: List[Tuple[str, str, str]] = []
 
     def unparsed(self, node: Node, section: str = "") -> None:
         self.device.unparsed.append(Unparsed(node.line, node.text, section))
@@ -142,6 +144,7 @@ class _Reader:
             "interface": self.interface,
             "acl": self.acl,
             "vrrp": self.vrrp_version,
+            "ospf": self.ospf,
         }
         for node in roots:
             if node.text.startswith(_NOISE):
@@ -384,6 +387,59 @@ class _Reader:
 
     # interfaces ------------------------------------------------------------------------------------------------------
 
+    def ospf(self, node: Node) -> bool:
+        """ospf N [router-id A] [vpn-instance V], areas inside with their network statements."""
+        w = node.words[1:]
+        number, router_id, vrf = "1", "", ""
+        if w and w[0].isdigit():
+            number, w = w[0], w[1:]
+        while w:
+            if w[0] == "router-id" and len(w) >= 2:
+                router_id, w = str(ipaddress.IPv4Address(w[1])), w[2:]
+            elif w[0] == "vpn-instance" and len(w) >= 2:
+                vrf, w = w[1], w[2:]
+            else:
+                return False
+        p = ospf_text.process(self.device, number, vrf)
+        p.vrf, p.router_id, p.origin = vrf, router_id, Origin(node.line, node.text)
+        for child in node.children:
+            try:
+                understood = self.ospf_line(p, child)
+            except (ValueError, IndexError):
+                understood = False
+            if not understood:
+                self.unparsed(child, node.text)
+        return True
+
+    def ospf_line(self, p: Ospf, node: Node) -> bool:
+        w = node.words
+        n = len(w)
+        if w[0] == "area" and n == 2:
+            dotted = ospf_text.area(w[1])
+            for child in node.children:
+                c = child.words
+                if c[0] == "network" and len(c) == 3:
+                    p.networks.append(OspfNetwork(acl_text.wildcard_prefix(c[1], c[2]), dotted))
+                elif c[0] in ("stub", "nssa") and c[1:] in ([], ["no-summary"]):
+                    p.area_types[dotted] = " ".join(c)
+                else:
+                    self.unparsed(child, node.text)
+        elif w == ["silent-interface", "all"]:
+            p.passive_default = True
+        elif w[0] == "silent-interface" and n == 2:
+            p.passive_interfaces.append(canonical(w[1])[0])
+        elif w[:2] == ["undo", "silent-interface"] and n == 3:
+            p.active_interfaces.append(canonical(w[2])[0])
+        elif w[0] == "import-route" and n == 2 and w[1] in ("direct", "static", "bgp"):
+            p.redistribute.append("connected" if w[1] == "direct" else w[1])
+        elif w[0] == "default-route-advertise" and w[1:] in ([], ["always"]):
+            p.default_originate = "always" if n == 2 else "on"
+        elif w[0] == "bandwidth-reference" and n == 2:
+            p.reference_bandwidth = int(w[1])
+        else:
+            return False
+        return True
+
     def vrrp_version(self, node: Node) -> bool:
         if node.words[1:2] == ["version"] and node.words[2:] in (["2"], ["3"]):
             self._vrrp_version = int(node.words[2])
@@ -512,6 +568,12 @@ class _Reader:
             if len(args) != 1:
                 return False
             setattr(iface, f"acl{'6' if v6 else ''}_{'in' if w[-1] == 'inbound' else 'out'}", args[0])
+        elif w[0] == "ospf" and n == 4 and w[1].isdigit() and w[2] == "area":
+            self._ospf_areas.append((iface.name, w[1], ospf_text.area(w[3])))
+        elif w[:2] == ["ospf", "cost"] and n == 3:
+            iface.ospf_cost = int(w[2])
+        elif w[:2] == ["ospf", "network-type"] and n == 3 and w[2] in ("p2p", "broadcast"):
+            iface.ospf_network = "point-to-point" if w[2] == "p2p" else "broadcast"
         elif w[:2] == ["vrrp", "vrid"]:
             return self._vrrp(iface, w[2:])
         elif w[:3] == ["undo", "vrrp", "vrid"]:
@@ -535,6 +597,7 @@ class _Reader:
         return True
 
     def _finish(self) -> None:
+        ospf_text.attach(self.device, self._ospf_areas, {})
         for iface in self.device.interfaces.values():
             for group in iface.fhrp:
                 group.version = self._vrrp_version

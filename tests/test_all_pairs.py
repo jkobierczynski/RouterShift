@@ -1,6 +1,7 @@
 import pytest
 from helpers import DATA
 
+from routershift import ospf as ospf_text
 from routershift.acl import safe_name
 from routershift.convert import PLATFORMS, convert, parse
 from routershift.model import AclAction
@@ -40,4 +41,12 @@ def test_converts_and_reads_back(source: str, target: str) -> None:
                                  for a in [g.address] + g.secondary)
     assert virtual(first) == virtual(back)
     assert all(g.address for i in back.interfaces.values() for g in i.fhrp)
+    # OSPF runs on the same number of interfaces, in the same areas, as passive or not, with the same router ID
+    for p in first.ospf:
+        other = next(o for o in back.ospf if o.router_id == p.router_id)
+        areas = lambda dev, q: sorted((a, q.passive(i)) for i, a in ospf_text.interfaces(dev, q).items())  # noqa: E731
+        assert areas(first, p) == areas(back, other)
+        assert other.redistribute == p.redistribute and other.area_types == p.area_types
+    costs = lambda dev: sorted(i.ospf_cost for i in dev.interfaces.values() if i.ospf_cost)  # noqa: E731
+    assert costs(first) == costs(back)
     assert report.counts()
