@@ -7,6 +7,7 @@ from routershift import bgp as bgp_text
 from routershift import nat as nat_text
 from routershift import aaa as aaa_text
 from routershift import snmp as snmp_text
+from routershift import qos as qos_text
 from routershift import stp as stp_text
 from routershift import vpn as vpn_text
 from routershift import ospf as ospf_text
@@ -157,6 +158,27 @@ def test_converts_and_reads_back(source: str, target: str) -> None:
         and not (target == "aoss" and i.stp_guard == "loop" and not (i.stp_bpdufilter or i.stp_cost or
                                                                      i.stp_port_priority)))
     assert stp_ports(first) == stp_ports(back)
+    # QoS keeps every applied policy with its classes (DSCP values, or an ACL with as many rules), markings and
+    # police rates, and the trust of every port (AOS-CX has no default class; EOS takes no output policy)
+    def qos(dev: Device) -> list:
+        def matches(name: str) -> tuple:
+            c = dev.qos_classes.get(name)
+            if c is None:
+                return ()
+            acl = dev.acls.get(c.acl) if c.acl else None
+            return (sorted(c.dscp), len([e for e in acl.entries if e.action != AclAction.REMARK]) if acl else 0)
+
+        return sorted((d, [(matches(a.qos_class), a.set_dscp, a.police_kbps)
+                                   for a in dev.qos_policies[getattr(i, d)].actions
+                                   if not (target == "aoscx" and a.qos_class == qos_text.DEFAULT_CLASS)])
+                      for i in dev.interfaces.values() for d in ("qos_policy_in", "qos_policy_out")
+                      if getattr(i, d) and not (target == "eos" and d == "qos_policy_out"))
+
+    assert qos(first) == qos(back)
+    # (IOS writes nothing for DSCP trust, which a Catalyst 9000 does by default)
+    trust = lambda dev: sorted(i.qos_trust for i in dev.interfaces.values()  # noqa: E731
+                               if i.qos_trust and not (target == "ios" and i.qos_trust == "dscp"))
+    assert trust(first) == trust(back)
     # BGP keeps every neighbor with its settings (peer groups may be written out on their members), networks and
     # redistribution; AOS-S leaves it to a person
     if first.bgp is not None and target == "aoss":

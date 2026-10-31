@@ -45,8 +45,9 @@ platform converts to and from all the others.
 | AAA: RADIUS and TACACS+ servers, server groups, login/enable/exec/command method lists, source interfaces | `Aaa`, `AaaServer`, `AaaGroup`, `AaaMethod` | 3 (done) |
 | 802.1X and MAC authentication on ports: host mode, reauthentication, the RADIUS servers used | `Aaa.dot1x`, `Interface.dot1x`, `Interface.mab` ... | 3 (done) |
 | TFTP and FTP client source interface | `System.transfer_source` | 3 (done) |
+| QoS: classes (DSCP or ACL), policies with DSCP marking and policing, policies on ports, port trust | `QosClass`, `QosPolicy`, `QosAction`, `Interface.qos_*` | 3 (done) |
 | LDAP and Kerberos servers (listed under "Not understood") | to come | 3+ |
-| Route maps, prefix lists, QoS, MLAG/VSX/vPC, VXLAN/EVPN | to come | 3+ |
+| Route maps, prefix lists, MLAG/VSX/vPC, VXLAN/EVPN | to come | 3+ |
 
 ### AOS-S specifics
 
@@ -186,6 +187,24 @@ platform converts to and from all the others.
   `loop-protect` as the alternative).
 * Per-instance and per-VLAN port costs and priorities, and timers (hello, forward delay, max age), are listed under
   "Not understood" for now.
+
+## QoS
+
+* A class matches DSCP values or an ACL, all or any; a policy gives each class a DSCP marking and a police rate
+  (conform transmits, exceed drops). Policies keep their direction on ports and VLAN interfaces, and ports keep their
+  trust (DSCP, CoS/802.1p, none).
+* IOS: `class-map match-all|match-any`, `policy-map` with `set dscp` and `police cir` (in bps), `service-policy
+  input|output`, `mls qos trust`. EOS: `class-map type qos`, `policy-map type quality-of-service`, `police rate ...
+  kbps`, `qos trust`. AOS-CX: `class ip` and `policy` entries with `action dscp` and `action cir kbps`, `apply policy`.
+  AOS-S: `class ipv4` and `policy qos` with `action rate-limit kbps`, `service-policy`. Comware: `traffic classifier`,
+  `traffic behavior` (`remark dscp`, `car cir`) and `qos policy`, `qos apply policy`; the writer adds one behavior
+  per class, named after the policy and class.
+* AOS-CX and AOS-S classes hold their own match entries: an ACL class is written entry by entry (deny becomes
+  `ignore`), and the reader turns them back into an ACL, reusing an existing ACL with the same entries.
+* Police bursts are not converted; where a burst is needed it is written as 1/8 s of the rate (reported).
+* Limits are reported: AOS-CX has no default class in a policy, EOS applies QoS policies inbound only, EOS classes are
+  match-any, and IOS on a Catalyst 9000 trusts DSCP by default (other trust settings are reported, not written).
+* Queuing, shaping, priority queues, CoS marking and DSCP maps are listed under "Not understood" for now.
 
 ## Users and AAA
 

@@ -47,7 +47,7 @@ def test_numbering_keeps_or_renumbers() -> None:
 
 def test_parse_acls_and_bindings_everywhere() -> None:
     ios = parse(sample("ios_access.cfg"), "ios")
-    assert set(ios.acls) == {"USERS-IN", "MGMT-ONLY", "101", "V6-IN"}
+    assert set(ios.acls) == {"USERS-IN", "MGMT-ONLY", "101", "V6-IN", "VIDEO"}
     assert ios.acls["USERS-IN"].entries[0].action == AclAction.REMARK
     assert ios.acls["USERS-IN"].entries[5].unsupported.startswith("50 permit tcp object-group")
     assert ios.acls["V6-IN"].family == 6 and ios.acls["V6-IN"].entries[0].sequence == 10

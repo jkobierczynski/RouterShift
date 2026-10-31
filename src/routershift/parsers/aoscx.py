@@ -27,11 +27,12 @@ from .. import dhcp as dhcp_text
 from .. import fhrp
 from .. import ospf as ospf_text
 from .. import aaa as aaa_text
+from .. import qos as qos_text
 from .. import confparse
 from ..confparse import Node
 from ..errors import ParseError
-from ..model import (AaaGroup, AaaMethod, AaaServer, Acl, Device, LocalUser, DhcpPool, FhrpGroup, NtpKey, SnmpCommunity, SnmpHost, SnmpUser, Interface, InterfaceKind, LacpMode, Origin, Ospf, StaticRoute,
-                     StpMode, SwitchportMode, Unparsed, Vlan)
+from ..model import (AaaGroup, AaaMethod, AaaServer, Acl, Device, LocalUser, DhcpPool, FhrpGroup, NtpKey, SnmpCommunity, SnmpHost, SnmpUser, Interface, InterfaceKind, LacpMode, Origin, Ospf, QosAction, QosClass,
+                     QosPolicy, StaticRoute, StpMode, SwitchportMode, Unparsed, Vlan)
 from .ioslike import _is_address, _vlan_ids
 
 MGMT_VRF = "mgmt"
@@ -69,6 +70,7 @@ class _Reader:
         self._ospf_areas: List[Tuple[str, str, str]] = []
         self._ospf_passive: Dict[str, bool] = {}
         self._voice_vlans: List[int] = []
+        self._class_acls: List[Tuple[QosClass, Acl]] = []
         self._client_limit: Dict[str, int] = {}  # port access, per port
         self._auth_mode: Dict[str, str] = {}
 
@@ -106,6 +108,8 @@ class _Reader:
             "radius-server": self.aaa_host,
             "tacacs-server": self.aaa_host,
             "aaa": self.aaa,
+            "class": self.qos_class,
+            "policy": self.qos_policy,
         }
         for node in roots:
             if node.text.startswith(_NOISE):
@@ -471,6 +475,48 @@ class _Reader:
         acl_text.read_block(acl, node.children, wildcards=False)
         return True
 
+    # QoS -------------------------------------------------------------------------------------------------------------
+
+    def qos_class(self, node: Node) -> bool:
+        """class ip NAME, entries '10 match any any any dscp 46' or ACL-like '20 match udp any any range 5000 5100'"""
+        w = node.words
+        if len(w) != 3 or w[1] != "ip":
+            return False
+        qos_class = QosClass(w[2], origin=Origin(node.line, node.text))
+        self.device.qos_classes[qos_class.name] = qos_class
+        for child in qos_text.read_class(qos_class, node.children, "dscp", False, self._class_acls):
+            self.unparsed(child, node.text)
+        return True
+
+    def qos_policy(self, node: Node) -> bool:
+        """policy NAME, entries '10 class ip C action dscp 46 action cir kbps 2000 cbs 250000 exceed drop'"""
+        w = node.words
+        if len(w) != 2:
+            return False
+        policy = QosPolicy(w[1], origin=Origin(node.line, node.text))
+        self.device.qos_policies[policy.name] = policy
+        for child in node.children:
+            c = child.words
+            action = QosAction(c[3]) if len(c) >= 4 and c[0].isdigit() and c[1:3] == ["class", "ip"] else None
+            args = c[4:]
+            while action is not None and args:
+                if args[:2] == ["action", "dscp"] and len(args) >= 3:
+                    action.set_dscp, args = qos_text.dscp(args[2]), args[3:]
+                elif args[:3] == ["action", "cir", "kbps"] and len(args) >= 4:
+                    action.police_kbps, args = int(args[3]), args[4:]
+                    if args[:1] == ["cbs"]:
+                        args = args[2:]
+                    if args[:2] != ["exceed", "drop"]:
+                        action = None
+                    args = args[2:]
+                else:
+                    action = None
+            if action is None:
+                self.unparsed(child, node.text)
+            else:
+                policy.actions.append(action)
+        return True
+
     # interfaces ------------------------------------------------------------------------------------------------------
 
     def dhcp_server(self, node: Node) -> bool:
@@ -777,6 +823,10 @@ class _Reader:
         elif w[:2] == ["apply", "access-list"] and n == 5 and w[2] in ("ip", "ipv6") and w[4] in (
                 "in", "out", "routed-in", "routed-out"):
             setattr(iface, f"acl{'6' if w[2] == 'ipv6' else ''}_{w[4].replace('routed-', '')}", w[3])
+        elif w[:2] == ["apply", "policy"] and n == 4 and w[3] in ("in", "out", "routed-in", "routed-out"):
+            setattr(iface, f"qos_policy_{w[3].replace('routed-', '')}", w[2])
+        elif w[:2] == ["qos", "trust"] and n == 3 and w[2] in ("dscp", "cos", "none"):
+            iface.qos_trust = w[2]
         elif w[:2] == ["ip", "helper-address"] and n >= 3:
             iface.helper_addresses.append(w[2])
             if n == 5 and w[3] == "vrf":
@@ -827,6 +877,7 @@ class _Reader:
         return True
 
     def _finish(self) -> None:
+        qos_text.adopt(self.device, self._class_acls)
         for iface in self.device.interfaces.values():
             self._voice_port(iface)
             if iface.dot1x or iface.mab:

@@ -18,6 +18,7 @@ from .. import fhrp
 from .. import ospf as ospf_text
 from .. import snmp as snmp_text
 from .. import stp as stp_text
+from .. import qos as qos_text
 from .. import aaa as aaa_text
 from ..parsers.aoscx import AOSCX_ROLES
 from ..model import Device, Interface, Ospf, InterfaceKind, LacpMode, StaticRoute, StpMode, SwitchportMode
@@ -51,6 +52,7 @@ class Writer:
         self.vrfs()
         self.spanning_tree()
         self.acls()
+        self.qos()
         self.vlans()
         self.groups = {i.name: fhrp.plan(i, "aoscx", self.report, self.port(i.name))
                        for i in self.device.interfaces.values() if i.fhrp}
@@ -378,6 +380,60 @@ class Writer:
                                          established=False)
             self.out += [_IND + line for line in lines]
 
+    def qos(self) -> None:
+        """Classes hold their own entries (match/ignore): DSCP values, and the entries of the ACL a class used."""
+        rep = self.report
+        for c in self.device.qos_classes.values():
+            label = f"class {c.name}"
+            rep.item("qos", label)
+            lines: List[str] = []
+            acl = self.device.acls.get(c.acl) if c.acl else None
+            if acl is not None:
+                lines = qos_text.class_lines(acl, rep, label, style="mask", any_protocol="any", icmp6="icmpv6",
+                                             icmp_names=True, icmp_keyword="icmp-type", remark="comment",
+                                             established=False)
+            elif c.acl:
+                rep.add("qos", label, Severity.REVIEW, "acl-missing", f"ACL {c.acl} is not defined; left out")
+            last = max([int(line.split()[0]) for line in lines], default=0)
+            lines += [f"{last + 10 * (n + 1)} match any any any dscp {d}" for n, d in enumerate(c.dscp)]
+            if c.match_all and c.dscp and acl is not None:
+                rep.add("qos", label, Severity.APPROX, "qos-match",
+                        "AOS-CX class entries are alternatives: DSCP and ACL now match either, not both")
+            self.out.append(f"class ip {c.name}")
+            self.out += [_IND + line for line in lines]
+        for p in self.device.qos_policies.values():
+            rep.item("qos", f"policy {p.name}")
+            self.out.append(f"policy {p.name}")
+            seq = 10
+            for a in p.actions:
+                label = qos_text.action_label(p, a)
+                if a.qos_class == qos_text.DEFAULT_CLASS or a.qos_class not in self.device.qos_classes:
+                    why = ("AOS-CX has no default class in a policy" if a.qos_class == qos_text.DEFAULT_CLASS
+                           else f"class {a.qos_class} is not defined")
+                    rep.skip("qos", label, "qos-class", f"{why}; left out")
+                    continue
+                words = [f"{seq} class ip {a.qos_class}"]
+                words += [f"action dscp {a.set_dscp}"] if a.set_dscp is not None else []
+                if a.police_kbps is not None:
+                    words.append(f"action cir kbps {a.police_kbps} cbs {max(1500, a.police_kbps * 125 // 8)} "
+                                 "exceed drop")
+                    rep.add("qos", label, Severity.APPROX, "qos-burst",
+                            "the burst is not converted: written as 1/8 s of the rate")
+                self.out.append(_IND + " ".join(words))
+                seq += 10
+
+    def _qos_interface(self, iface: Interface, add: Callable[[Severity, str, str], None]) -> List[str]:
+        lines = []
+        for direction, name in (("in", iface.qos_policy_in), ("out", iface.qos_policy_out)):
+            if name and name in self.device.qos_policies:
+                routed = "routed-" if iface.kind == InterfaceKind.VLAN else ""
+                lines.append(f"apply policy {name} {routed}{direction}")
+            elif name:
+                add(Severity.REVIEW, "qos-policy", f"policy {name} is applied but not defined; left out")
+        if iface.qos_trust:
+            lines.append(f"qos trust {iface.qos_trust}")
+        return lines
+
     def vlans(self) -> None:
         voice = {i.voice_vlan for i in self.device.interfaces.values() if i.voice_vlan is not None}
         for vlan in sorted(self.device.vlans.values(), key=lambda v: v.vlan_id):
@@ -440,6 +496,7 @@ class Writer:
         lines += self._fhrp(iface, name)
         lines += self._ospf_interface(iface)
         lines += self._port_access_interface(iface, add)
+        lines += self._qos_interface(iface, add)
         if iface.stp_portfast:
             lines.append("spanning-tree port-type admin-edge")
         if iface.stp_bpduguard:

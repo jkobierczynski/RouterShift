@@ -18,6 +18,7 @@ from .. import vpn as vpn_text
 from .. import ospf as ospf_text
 from .. import snmp as snmp_text
 from .. import stp as stp_text
+from .. import qos as qos_text
 from ..model import (AaaMethod, AaaServer, AclAction, AclEntry, BgpNeighbor, Device, FhrpGroup, IpsecPeer, SnmpGroup, Interface, InterfaceKind, LacpMode, NatRule,
                      Ospf, StaticRoute, StpMode, SwitchportMode)
 from ..names import PortMapper
@@ -59,6 +60,7 @@ class Writer:
         self.vlans()
         self.spanning_tree()
         self.acls()
+        self.qos()
         for p in self.device.ospf:
             self.ospf(p)
         self.dhcp()
@@ -472,6 +474,40 @@ class Writer:
 
     # access lists ----------------------------------------------------------------------------------------------------
 
+    def qos(self) -> None:
+        """Traffic classifiers, one traffic behavior per policy action, and QoS policies pairing them."""
+        rep = self.report
+        for c in self.device.qos_classes.values():
+            label = f"class {c.name}"
+            rep.item("qos", label)
+            self.out.append(f"traffic classifier {c.name} operator {'and' if c.match_all else 'or'}")
+            for n in range(0, len(c.dscp), 8):  # eight values per line
+                self.out.append(f"{_IND}if-match dscp {' '.join(qos_text.dscp_name(d) for d in c.dscp[n:n + 8])}")
+            if c.acl and c.acl in self.device.acls:
+                self.out.append(f"{_IND}if-match acl name {acl_text.safe_name(c.acl)}")
+            elif c.acl:
+                rep.add("qos", label, Severity.REVIEW, "acl-missing", f"ACL {c.acl} is not defined; left out")
+            self.block_end()
+        for p in self.device.qos_policies.values():
+            rep.item("qos", f"policy {p.name}")
+            pairs = []
+            for a in p.actions:
+                label = qos_text.action_label(p, a)
+                if a.qos_class != qos_text.DEFAULT_CLASS and a.qos_class not in self.device.qos_classes:
+                    rep.skip("qos", label, "qos-class", f"class {a.qos_class} is not defined; left out")
+                    continue
+                behavior = f"{p.name}-{a.qos_class}"
+                self.out.append(f"traffic behavior {behavior}")
+                if a.set_dscp is not None:
+                    self.out.append(f"{_IND}remark dscp {qos_text.dscp_name(a.set_dscp)}")
+                if a.police_kbps is not None:
+                    self.out.append(f"{_IND}car cir {a.police_kbps} red discard")
+                self.block_end()
+                classifier = "default-class" if a.qos_class == qos_text.DEFAULT_CLASS else a.qos_class
+                pairs.append(f"{_IND}classifier {classifier} behavior {behavior}")
+            self.out += [f"qos policy {p.name}"] + pairs
+            self.block_end()
+
     def acls(self) -> None:
         for acl in self.device.acls.values():
             name = acl_text.safe_name(acl.name)
@@ -563,6 +599,13 @@ class Writer:
             lines.append(f"ip address {net.ip} {net.netmask}" + (" sub" if n else ""))
         for cidr in iface.ipv6:
             lines.append(f"ipv6 address {cidr}")
+        for direction, policy in (("inbound", iface.qos_policy_in), ("outbound", iface.qos_policy_out)):
+            if policy and policy in self.device.qos_policies:
+                lines.append(f"qos apply policy {policy} {direction}")
+            elif policy:
+                add(Severity.REVIEW, "qos-policy", f"policy {policy} is applied but not defined; left out")
+        if iface.qos_trust in ("dscp", "cos"):
+            lines.append(f"qos trust {'dot1p' if iface.qos_trust == 'cos' else 'dscp'}")
         for attr, v6, direction in (("acl_in", "", "inbound"), ("acl_out", "", "outbound"),
                                     ("acl6_in", "ipv6 ", "inbound"), ("acl6_out", "ipv6 ", "outbound")):
             acl_name = getattr(iface, attr)

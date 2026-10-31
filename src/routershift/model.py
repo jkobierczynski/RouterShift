@@ -146,6 +146,9 @@ class Interface:
     stp_bpdufilter: bool = False
     stp_cost: Optional[int] = None
     stp_port_priority: Optional[int] = None  # 0-240 in steps of 16; None = the default, 128
+    qos_trust: str = ""  # "dscp", "cos" or "none"; "" = the platform default
+    qos_policy_in: str = ""  # QosPolicy names
+    qos_policy_out: str = ""
     fhrp: List["FhrpGroup"] = field(default_factory=list)
     nat: str = ""  # "inside", "outside" or ""
     ospf_cost: Optional[int] = None
@@ -499,6 +502,33 @@ class Aaa:
 
 
 @dataclass
+class QosClass:
+    """Traffic matched by DSCP value or by an access list."""
+
+    name: str
+    dscp: List[int] = field(default_factory=list)
+    acl: str = ""
+    match_all: bool = False  # IOS match-all: every condition must hold (only matters with more than one)
+    origin: Origin = field(default_factory=Origin)
+
+
+@dataclass
+class QosAction:
+    """What a policy does with the traffic of one class."""
+
+    qos_class: str  # QosClass name; "class-default" = everything else
+    set_dscp: Optional[int] = None
+    police_kbps: Optional[int] = None  # committed rate; traffic above it is dropped
+
+
+@dataclass
+class QosPolicy:
+    name: str
+    actions: List[QosAction] = field(default_factory=list)
+    origin: Origin = field(default_factory=Origin)
+
+
+@dataclass
 class Stp:
     """Spanning tree beyond its mode: bridge priorities and the MST region."""
 
@@ -539,6 +569,8 @@ class Device:
     psks: Dict[str, PreSharedKey] = field(default_factory=dict)  # by peer address
     stp_mode: Optional[StpMode] = None
     stp: Stp = field(default_factory=Stp)
+    qos_classes: Dict[str, QosClass] = field(default_factory=dict)
+    qos_policies: Dict[str, QosPolicy] = field(default_factory=dict)
     snmp: Snmp = field(default_factory=Snmp)
     users: List[LocalUser] = field(default_factory=list)
     aaa: Aaa = field(default_factory=Aaa)

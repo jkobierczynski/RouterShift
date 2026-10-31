@@ -19,6 +19,7 @@ from .. import acl as acl_text
 from .. import bgp as bgp_text
 from .. import fhrp
 from .. import ospf as ospf_text
+from .. import qos as qos_text
 from .. import confparse, names
 from .. import dhcp as dhcp_text
 from .. import vpn as vpn_text
@@ -27,7 +28,7 @@ from ..confparse import Node
 from ..errors import ParseError
 from ..model import (AaaGroup, AaaMethod, AaaServer, Acl, Device, LocalUser, DhcpPool, FhrpGroup, IkePolicy, IpsecPeer, IpsecTransform, NtpKey, PreSharedKey,
                      SnmpCommunity, SnmpGroup, SnmpHost, SnmpUser, NatPool, NatRule, Interface, InterfaceKind, LacpMode, Origin, Ospf, OspfNetwork,
-                     StaticRoute, StpMode, SwitchportMode, Unparsed, Vlan)
+                     QosAction, QosClass, QosPolicy, StaticRoute, StpMode, SwitchportMode, Unparsed, Vlan)
 
 # Lines that only describe the file or the software, not the device's behaviour.
 _NOISE = ("Building configuration", "Current configuration", "version ", "end", "boot-start-marker",
@@ -127,6 +128,9 @@ class _Reader:
             "radius-server": self.aaa_host,
             "tacacs-server": self.aaa_host,
             "dot1x": self.dot1x,
+            "class-map": self.class_map,
+            "policy-map": self.policy_map,
+            "mls": lambda node: node.words == ["mls", "qos"],
         }
         for node in roots:
             if node.text.startswith(_NOISE) or node.text == "end":
@@ -534,6 +538,95 @@ class _Reader:
             a.methods.append(method)
             return True
         return False
+
+    # QoS -------------------------------------------------------------------------------------------------------------
+
+    def class_map(self, node: Node) -> bool:
+        """IOS: class-map [match-any|match-all] NAME; EOS: class-map type qos [match-any] NAME"""
+        w = node.words[1:]
+        if w[:2] == ["type", "qos"]:
+            w = w[2:]
+        match_all = w[0] != "match-any"  # IOS defaults to match-all
+        if w[0] in ("match-any", "match-all"):
+            w = w[1:]
+        if len(w) != 1:
+            return False
+        qos_class = QosClass(w[0], match_all=match_all, origin=Origin(node.line, node.text))
+        self.device.qos_classes[qos_class.name] = qos_class
+        for child in node.children:
+            c = child.words
+            try:
+                if c[:2] == ["match", "dscp"] or c[:3] == ["match", "ip", "dscp"]:
+                    qos_class.dscp += [qos_text.dscp(x) for x in c[2 + (c[1] == "ip"):]]
+                    continue
+                if c[:2] == ["match", "access-group"] and len(c) in (3, 4) or \
+                        c[:3] == ["match", "ip", "access-group"] and len(c) == 4:
+                    qos_class.acl = c[-1]
+                    continue
+            except ValueError:
+                pass
+            self.unparsed(child, node.text)
+        return True
+
+    def policy_map(self, node: Node) -> bool:
+        """IOS: policy-map NAME; EOS: policy-map type quality-of-service NAME"""
+        w = node.words[1:]
+        if w[:2] == ["type", "quality-of-service"]:
+            w = w[2:]
+        if len(w) != 1:
+            return False
+        policy = QosPolicy(w[0], origin=Origin(node.line, node.text))
+        self.device.qos_policies[policy.name] = policy
+        for child in node.children:
+            if child.words[0] != "class" or len(child.words) != 2:
+                self.unparsed(child, node.text)
+                continue
+            action = QosAction(child.words[1])
+            policy.actions.append(action)
+            for line in child.children:
+                try:
+                    understood = self._qos_action(action, line)
+                except (ValueError, IndexError):
+                    understood = False
+                if not understood:
+                    self.unparsed(line, f"{node.text} / {child.text}")
+        return True
+
+    @staticmethod
+    def _qos_action(action: QosAction, node: Node) -> bool:
+        """set [ip] dscp X; IOS: police [cir] BPS [BC] [conform-action transmit] [exceed-action drop];
+        EOS: police rate|cir N [bps|kbps|mbps] [burst-size N kbytes]"""
+        w = node.words
+        if w[:2] == ["set", "dscp"] and len(w) == 3 or w[:3] == ["set", "ip", "dscp"] and len(w) == 4:
+            action.set_dscp = qos_text.dscp(w[-1])
+            return True
+        if w[0] != "police" or len(w) < 2:
+            return False
+        args = w[1:]
+        if args[0] in ("cir", "rate"):
+            args = args[1:]
+        rate, args = int(args[0]), args[1:]
+        unit = 1000  # bps, the IOS unit
+        if args and args[0] in ("bps", "kbps", "mbps", "gbps"):
+            unit = {"bps": 1000, "kbps": 1, "mbps": 1, "gbps": 1}[args[0]]
+            rate *= {"bps": 1, "kbps": 1, "mbps": 1000, "gbps": 1000000}[args[0]]
+            args = args[1:]
+        action.police_kbps = max(1, rate // unit)
+        actions = {"transmit"}
+        while args:
+            if args[0] in ("bc", "burst-size") and len(args) >= 2:
+                args = args[2 + (args[2:3] in (["bytes"], ["kbytes"], ["mbytes"])):]
+            elif args[0].isdigit():
+                args = args[1:]  # IOS: the burst
+            elif args[0] in ("conform-action", "exceed-action") and len(args) >= 2:
+                actions.add(f"{args[0]}:{args[1]}")
+                args = args[2:]
+            else:
+                return False
+        exceed = [a for a in actions if a.startswith("exceed-action:")]
+        children = {" ".join(c.words) for c in node.children}
+        return all(a == "exceed-action:drop" for a in exceed) and children <= {"conform-action transmit",
+                                                                               "exceed-action drop"}
 
     def dot1x(self, node: Node) -> bool:
         if node.words[1:] == ["system-auth-control"]:
@@ -1551,6 +1644,16 @@ class _Reader:
             iface.stp_port_priority = int(w[2])
         elif w[0] in ("authentication", "access-session", "dot1x", "mab") and n >= 1:
             return self.dot1x_line(iface, w)
+        elif w[0] == "service-policy" and n in (3, 5):
+            # IOS: service-policy input|output P; EOS: service-policy type qos input P
+            args = w[3:] if w[1:3] == ["type", "qos"] else w[1:]
+            if len(args) != 2 or args[0] not in ("input", "output"):
+                return False
+            setattr(iface, "qos_policy_in" if args[0] == "input" else "qos_policy_out", args[1])
+        elif w[:3] == ["mls", "qos", "trust"] and n == 4 and w[3] in ("dscp", "cos"):
+            iface.qos_trust = w[3]
+        elif w[:2] == ["qos", "trust"] and n == 3 and w[2] in ("dscp", "cos", "disabled"):
+            iface.qos_trust = "none" if w[2] == "disabled" else w[2]
         else:
             return False
         return True

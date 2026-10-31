@@ -15,6 +15,7 @@ from .. import dhcp as dhcp_text
 from .. import fhrp
 from .. import nat as nat_text
 from .. import ospf as ospf_text
+from .. import qos as qos_text
 from .. import snmp as snmp_text
 from .. import stp as stp_text
 from .. import aaa as aaa_text
@@ -73,6 +74,7 @@ class Writer:
         self.vrfs()
         self.vlans()
         self.vpn()
+        self.qos()
         for iface in self.device.interfaces.values():
             self.interface(iface)
         self.routing()
@@ -220,6 +222,7 @@ class Writer:
             lines.append(f"mtu {mtu}")
         lines += self._speed(iface, add)
         lines += self._dot1x(iface, add)
+        lines += self._qos_interface(iface, add)
         if iface.stp_portfast:
             trunk = iface.mode == SwitchportMode.TRUNK
             lines.append("spanning-tree portfast trunk" if self.ios and trunk else "spanning-tree portfast")
@@ -1060,6 +1063,64 @@ class Writer:
         if form == "sha512-crypt":
             return f"secret sha512 {value}"
         return f"secret {form[len('ios-type'):]} {value}"
+
+    def qos(self) -> None:
+        """Class maps and policy maps; EOS takes the policies as 'quality-of-service' and classes as 'qos'."""
+        rep = self.report
+        for c in self.device.qos_classes.values():
+            label = f"class {c.name}"
+            rep.item("qos", label)
+            kind = "" if self.ios else " type qos"
+            self.out.append(f"class-map{kind} {'match-all' if c.match_all and self.ios else 'match-any'} {c.name}")
+            if c.match_all and not self.ios and c.dscp and c.acl:
+                rep.add("qos", label, Severity.APPROX, "qos-match",
+                        "EOS matches any of the conditions: DSCP and ACL are both written, as alternatives")
+            if c.dscp:
+                values = " ".join(qos_text.dscp_name(d) if self.ios else str(d) for d in c.dscp)
+                self.out.append(f"{self.ind}match dscp {values}")
+            if c.acl and c.acl in self.device.acls:
+                name = acl_text.safe_name(c.acl)
+                self.out.append(f"{self.ind}match access-group name {name}" if self.ios else
+                                f"{self.ind}match ip access-group {name}")
+            elif c.acl:
+                rep.add("qos", label, Severity.REVIEW, "acl-missing", f"ACL {c.acl} is not defined; left out")
+            self.out.append("!")
+        for p in self.device.qos_policies.values():
+            rep.item("qos", f"policy {p.name}")
+            self.out.append(f"policy-map {p.name}" if self.ios else f"policy-map type quality-of-service {p.name}")
+            for a in p.actions:
+                self.out.append(f"{self.ind}class {a.qos_class}")
+                deep = self.ind * 2
+                if a.set_dscp is not None:
+                    self.out.append(f"{deep}set dscp {qos_text.dscp_name(a.set_dscp) if self.ios else a.set_dscp}")
+                if a.police_kbps is not None:
+                    self.out.append(f"{deep}police cir {a.police_kbps * 1000} conform-action transmit exceed-action drop"
+                                    if self.ios else f"{deep}police rate {a.police_kbps} kbps burst-size "
+                                                     f"{max(16, a.police_kbps // 8)} kbytes")
+                    if not self.ios:
+                        rep.add("qos", qos_text.action_label(p, a), Severity.APPROX, "qos-burst",
+                                "the burst is not converted: written as 1/8 s of the rate")
+            self.out.append("!")
+
+    def _qos_interface(self, iface: Interface, add: _Add) -> List[str]:
+        lines = []
+        for direction, name in (("input", iface.qos_policy_in), ("output", iface.qos_policy_out)):
+            if not name:
+                continue
+            if name not in self.device.qos_policies:
+                add(Severity.REVIEW, "qos-policy", f"policy {name} is applied but not defined; left out")
+            elif direction == "output" and not self.ios:
+                add(Severity.REVIEW, "qos-output", f"EOS applies QoS policies inbound only; output policy {name} "
+                                                   "left out")
+            else:
+                lines.append(f"service-policy {direction} {name}" if self.ios else
+                             f"service-policy type qos {direction} {name}")
+        if iface.qos_trust and not self.ios:
+            lines.append(f"qos trust {'disabled' if iface.qos_trust == 'none' else iface.qos_trust}")
+        elif iface.qos_trust and iface.qos_trust != "dscp":
+            add(Severity.REVIEW, "qos-trust", f"trust {iface.qos_trust}: a Catalyst 9000 trusts DSCP on every port; "
+                                              "remark with a policy if the port must be treated differently")
+        return lines
 
     def _dot1x(self, iface: Interface, add: _Add) -> List[str]:
         """802.1X and MAC authentication on a port."""
