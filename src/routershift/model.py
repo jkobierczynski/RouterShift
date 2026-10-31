@@ -90,6 +90,7 @@ class System:
     ntp_keys: Dict[int, "NtpKey"] = field(default_factory=dict)
     ntp_authenticate: bool = False  # only take time from authenticated servers
     ntp_source: str = ""  # canonical name of the interface NTP packets leave from
+    transfer_source: Dict[str, str] = field(default_factory=dict)  # "tftp" / "ftp" -> canonical source interface
 
 
 @dataclass
@@ -150,6 +151,11 @@ class Interface:
     tunnel_destination: str = ""
     tunnel_mode: str = ""  # tunnel: "gre" or "ipsec"
     tunnel_profile: str = ""  # tunnel: the IPsec profile protecting it (an IpsecPeer name)
+    dot1x: bool = False  # 802.1X authenticator on the port
+    mab: bool = False  # MAC authentication for clients without 802.1X
+    dot1x_host_mode: str = ""  # "single-host", "multi-host" (one login opens the port), "multi-auth", "multi-domain"
+    dot1x_reauth: bool = False
+    dot1x_reauth_period: Optional[int] = None  # seconds; None = the platform default
     origin: Origin = field(default_factory=Origin)
 
 
@@ -470,7 +476,7 @@ class AaaMethod:
     """
 
     kind: str  # "authentication", "authorization" or "accounting"
-    service: str  # "login", "enable", "exec" or "commands"
+    service: str  # "login", "enable", "exec", "commands" or "dot1x" (port authentication)
     methods: List[str] = field(default_factory=list)
     name: str = "default"
     level: Optional[int] = None  # commands: the privilege level
@@ -485,6 +491,7 @@ class Aaa:
     methods: List[AaaMethod] = field(default_factory=list)
     source: Dict[str, str] = field(default_factory=dict)  # protocol -> canonical source interface
     enable_secret: Optional[LocalUser] = None  # IOS/EOS enable secret, as a user named "enable"
+    dot1x: bool = False  # 802.1X port authentication switched on for the device
 
 
 @dataclass

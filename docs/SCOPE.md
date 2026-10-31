@@ -43,7 +43,9 @@ platform converts to and from all the others.
 | SNMP: communities with access and ACL, location, contact, notification hosts (v1/v2c/v3, traps or informs), v3 groups and users, source interface | `Snmp`, `SnmpCommunity`, `SnmpHost`, `SnmpGroup`, `SnmpUser` | 2 (done) |
 | Local users, privilege levels and roles, enable secret | `LocalUser`, `Aaa.enable_secret` | 3 (done) |
 | AAA: RADIUS and TACACS+ servers, server groups, login/enable/exec/command method lists, source interfaces | `Aaa`, `AaaServer`, `AaaGroup`, `AaaMethod` | 3 (done) |
-| LDAP, Kerberos, TFTP/FTP, 802.1X | to come | 3 |
+| 802.1X and MAC authentication on ports: host mode, reauthentication, the RADIUS servers used | `Aaa.dot1x`, `Interface.dot1x`, `Interface.mab` ... | 3 (done) |
+| TFTP and FTP client source interface | `System.transfer_source` | 3 (done) |
+| LDAP and Kerberos servers (listed under "Not understood") | to come | 3+ |
 | Route maps, prefix lists, QoS, MLAG/VSX/vPC, VXLAN/EVPN | to come | 3+ |
 
 ### AOS-S specifics
@@ -189,6 +191,27 @@ platform converts to and from all the others.
   exec authorization (a user's group gives the rights); AOS-S has per-access authentication and two methods at most.
   Named lists (applied to lines) are reported.
 * The source interface for RADIUS and TACACS+ carries over; Comware takes the address (`nas-ip`) instead.
+* LDAP and Kerberos are not converted yet; their lines are listed under "Not understood".
+
+## 802.1X and MAC authentication
+
+* A port keeps 802.1X, MAC authentication (MAB), its host mode and reauthentication with its period; the device keeps
+  802.1X switched on and the RADIUS group ports authenticate against.
+* IOS: `authentication host-mode`/`port-control auto`/`periodic`/`timer reauthenticate`, `mab`, `dot1x pae
+  authenticator` (`access-session` is read too), `dot1x system-auth-control`, `aaa authentication dot1x`.
+* EOS: `dot1x pae authenticator`, `dot1x host-mode single-host|multi-host [authenticated]` (multi-auth is
+  `multi-host authenticated`), `dot1x mac based authentication`, `dot1x reauthentication`.
+* AOS-CX: `aaa authentication port-access` with `client-limit` and `auth-mode` (client mode with one client is
+  single-host, device mode is multi-host) and the `dot1x authenticator` and `mac-auth` blocks.
+* AOS-S: `aaa port-access authenticator PORTS` (no client limit opens the port for all, multi-host; a limit of 1 is
+  single-host), `aaa port-access mac-based PORTS`, `aaa authentication port-access eap-radius`.
+* Comware: `dot1x` and `mac-authentication` on the port (MAC-based access with `max-user 1` is single-host,
+  `port-method portbased` multi-host), `dot1x re-authenticate`, one global `dot1x timer reauth-period`, and
+  `authentication lan-access radius-scheme` in `domain system`.
+* Multi-auth becomes a client limit of 32 where the platform counts clients (reported); multi-domain becomes multi-auth
+  where the platform has no voice domain on the port (reported).
+* TFTP and FTP keep their client source interface. AOS-CX and AOS-S have no FTP client setting (reported), and AOS-S
+  takes a VLAN or loopback as TFTP source.
 
 ## Site-to-site VPN (IPsec)
 

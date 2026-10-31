@@ -40,11 +40,12 @@ def test_ios_reader() -> None:
         ("admin", 15, "Adm1nPass"), ("backup", None, "cisco")]
     assert device.aaa.enable_secret is not None and device.aaa.enable_secret.hash_type == "md5-crypt"
     assert [(s.protocol, s.address, s.key) for s in device.aaa.servers] == [
-        ("tacacs", "10.0.5.31", "TacKey1"), ("tacacs", "10.0.5.32", "TacKey2")]
+        ("tacacs", "10.0.5.31", "TacKey1"), ("tacacs", "10.0.5.32", "TacKey2"), ("radius", "10.0.5.41", "RadKey1")]
     assert device.aaa.groups["TAC"].servers == ["10.0.5.31", "10.0.5.32"]
     assert device.aaa.source == {"tacacs": "Vlan99"}
     assert [aaa_text.method_label(m) for m in device.aaa.methods] == [
-        "authentication login default", "authorization exec default", "accounting commands 15 default"]
+        "authentication login default", "authorization exec default", "accounting commands 15 default",
+        "authentication dot1x default"]
 
 
 def test_comware_reader() -> None:

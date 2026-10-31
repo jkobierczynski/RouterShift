@@ -200,6 +200,7 @@ class Writer:
                 add(Severity.APPROX, "mtu", f"MTU {iface.mtu} lowered to {mtu}, the largest a Catalyst 9000 port takes")
             lines.append(f"mtu {mtu}")
         lines += self._speed(iface, add)
+        lines += self._dot1x(iface, add)
         if iface.stp_portfast:
             trunk = iface.mode == SwitchportMode.TRUNK
             lines.append("spanning-tree portfast trunk" if self.ios and trunk else "spanning-tree portfast")
@@ -1033,6 +1034,31 @@ class Writer:
             return f"secret sha512 {value}"
         return f"secret {form[len('ios-type'):]} {value}"
 
+    def _dot1x(self, iface: Interface, add: _Add) -> List[str]:
+        """802.1X and MAC authentication on a port."""
+        if not (iface.dot1x or iface.mab):
+            return []
+        mode = iface.dot1x_host_mode or "single-host"
+        if self.ios:
+            lines = [f"authentication host-mode {mode}", "authentication port-control auto"]
+            lines += ["authentication periodic"] if iface.dot1x_reauth else []
+            lines += [f"authentication timer reauthenticate {iface.dot1x_reauth_period}"] \
+                if iface.dot1x_reauth_period else []
+            lines += ["mab"] if iface.mab else []
+            lines += ["dot1x pae authenticator"] if iface.dot1x else []
+            return lines
+        if mode == "multi-domain":
+            add(Severity.APPROX, "dot1x-host-mode", "multi-domain written as 'multi-host authenticated': EOS has no "
+                                                   "separate voice domain, every host logs in")
+        lines = ["dot1x pae authenticator"] if iface.dot1x else []
+        lines.append("dot1x port-control auto")
+        lines.append({"single-host": "dot1x host-mode single-host", "multi-host": "dot1x host-mode multi-host"}.get(
+            mode, "dot1x host-mode multi-host authenticated"))
+        lines += ["dot1x mac based authentication"] if iface.mab else []
+        lines += ["dot1x reauthentication"] if iface.dot1x_reauth else []
+        lines += [f"dot1x timeout reauth-period {iface.dot1x_reauth_period}"] if iface.dot1x_reauth_period else []
+        return lines
+
     def _users(self) -> None:
         a = self.device.aaa
         if a.enable_secret is not None:
@@ -1221,6 +1247,12 @@ class Writer:
         self._snmp()
         self._users()
         self._aaa()
+        if self.device.aaa.dot1x:
+            self.out.append("dot1x system-auth-control")
+            self.report.item("management", "802.1X")
+        for protocol, source in s.transfer_source.items():
+            self.out.append(f"ip {protocol}{'' if self.ios else ' client'} source-interface {self.port(source)}")
+            self.report.item("system", f"{protocol} source")
         for host in s.syslog_servers:
             if not vrf:
                 self.out.append(f"logging host {host}")

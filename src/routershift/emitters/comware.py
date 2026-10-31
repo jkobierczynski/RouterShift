@@ -50,6 +50,7 @@ class Writer:
         self.system()
         self.users()
         self.aaa()
+        self.port_access()
         if self.vrrp_v2:
             self.out.append(f"{_IND}vrrp version 2")  # Comware 7 runs VRRPv3 unless told otherwise
             self.block_end()
@@ -238,7 +239,7 @@ class Writer:
             address = iface.ipv4[0].split("/")[0]
             self.out.append(f"{_IND}{'radius' if protocol == 'radius' else 'hwtacacs'} nas-ip {address}")
             self.block_end()
-        lines = [f"{_IND}{line}" for line in (self._domain_line(m) for m in a.methods) if line]
+        lines = [f"{_IND}{line}" for m in a.methods for line in self._domain_line(m)]
         if lines:
             self.out += ["domain system"] + lines
             self.block_end()
@@ -248,23 +249,25 @@ class Writer:
 
     _DOMAIN = {("authentication", "login"): "authentication login", ("authentication", "enable"): "authentication super",
                ("authorization", "exec"): "authorization login", ("authorization", "commands"): "authorization command",
-               ("accounting", "exec"): "accounting login", ("accounting", "commands"): "accounting command"}
+               ("accounting", "exec"): "accounting login", ("accounting", "commands"): "accounting command",
+               ("authentication", "dot1x"): "authentication lan-access"}
 
-    def _domain_line(self, m: AaaMethod) -> str:
-        """The ISP domain line for a method list, or '' with a note."""
+    def _domain_line(self, m: AaaMethod) -> List[str]:
+        """The ISP domain lines for a method list, or none with a note."""
         rep = self.report
         label = aaa_text.method_label(m)
         words = self._DOMAIN.get((m.kind, m.service))
         if words is None or m.name != "default":
             why = ("Comware picks a domain by the user name, not per line" if words else "Comware has no such list")
             rep.skip("management", label, "aaa-list", f"{why}; configure it by hand")
-            return ""
+            return []
         commands = m.service == "commands"
+        lan = m.service == "dot1x"
         kept: List[str] = []
         for method in m.methods:
             protocol = aaa_text.protocol_of(self.device, method)
             if protocol:
-                if kept or (commands and protocol != "tacacs"):
+                if kept or (commands and protocol != "tacacs") or (lan and protocol != "radius"):
                     continue
                 name = method[len("group:"):]
                 name = protocol.upper() if name == protocol else name
@@ -274,15 +277,61 @@ class Writer:
                 break
         if len(kept) != len(m.methods):
             rep.add("management", label, Severity.APPROX, "aaa-method",
-                    "Comware takes one scheme, then local or none (HWTACACS only for commands, a scheme only for "
-                    f"super); written as {' '.join(kept) or 'nothing'}")
+                    "Comware takes one scheme, then local or none (HWTACACS only for commands, RADIUS only for LAN "
+                    f"access, a scheme only for super); written as {' '.join(kept) or 'nothing'}")
         if not kept:
-            return ""
+            return []
         rep.item("management", label)
         if commands and m.level not in (None, 15):
             rep.add("management", label, Severity.APPROX, "aaa-level",
                     f"level {m.level} left out: Comware authorizes every command")
-        return f"{words} {' '.join(kept)}"
+        if lan:  # the RADIUS reply authorizes the port as well
+            return [f"{words} {' '.join(kept)}", f"authorization lan-access {' '.join(kept)}"]
+        return [f"{words} {' '.join(kept)}"]
+
+    def port_access(self) -> None:
+        """802.1X and MAC authentication switched on globally, the reauthentication timer, and file transfer
+        sources."""
+        rep = self.report
+        for protocol, source in self.device.system.transfer_source.items():
+            self.out.append(f"{_IND}{protocol} client source interface {self.port(source)}")
+            rep.item("system", f"{protocol} source")
+        ports = [i for i in self.device.interfaces.values() if i.dot1x or i.mab]
+        if self.device.aaa.dot1x:
+            self.out.append(f"{_IND}dot1x")
+            rep.item("management", "802.1X")
+        if any(i.mab for i in ports):
+            self.out.append(f"{_IND}mac-authentication")
+        periods = sorted({i.dot1x_reauth_period for i in ports if i.dot1x_reauth and i.dot1x_reauth_period})
+        if periods:
+            self.out.append(f"{_IND}dot1x timer reauth-period {periods[-1]}")
+            if len(periods) > 1:
+                rep.add("management", "802.1X", Severity.APPROX, "dot1x-reauth",
+                        f"Comware has one reauthentication period for all ports; {periods[-1]} s is written "
+                        f"(the ports had {', '.join(str(p) for p in periods)})")
+        if self.device.system.transfer_source or ports or self.device.aaa.dot1x:
+            self.block_end()
+
+    def _dot1x(self, iface: Interface, add: Callable[[Severity, str, str], None]) -> List[str]:
+        if not (iface.dot1x or iface.mab):
+            return []
+        mode = iface.dot1x_host_mode or "single-host"
+        lines = []
+        if iface.dot1x:
+            lines.append("dot1x")
+            if mode == "multi-host":
+                lines.append("dot1x port-method portbased")
+            elif mode == "single-host":
+                lines.append("dot1x max-user 1")
+            elif mode == "multi-domain":
+                add(Severity.APPROX, "dot1x-host-mode",
+                    "multi-domain written as MAC-based access: Comware has no separate voice domain on the port")
+            lines += ["dot1x re-authenticate"] if iface.dot1x_reauth else []
+        if iface.mab:
+            lines.append("mac-authentication")
+            if mode == "single-host" or mode == "multi-host" and not iface.dot1x:
+                lines.append("mac-authentication max-user 1")
+        return lines
 
 
     _SNMP_AUTH = ["md5", "sha", "sha256", "sha384", "sha512"]
@@ -515,6 +564,7 @@ class Writer:
         if iface.helper_addresses:
             lines.append("dhcp select relay")
             lines += [f"dhcp relay server-address {helper}" for helper in iface.helper_addresses]
+        lines += self._dot1x(iface, add)
         if iface.stp_portfast:
             lines.append("stp edged-port")
         lines.append("shutdown" if iface.shutdown else "undo shutdown")

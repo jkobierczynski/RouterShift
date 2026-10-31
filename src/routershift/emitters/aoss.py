@@ -308,7 +308,10 @@ class Writer:
             else:
                 rep.add("management", f"{protocol} source", Severity.REVIEW, "aaa-source",
                         f"source {source} is not a VLAN or loopback; set 'ip source-interface' by hand")
+        self._port_access()
         for m in a.methods:
+            if m.service == "dot1x":
+                continue  # written with the port access settings
             label = aaa_text.method_label(m)
             access = "ssh" if m.name == "default" else m.name
             if m.kind == "authentication" and access in ("ssh", "telnet", "console", "web"):
@@ -329,6 +332,64 @@ class Writer:
                 rep.skip("management", label, "aaa-list",
                          "AOS-S has no such list (only per-access authentication, command authorization and "
                          "default accounting); configure it by hand")
+
+    def _port_access(self) -> None:
+        """802.1X (authenticator) and MAC authentication (mac-based) on the ports, and the servers they use."""
+        a = self.device.aaa
+        rep = self.report
+        for protocol, source in self.device.system.transfer_source.items():
+            if protocol == "tftp" and source.startswith(("Vlan", "Loopback")):
+                kind = "vlan" if source.startswith("Vlan") else "loopback"
+                self.out.append(f"ip source-interface tftp {kind} {source.lstrip('VlanLoopback')}")
+                rep.item("system", "tftp source")
+            elif protocol == "tftp":
+                rep.add("system", "tftp source", Severity.REVIEW, "transfer-source",
+                        f"source {source} is not a VLAN or loopback; set 'ip source-interface tftp' by hand")
+            else:
+                rep.skip("system", f"{protocol} source", "transfer-source",
+                         "AOS-S has no FTP client source setting; it copies files with TFTP, SFTP or SCP")
+        method = next((m for m in a.methods if m.service == "dot1x"), None)
+        ports = [i for i in self.device.interfaces.values() if (i.dot1x or i.mab) and not i.lag]
+        if method is not None and (ports or a.dot1x):
+            label = aaa_text.method_label(method)
+            rep.item("management", label)
+            group = next((x[len("group:"):] for x in method.methods if x.startswith("group:")), "radius")
+            if len(method.methods) != 1:
+                rep.add("management", label, Severity.APPROX, "aaa-method",
+                        f"AOS-S authenticates ports against one RADIUS group; written as {group}")
+            server_group = "" if group == "radius" else f" server-group {_quote(group)}"
+            self.out.append(f"aaa authentication port-access eap-radius{server_group}")
+            if any(i.mab for i in ports):
+                self.out.append(f"aaa authentication mac-based chap-radius{server_group}")
+        dot1x = [i for i in ports if i.dot1x]
+        mab = [i for i in ports if i.mab]
+        if dot1x:
+            self.out.append(f"aaa port-access authenticator {port_list([self.port(i.name) for i in dot1x])}")
+        for i in dot1x:
+            name = self.port(i.name)
+            limit = self._client_limit(i)
+            if limit:
+                self.out.append(f"aaa port-access authenticator {name} client-limit {limit}")
+            if i.dot1x_reauth:
+                self.out.append(f"aaa port-access authenticator {name} reauth-period {i.dot1x_reauth_period or 3600}")
+        if a.dot1x:
+            self.out.append("aaa port-access authenticator active")
+            rep.item("management", "802.1X")
+        if mab:
+            self.out.append(f"aaa port-access mac-based {port_list([self.port(i.name) for i in mab])}")
+        for i in mab:
+            limit = self._client_limit(i)
+            if limit and limit != 1:
+                self.out.append(f"aaa port-access mac-based {self.port(i.name)} addr-limit {limit}")
+
+    def _client_limit(self, i: Interface) -> int:
+        """The client limit for a port's host mode; 0 = none (the port opens for all once one client logs in)."""
+        mode = i.dot1x_host_mode or "single-host"
+        if mode == "multi-domain":
+            self.report.add("interface", f"{i.source_name or i.name} -> {self.port(i.name)}", Severity.APPROX,
+                            "dot1x-host-mode", "multi-domain written as up to 32 clients: AOS-S has no separate voice "
+                            "domain")
+        return {"single-host": 1, "multi-host": 0}.get(mode, 32)
 
     def snmp(self) -> None:
         s = self.device.snmp

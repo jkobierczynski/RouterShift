@@ -132,6 +132,9 @@ class _Reader:
         self._nas_ip: Dict[str, Tuple[str, int]] = {}  # protocol -> (source address, line)
         self._domains: Dict[str, List[AaaMethod]] = {}
         self._default_domain = "system"
+        self._reauth_period: Optional[int] = None
+        self._max_users: Dict[Tuple[str, str], int] = {}  # (port, dot1x|mac-authentication) -> max-user
+        self._port_based: Set[str] = set()
 
     def unparsed(self, node: Node, section: str = "") -> None:
         self.device.unparsed.append(Unparsed(node.line, node.text, section))
@@ -173,6 +176,10 @@ class _Reader:
             "hwtacacs": self.aaa_scheme,
             "domain": self.domain,
             "line": self.line,
+            "dot1x": self.dot1x,
+            "mac-authentication": self.dot1x,
+            "tftp": self.transfer,
+            "ftp": self.transfer,
         }
         for node in roots:
             if node.text.startswith(_NOISE):
@@ -462,7 +469,8 @@ class _Reader:
                ("authorization", "login"): ("authorization", "exec"),
                ("authorization", "command"): ("authorization", "commands"),
                ("accounting", "login"): ("accounting", "exec"),
-               ("accounting", "command"): ("accounting", "commands")}
+               ("accounting", "command"): ("accounting", "commands"),
+               ("authentication", "lan-access"): ("authentication", "dot1x")}
 
     def domain(self, node: Node) -> bool:
         """domain NAME: the method lists of an ISP domain; domain default enable NAME"""
@@ -475,6 +483,8 @@ class _Reader:
         methods = self._domains.setdefault(w[1], [])
         for child in node.children:
             c = child.words
+            if c[:2] in (["authorization", "lan-access"], ["accounting", "lan-access"]):
+                continue  # goes with authentication lan-access
             kind = self._DOMAIN.get((c[0], c[1])) if len(c) >= 3 else None
             words = self._methods(c[2:]) if kind else None
             if kind is None or not words:
@@ -487,6 +497,44 @@ class _Reader:
             if kind[0] == "accounting":
                 m.record = "start-stop"
             methods.append(m)
+        return True
+
+    def dot1x(self, node: Node) -> bool:
+        """dot1x; mac-authentication; dot1x timer reauth-period N; dot1x authentication-method eap|chap|pap"""
+        w = node.words
+        if w == ["dot1x"]:
+            self.device.aaa.dot1x = True
+            return True
+        if w == ["mac-authentication"] or w[:2] == ["dot1x", "authentication-method"] and len(w) == 3:
+            return True
+        if w[:3] == ["dot1x", "timer", "reauth-period"] and len(w) == 4:
+            self._reauth_period = int(w[3])
+            return True
+        return False
+
+    def transfer(self, node: Node) -> bool:
+        """tftp|ftp client source interface X"""
+        w = node.words
+        if w[1:4] == ["client", "source", "interface"] and len(w) in (5, 6):
+            self.device.system.transfer_source[w[0]] = canonical("".join(w[4:]))[0]
+            return True
+        return False
+
+    def dot1x_line(self, iface: Interface, w: List[str]) -> bool:
+        n = len(w)
+        if w == ["dot1x"]:
+            iface.dot1x = True
+        elif w == ["mac-authentication"]:
+            iface.mab = True
+        elif w[:2] == ["dot1x", "port-method"] and n == 3 and w[2] in ("macbased", "portbased"):
+            if w[2] == "portbased":
+                self._port_based.add(iface.name)
+        elif w == ["dot1x", "re-authenticate"]:
+            iface.dot1x_reauth = True
+        elif w[1:2] == ["max-user"] and n == 3:
+            self._max_users[(iface.name, w[0])] = int(w[2])
+        else:
+            return False
         return True
 
     def line(self, node: Node) -> bool:
@@ -514,6 +562,14 @@ class _Reader:
 
     def _finish_aaa(self) -> None:
         a = self.device.aaa
+        for iface in self.device.interfaces.values():
+            if iface.dot1x_reauth:
+                iface.dot1x_reauth_period = self._reauth_period
+            if iface.dot1x or iface.mab:
+                # MAC-based access (the default) lets each client log in, up to max-user; port-based opens the port
+                limit = self._max_users.get((iface.name, "dot1x" if iface.dot1x else "mac-authentication"), 4096)
+                iface.dot1x_host_mode = "multi-host" if iface.name in self._port_based and iface.dot1x else \
+                    "single-host" if limit == 1 else "multi-auth"
         for name, methods in self._domains.items():
             for m in methods:
                 m.name = "default" if name == self._default_domain else name
@@ -1142,6 +1198,8 @@ class _Reader:
     def interface_line(self, iface: Interface, w: List[str]) -> bool:
         n = len(w)
         name = iface.name
+        if w[0] in ("dot1x", "mac-authentication"):
+            return self.dot1x_line(iface, w)
         if w[0] == "description":
             iface.description = " ".join(w[1:])
         elif w == ["shutdown"]:
