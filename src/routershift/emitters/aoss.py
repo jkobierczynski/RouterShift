@@ -25,6 +25,7 @@ from .. import nat as nat_text
 from .. import wlan as wlan_text
 from .. import vpn as vpn_text
 from .. import vrfs as vrfs_text
+from .. import multicast as multicast_text
 from .. import bfd as bfd_text
 from .. import igp as igp_text
 from .. import routemap as routemap_text
@@ -120,6 +121,9 @@ class Writer:
         routemap_text.unsupported(self.device, self.report, "AOS-S")
         bfd_text.unsupported(self.device, self.report, "AOS-S")
         igp_text.unsupported(self.device, self.report, "AOS-S")
+        multicast_text.pim_unsupported(self.device, self.report, "AOS-S")
+        if multicast_text.stated(self.device):
+            self.report.item("vlan", multicast_text.LABEL)
         routemap_text.ospf_maps_unsupported(self.device, self.report, "AOS-S")
         vrfs_text.mlag_unsupported(self.device, self.report, "AOS-S",
                                    "AOS-S pairs switches with distributed trunking; configure it by hand")
@@ -661,6 +665,10 @@ class Writer:
                 self.out += [_IND + line for line in self._svi(svi)]
             elif vid != 1 or self.untagged.get(1) or self.tagged.get(1):
                 self.out.append(f"{_IND}no ip address")
+            if vid in multicast_text.snooped(self.device):
+                self.out.append(f"{_IND}ip igmp")  # snooping, with the querier on
+                if vid not in multicast_text.queriers(self.device):
+                    self.out.append(f"{_IND}no ip igmp querier")
             self.out.append(_IND + "exit")
             if vid in self.device.vlans:
                 self.report.item("vlan", str(vid))

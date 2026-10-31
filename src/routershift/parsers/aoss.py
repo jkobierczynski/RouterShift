@@ -737,6 +737,10 @@ class _Reader:
                     l3().ipv4.append(str(ipaddress.ip_interface(c[2])))
                 elif c[:2] == ["ipv6", "address"] and len(c) == 3 and "/" in c[2]:
                     l3().ipv6.append(str(ipaddress.ip_interface(c[2])))
+                elif c == ["ip", "igmp"]:  # snooping, and the querier unless it is switched off
+                    vlan.igmp_snooping = vlan.igmp_querier = True
+                elif c == ["no", "ip", "igmp", "querier"]:
+                    vlan.igmp_querier = False
                 elif c[1:2] == ["access-group"] and c[0] in ("ip", "ipv6") and c[-1] in ("in", "out"):
                     self._access_group(l3(), c)
                 elif c[:2] == ["ip", "helper-address"] and len(c) == 3:

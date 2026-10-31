@@ -17,6 +17,7 @@ from routershift import vpn as vpn_text
 from routershift import vrfs as vrfs_text
 from routershift import bfd as bfd_text
 from routershift import igp as igp_text
+from routershift import multicast as multicast_text
 from routershift import routemap as routemap_text
 from routershift import ospf as ospf_text
 from routershift.acl import safe_name
@@ -346,4 +347,18 @@ def test_converts_and_reads_back(source: str, target: str) -> None:
         ports = lambda dev: sorted((i.isis_passive, i.isis_metric or 0, i.isis_network)  # noqa: E731
                                    for i in dev.interfaces.values() if i.isis)
         assert ports(back) == ports(first)
+    # IGMP snooping keeps the VLANs that snoop and (but on AOS-CX; IOS sets it for all) the querier; multicast routing
+    # its RPs and the PIM mode (EOS runs sparse) and IGMP version of every interface (AOS-S writes none of it)
+    assert multicast_text.snooped(back) == multicast_text.snooped(first)
+    if target == "ios" and multicast_text.queriers(first):
+        assert multicast_text.queriers(back) == multicast_text.snooped(first)
+    elif target != "aoscx":
+        assert multicast_text.queriers(back) == multicast_text.queriers(first)
+    if target == "aoss":
+        assert not multicast_text.uses_pim(back)
+    else:
+        assert (back.multicast_routing, back.pim_rps) == (first.multicast_routing, first.pim_rps)
+        pim = lambda dev: sorted(("sparse" if target == "eos" and i.pim else i.pim, i.igmp_version or 0)  # noqa: E731
+                                 for i in dev.interfaces.values() if i.pim or i.igmp_version)
+        assert pim(back) == pim(first)
     assert report.counts()

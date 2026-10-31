@@ -10,6 +10,7 @@ import ipaddress
 from typing import Callable, Dict, List, Tuple
 
 from .. import acl as acl_text
+from .. import multicast as multicast_text
 from .. import bfd as bfd_text
 from .. import igp as igp_text
 from .. import routemap as routemap_text
@@ -554,6 +555,10 @@ class Writer:
     def vlans(self) -> None:
         voice = {i.voice_vlan for i in self.device.interfaces.values() if i.voice_vlan is not None}
         snooped = set(l2sec_text.snooping_vlans_written(self.device, self.report))
+        igmp = multicast_text.snooped(self.device)
+        if multicast_text.stated(self.device):
+            self.report.item("vlan", multicast_text.LABEL)
+            multicast_text.querier_unsupported(self.device, self.report, "AOS-CX")
         if self.device.dhcp_snooping or snooped:
             self.out.append("dhcpv4-snooping")
             self.report.item("vlan", "DHCP snooping")
@@ -571,7 +576,13 @@ class Writer:
                 self.out.append(f"{_IND}dhcpv4-snooping")
             if vlan.arp_inspection:
                 self.out.append(f"{_IND}arp inspection")
+            if vlan.vlan_id in igmp:
+                self.out.append(f"{_IND}ip igmp snooping enable")
             self.report.item("vlan", str(vlan.vlan_id))
+        d = self.device
+        if d.multicast_routing or d.pim_rps:
+            self.report.item("system", "multicast routing")
+            self.out += ["router pim", f"{_IND}enable"] + [f"{_IND}rp-address {rp}" for rp in d.pim_rps]
 
     # interfaces ------------------------------------------------------------------------------------------------------
 
@@ -622,6 +633,14 @@ class Writer:
                 add(Severity.REVIEW, "acl-missing", f"ACL {acl_name} is applied but not defined; left out")
         lines += self._fhrp(iface, name)
         lines += self._ospf_interface(iface)
+        if iface.pim or iface.igmp_version is not None:
+            lines.append("ip igmp enable")
+        if iface.pim:
+            lines.append(f"ip pim-{'dense' if iface.pim == 'dense' else 'sparse'} enable")
+            if iface.pim == "sparse-dense":
+                add(Severity.APPROX, "pim-mode", "PIM sparse-dense mode written as sparse mode")
+        if iface.igmp_version is not None:
+            lines.append(f"ip igmp version {iface.igmp_version}")
         lines += self._port_access_interface(iface, add)
         lines += self._qos_interface(iface, add)
         lines += [f"no lldp {name}" for name, on in (("transmit", iface.lldp_tx), ("receive", iface.lldp_rx)) if not on]

@@ -144,6 +144,8 @@ class Vlan:
     shutdown: bool = False
     dhcp_snooping: bool = False  # DHCP snooping on the VLAN
     arp_inspection: bool = False  # dynamic ARP inspection on the VLAN
+    igmp_snooping: Optional[bool] = None  # IGMP snooping switched on or off for the VLAN; None = not stated
+    igmp_querier: bool = False  # the switch sends IGMP queries in the VLAN
     origin: Origin = field(default_factory=Origin)
 
 
@@ -211,6 +213,8 @@ class Interface:
     isis_passive: bool = False  # IS-IS advertises the interface's prefixes but forms no adjacency on it
     isis_metric: Optional[int] = None
     isis_network: str = ""  # "", "point-to-point"
+    pim: str = ""  # PIM mode: "", "sparse", "dense", "sparse-dense"
+    igmp_version: Optional[int] = None  # IGMP version towards hosts (2, 3)
     pbr: str = ""  # policy-based routing: the route map (Comware policy-based-route, EOS pbr policy) on received packets
     crypto_map: str = ""  # policy-based IPsec applied on the interface
     tunnel_source: str = ""  # tunnel: a canonical interface name or an address
@@ -737,6 +741,10 @@ class Device:
     wlans: List[Wlan] = field(default_factory=list)
     management: Management = field(default_factory=Management)
     dhcp_snooping: bool = False  # DHCP snooping switched on
+    igmp_snooping: Optional[bool] = None  # IGMP snooping for every VLAN; None = not stated
+    igmp_querier: bool = False  # IGMP querier in every VLAN that snoops (IOS ip igmp snooping querier)
+    multicast_routing: bool = False
+    pim_rps: List[str] = field(default_factory=list)  # static PIM rendezvous point addresses
     mlag: Optional[Mlag] = None
     qos_classes: Dict[str, QosClass] = field(default_factory=dict)
     qos_policies: Dict[str, QosPolicy] = field(default_factory=dict)
