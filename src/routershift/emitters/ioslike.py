@@ -24,6 +24,7 @@ from .. import stp as stp_text
 from .. import aaa as aaa_text
 from .. import vpn as vpn_text
 from .. import vrfs as vrfs_text
+from .. import routemap as routemap_text
 from .. import wlan as wlan_text
 from ..model import (AaaMethod, AaaServer, LocalUser, AclAction, Bgp, BgpNeighbor, Device, DhcpPool, IkePolicy, IpsecPeer, NatRule, SnmpGroup, FhrpGroup, Interface, InterfaceKind, LacpMode, Ospf,
                      StaticRoute, StpMode, SwitchportMode)
@@ -85,6 +86,7 @@ class Writer:
         self.mpls()
         for iface in self.device.interfaces.values():
             self.interface(iface)
+        self.policies()
         self.routing()
         self.acls()
         self.nat()
@@ -924,13 +926,16 @@ class Writer:
         for area, kind in p.area_types.items():
             lines.append(f"area {self._area(area)} {kind}")
         for source in p.redistribute:
+            written = source
             if source == "bgp":
                 if self.device.bgp is None:
                     self.report.add("ospf", label, Severity.REVIEW, "ospf-redistribute",
                                     "redistribution of BGP left out: there is no BGP process")
                     continue
-                source = f"bgp {self.device.bgp.local_as}" if self.ios else "bgp"
-            lines.append(f"redistribute {source}" + (" subnets" if self.ios else ""))
+                written = f"bgp {self.device.bgp.local_as}" if self.ios else "bgp"
+            rm = p.redistribute_maps.get(source)
+            lines.append(f"redistribute {written}" + (" subnets" if self.ios else "") +
+                         (f" route-map {rm}" if rm else ""))
         if p.default_originate:
             lines.append("default-information originate" + (" always" if p.default_originate == "always" else ""))
         self.out.append(header)
@@ -967,7 +972,8 @@ class Writer:
                 else:
                     body.append(f"network {net}")
             for source in bgp.redistribute6 if af == "ipv6" else bgp.redistribute:
-                body.append(self._bgp_redistribute(source))
+                rm = bgp.redistribute_maps.get(source) if af == "ipv4" else None
+                body.append(self._bgp_redistribute(source) + (f" route-map {rm}" if rm else ""))
             for group in bgp.peer_groups.values():  # IOS takes a group's options per address family
                 if self.ios and any(af in n.families for n in bgp.neighbors if n.peer_group == group.address):
                     body += self._bgp_af_options(group)
@@ -1019,7 +1025,23 @@ class Writer:
             lines.append(f"neighbor {peer.address} next-hop-self")
         if peer.send_community:
             lines.append(f"neighbor {peer.address} send-community")
+        for kind in ("route-map", "prefix-list"):
+            for direction in ("in", "out"):
+                name = getattr(peer, f"{kind.replace('-', '_')}_{direction}")
+                if name:
+                    lines.append(f"neighbor {peer.address} {kind} {name} {direction}")
         return lines
+
+    def policies(self) -> None:
+        """Prefix lists, then the route maps that match them."""
+        routemap_text.items(self.device, self.report)
+        platform = "ios" if self.ios else "eos"
+        for pl in self.device.prefix_lists.values():
+            self.out += routemap_text.ios_prefix_lines(pl, platform)
+        if self.device.prefix_lists and self.ios:
+            self.out.append("!")
+        for rm in self.device.route_maps.values():
+            self.out += routemap_text.ios_route_map_lines(rm, platform, self.report, self.ind)
 
     def _bgp_redistribute(self, source: str) -> str:
         if source == "ospf" and self.ios:

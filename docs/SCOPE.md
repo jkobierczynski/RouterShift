@@ -53,7 +53,8 @@ platform converts to and from all the others.
 | LDAP and Kerberos servers (listed under "Not understood") | to come | 3+ |
 | VRF route leaking: route distinguisher, import and export route targets | `VrfInfo` | 4 (done) |
 | Multi-chassis LAG: EOS MLAG and AOS-CX VSX (peer link, keepalive, shared LAGs) | `Mlag`, `Interface.mlag_id` | 4 (done) |
-| Route maps, prefix lists, vPC (NX-OS), VXLAN/EVPN | to come | 3+ |
+| Prefix lists and route maps (Comware route policies), on BGP neighbors and redistribution | `PrefixList`, `RouteMap`, `BgpNeighbor.route_map_*` | 4 (done) |
+| vPC (NX-OS), VXLAN/EVPN | to come | 3+ |
 
 ### AOS-S specifics
 
@@ -212,6 +213,23 @@ platform converts to and from all the others.
   VLAN, and from Comware the VLANs defined are listed; IOS limits all unicast and the others unknown unicast; AOS-S
   limits broadcast only, and AOS-S and Comware take whole percents; AOS-CX rate-limits in kbps or pps, so storm
   control is left to a person.
+
+## Prefix lists and route maps
+
+* Prefix lists keep their sequence numbers, actions, prefixes and length ranges (ge, le); IPv4 and IPv6. IOS and AOS-CX
+  write one line per entry, EOS a block, Comware `ip prefix-list NAME index N permit A LEN greater-equal X
+  less-equal Y`.
+* Route maps keep their numbered entries (permit, deny), descriptions, matches (prefix lists, ACLs, tags) and sets:
+  local preference, metric (MED, OSPF cost), weight, tag, next hop, origin, AS path prepend and communities (with
+  additive). Comware writes them as route policies: `if-match`, and `apply local-preference|cost|preferred-value|tag|
+  ip-address next-hop|origin|as-path ... additive|community`.
+* BGP neighbors and peer groups keep their route maps and prefix lists in and out (Comware `peer X route-policy|
+  prefix-list NAME import|export`), and BGP and OSPF redistribution its route map (Comware `import-route ...
+  route-policy`).
+* Reported limits: EOS, AOS-CX and Comware match one prefix list, ACL or tag per entry (the first is written); AOS-CX
+  route maps match no ACLs (the entry is written without the match); AOS-S writes no prefix lists or route maps, and
+  its OSPF redistribution goes without the route map. Other match and set clauses (continue, communities lists, ...)
+  are listed under "Not understood".
 
 ## VRF route leaking
 

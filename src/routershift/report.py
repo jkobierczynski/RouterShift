@@ -69,6 +69,7 @@ _KIND_TITLES = [
     ("mpls", "MPLS"),
     ("bgp", "BGP"),
     ("acl", "Access lists"),
+    ("policy", "Prefix lists and route maps"),
     ("dhcp", "DHCP server"),
     ("nat", "NAT"),
     ("vpn", "Site-to-site VPN (IPsec)"),
