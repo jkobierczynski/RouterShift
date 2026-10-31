@@ -19,6 +19,7 @@ from routershift import bfd as bfd_text
 from routershift import igp as igp_text
 from routershift import multicast as multicast_text
 from routershift import monitor as monitor_text
+from routershift import hosts as hosts_text
 from routershift import routemap as routemap_text
 from routershift import ospf as ospf_text
 from routershift.acl import safe_name
@@ -401,4 +402,20 @@ def test_converts_and_reads_back(source: str, target: str) -> None:
     decrements = lambda dev, names=None: sorted(dec for i in dev.interfaces.values() for g in i.fhrp  # noqa: E731
                                                 for t, dec in g.tracks.items() if names is None or t in names)
     assert decrements(back) == decrements(first, kept)
+    # the DNS client keeps lookup off (IOS), search domains (not AOS-S), source interface (IOS, EOS, Comware) and static
+    # hosts (not AOS-S); PoE ports keep off (Comware: off by default), priority (the nearest the target has) and limit
+    # (IOS, EOS, Comware)
+    fs, bs = first.system, back.system
+    assert (bs.dns_lookup is False) == (fs.dns_lookup is False and target == "ios")
+    assert bs.dns_search == ([] if target == "aoss" else fs.dns_search)
+    assert bool(bs.dns_source) == (bool(fs.dns_source) and target in ("ios", "eos", "comware"))
+    assert bs.dns_hosts == ({} if target == "aoss" else fs.dns_hosts)
+    allowed = {"ios": ("low", "high"), "eos": hosts_text.PRIORITIES}.get(target, ("low", "high", "critical"))
+    on = lambda dev: [i for i in dev.interfaces.values() if i.poe is not False]  # noqa: E731
+    assert sum(1 for i in back.interfaces.values() if i.poe is False) == \
+        (0 if target == "comware" else sum(1 for i in first.interfaces.values() if i.poe is False))
+    assert sorted(i.poe_priority for i in on(back) if i.poe_priority) == \
+        sorted(hosts_text.poe_priority(i, allowed, lambda *a: None, target) for i in on(first) if i.poe_priority)
+    assert sorted(i.poe_max_mw for i in on(back) if i.poe_max_mw) == \
+        (sorted(i.poe_max_mw for i in on(first) if i.poe_max_mw) if target in ("ios", "eos", "comware") else [])
     assert report.counts()

@@ -63,6 +63,8 @@ platform converts to and from all the others.
 | sFlow: collectors, agent address, sampling rate, polling interval, sampled ports (not IOS) | `Sflow`, `Interface.sflow` | 4 (done) |
 | NetFlow: collectors, export version, source interface, ports by direction (IOS, Comware) | `Netflow`, `Interface.flow` | 4 (done) |
 | IP SLA (ICMP echo; Comware NQA), tracked objects (probe reachability, interface line protocol), tracked static routes and gateway groups (IOS, Comware; EOS interface tracks) | `IpSla`, `Track`, `StaticRoute.track`, `FhrpGroup.tracks` | 4 (done) |
+| DNS client: name lookup off, search domains, source interface, static hosts | `System.dns_*` | 4 (done) |
+| PoE per port: on/off, priority, power limit | `Interface.poe*` | 4 (done) |
 | vPC (NX-OS), VXLAN/EVPN | to come | 3+ |
 
 ### AOS-S specifics
@@ -297,6 +299,21 @@ platform converts to and from all the others.
   T decrement D`, `vrrp N track T decrement D` and `track T decrement D` in a VRRPv3 block, EOS `vrrp N
   tracked-object T decrement D`, Comware `vrrp vrid N track T priority reduced D`. A decrement left out in the
   source is 10, the IOS and Comware default.
+
+## DNS client and PoE
+
+* Besides the domain name and servers, the DNS client keeps: name lookup switched off (IOS `no ip domain lookup`;
+  reported elsewhere), search domains (IOS `ip domain list`, EOS `ip domain-list`, AOS-CX `ip dns domain-list`,
+  Comware further `dns domain` lines after the first), the source interface (IOS and EOS `ip domain lookup
+  source-interface`, Comware `dns source-interface`) and static hosts (IOS and EOS `ip host`, AOS-CX `ip dns host`,
+  Comware `ip host`). What a target has no setting for is reported in one line (AOS-S has none of these).
+* PoE per port keeps on or off as stated, the priority and the power limit: IOS `power inline never`, `power inline
+  auto max MW`, `power inline port priority low|high`; EOS `poe disabled`, `poe priority low|medium|high|critical`,
+  `poe limit W watts`; AOS-CX `no power-over-ethernet`, `power-over-ethernet priority`; AOS-S `no
+  power-over-ethernet`, `power-over-ethernet low|high|critical`; Comware `poe enable` (off by default), `poe
+  priority`, `poe max-power MW`. A priority the target lacks becomes the nearest (reported); the Aruba limit is
+  reported. Only stated settings convert: a port that powers by default on IOS, EOS or the Aruba switches gets no
+  `poe enable` on Comware unless the source says so.
 
 ## RIP and IS-IS
 

@@ -401,6 +401,21 @@ class _Reader:
             return True
         if w[1:2] == ["routing"]:
             return True  # implied by the presence of layer 3 configuration
+        if w[1:3] in (["domain", "lookup"], ["domain-lookup"]) or w[1:2] == ["domain-lookup"]:
+            rest = w[2:] if w[1] == "domain-lookup" else w[3:]
+            if rest == []:
+                self.device.system.dns_lookup = True
+            elif rest[:1] == ["source-interface"] and len(rest) >= 2:
+                self.device.system.dns_source = names.canonical(" ".join(rest[1:]))[0]
+            else:
+                return False
+            return True
+        if (w[1:3] == ["domain", "list"] and len(w) == 4) or (w[1:2] == ["domain-list"] and len(w) == 3):
+            self.device.system.dns_search.append(w[-1])
+            return True
+        if w[1:2] == ["host"] and len(w) == 4 and _is_address(w[3]):
+            self.device.system.dns_hosts[w[2]] = w[3]
+            return True
         if w[1:2] in (["domain-name"], ["domain"]) and len(w) >= 3:
             name = w[3] if w[2] == "name" and len(w) == 4 else w[2]
             self.device.system.domain_name = name
@@ -1255,6 +1270,26 @@ class _Reader:
             return False
         return True
 
+    @staticmethod
+    def _poe_line(iface: Interface, w: List[str]) -> bool:
+        """IOS power inline never | auto [max MW] | port priority P; EOS poe disabled | priority P | limit W watts."""
+        n = len(w)
+        if w == ["power", "inline", "never"] or w == ["poe", "disabled"]:
+            iface.poe = False
+        elif w[:3] == ["power", "inline", "auto"] and n in (3, 5) and w[3:4] in ([], ["max"]):
+            iface.poe = True
+            if n == 5:
+                iface.poe_max_mw = int(w[4])
+        elif w[:4] == ["power", "inline", "port", "priority"] and n == 5 and w[4] in ("high", "low"):
+            iface.poe_priority = w[4]
+        elif w[:2] == ["poe", "priority"] and n == 3 and w[2] in ("low", "medium", "high", "critical"):
+            iface.poe_priority = w[2]
+        elif w[:2] == ["poe", "limit"] and n == 4 and w[3] == "watts":
+            iface.poe_max_mw = round(float(w[2]) * 1000)
+        else:
+            return False
+        return True
+
     def ip_sla(self, node: Node, name: str) -> bool:
         """ip sla N / icmp-echo A [source-interface X | source-ip A] / frequency, timeout, vrf (beside it or under
         it)."""
@@ -1777,6 +1812,9 @@ class _Reader:
         m = self.device.management
         if w[1:4] == ["ip", "igmp", "snooping"]:
             return self.igmp_snooping(w[4:], False)
+        if w[1:] in (["ip", "domain", "lookup"], ["ip", "domain-lookup"]):
+            self.device.system.dns_lookup = False
+            return True
         if w[1:] in (["lldp", "run"], ["cdp", "run"]):
             setattr(m, w[1], False)
             return True
@@ -2294,6 +2332,8 @@ class _Reader:
             self._sflow_off.append(iface.name)
         elif w == ["sflow", "enable"] and self.device.platform == "eos":
             pass
+        elif w[:2] == ["power", "inline"] or w[0] == "poe":
+            return self._poe_line(iface, w)
         elif w == ["isis", "passive"]:
             iface.isis = iface.isis_passive = True
         elif w[:2] == ["isis", "metric"] and n in (3, 4) and w[3:] in ([], ["level-1"], ["level-2"]):

@@ -43,6 +43,8 @@ Port mirroring (SPAN) and sFlow convert on every platform; NetFlow between IOS (
 and Comware (NetStream), and is flagged elsewhere, as is sFlow on IOS.
 IP SLA probes (Comware NQA) and tracked objects convert between IOS and Comware with the static routes
 and gateway groups that use them; EOS takes the interface tracks, and the rest is flagged.
+The DNS client (lookup switch, search domains, source interface, static hosts) and PoE per port
+(on/off, priority, power limit) convert as far as each platform has the setting.
 Everything else (LDAP, ...) is listed in the report under "Not understood", line by
 line, with secrets masked.
 

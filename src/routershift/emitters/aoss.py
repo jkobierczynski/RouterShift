@@ -28,6 +28,7 @@ from .. import vrfs as vrfs_text
 from .. import multicast as multicast_text
 from .. import monitor as monitor_text
 from .. import tracking as tracking_text
+from .. import hosts as hosts_text
 from .. import bfd as bfd_text
 from .. import igp as igp_text
 from .. import routemap as routemap_text
@@ -253,6 +254,7 @@ class Writer:
             self.out.append(f"ip dns server-address priority {n} {server}")
         if s.dns_servers:
             rep.item("system", "name servers")
+        hosts_text.dns_unsupported(self.device, rep, "AOS-S")
         for host in s.syslog_servers:
             self.out.append(f"logging {host}")
         if s.syslog_servers:
@@ -642,6 +644,15 @@ class Writer:
                                  f"AOS-S takes whole percents: broadcast limit {level:g}% written as {round(level)}%")
                     lines.append(f"broadcast-limit {round(level)}")
             lines += self.mirror_lines.get(iface.name, [])
+            if hosts_text.poe_stated(iface):
+                add = lambda sev, code, msg, i=iface: self.add(i, sev, code, msg)  # noqa: E731
+                if iface.poe is False:
+                    lines.append("no power-over-ethernet")
+                else:
+                    priority = hosts_text.poe_priority(iface, ("low", "high", "critical"), add, "AOS-S")
+                    if priority:
+                        lines.append(f"power-over-ethernet {priority}")
+                    hosts_text.poe_limit(iface, add, "AOS-S", False)
             if iface.shutdown:
                 lines.append("disable")
             if iface.speed is not None:

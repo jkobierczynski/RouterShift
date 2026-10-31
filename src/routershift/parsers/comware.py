@@ -250,7 +250,14 @@ class _Reader:
     def dns(self, node: Node) -> bool:
         w = node.words
         if w[1:2] == ["domain"] and len(w) == 3:
-            self.device.system.domain_name = w[2]
+            s = self.device.system
+            if s.domain_name:  # the domains after the first are tried in turn
+                s.dns_search.append(w[2])
+            else:
+                s.domain_name = w[2]
+            return True
+        if w[1:2] == ["source-interface"] and len(w) == 3:
+            self.device.system.dns_source = canonical(w[2])[0]
             return True
         if w[1:2] == ["server"]:
             self.device.system.dns_servers.extend(self._vpn(w[2:]))
@@ -830,6 +837,9 @@ class _Reader:
 
     def ip(self, node: Node) -> bool:
         w = node.words
+        if w[1:2] == ["host"] and len(w) == 4:
+            self.device.system.dns_hosts[w[2]] = str(ipaddress.ip_address(w[3]))
+            return True
         if w[1:3] == ["netstream", "export"] and not node.children:
             return self.netstream_export(node, w[3:])
         if w[1:2] == ["prefix-list"]:
@@ -1546,6 +1556,8 @@ class _Reader:
         name = iface.name
         if w[0] in ("mirroring-group", "sflow") or w[:2] == ["ip", "netstream"]:
             return self.monitor_line(iface, w)
+        if w[0] == "poe" or w == ["undo", "poe", "enable"]:
+            return self.poe_line(iface, w)
         if w[0] in ("dot1x", "mac-authentication"):
             return self.dot1x_line(iface, w)
         if w[0] == "description":
@@ -1842,6 +1854,19 @@ class _Reader:
             nf.version = int(w[1])
         elif w[:2] == ["source", "interface"] and len(w) == 3:
             nf.source_interface = canonical(w[2])[0]
+        else:
+            return False
+        return True
+
+    @staticmethod
+    def poe_line(iface: Interface, w: List[str]) -> bool:
+        """poe enable, undo poe enable, poe priority P, poe max-power MW."""
+        if w in (["poe", "enable"], ["undo", "poe", "enable"]):
+            iface.poe = w[0] == "poe"
+        elif w[:2] == ["poe", "priority"] and len(w) == 3 and w[2] in ("low", "high", "critical"):
+            iface.poe_priority = w[2]
+        elif w[:2] == ["poe", "max-power"] and len(w) == 3:
+            iface.poe_max_mw = int(w[2])
         else:
             return False
         return True

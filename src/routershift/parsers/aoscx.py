@@ -200,6 +200,12 @@ class _Reader:
         if w[1:3] == ["dns", "server-address"]:
             self.device.system.dns_servers.extend(self._service_vrf(w[3:]))
             return True
+        if w[1:3] == ["dns", "domain-list"] and len(w) == 4:
+            self.device.system.dns_search.append(w[3])
+            return True
+        if w[1:3] == ["dns", "host"] and len(w) == 5:
+            self.device.system.dns_hosts[w[3]] = str(ipaddress.ip_address(w[4]))
+            return True
         if w[1:2] == ["route"]:
             return self.route(node, w[2:])
         return False
@@ -1041,6 +1047,12 @@ class _Reader:
             iface.pim = w[1][len("pim-"):]
         elif w == ["sflow"]:
             iface.sflow = True
+        elif w == ["no", "power-over-ethernet"]:
+            iface.poe = False
+        elif w == ["power-over-ethernet"]:
+            iface.poe = True
+        elif w[:2] == ["power-over-ethernet", "priority"] and len(w) == 3 and w[2] in ("low", "high", "critical"):
+            iface.poe_priority = w[2]
         elif w == ["ip", "igmp", "enable"]:
             pass  # written wherever PIM or an IGMP version is
         elif w[:3] == ["ip", "igmp", "version"] and n == 4 and w[3] in ("2", "3"):

@@ -13,6 +13,7 @@ from .. import acl as acl_text
 from .. import multicast as multicast_text
 from .. import monitor as monitor_text
 from .. import tracking as tracking_text
+from .. import hosts as hosts_text
 from .. import bfd as bfd_text
 from .. import igp as igp_text
 from .. import routemap as routemap_text
@@ -154,6 +155,9 @@ class Writer:
         if s.dns_servers:
             self.out.append(f"ip dns server-address {' '.join(s.dns_servers)}{via}")
             rep.item("system", "name servers")
+        hosts_text.dns_unsupported(self.device, rep, "AOS-CX", search=True, hosts=True)
+        self.out += [f"ip dns domain-list {d}" for d in s.dns_search]
+        self.out += [f"ip dns host {name} {address}" for name, address in s.dns_hosts.items()]
         severity = f" severity {mgmt_text.SHORT[s.logging_level]}" if s.logging_level is not None else ""
         for host in s.syslog_servers:
             self.out.append(f"logging {host}{severity}{via}")
@@ -677,6 +681,14 @@ class Writer:
             lines.append(f"ip igmp version {iface.igmp_version}")
         if iface.sflow and self.device.sflow is not None and not monitor_text.all_ports(self.device):
             lines.append("sflow")
+        if hosts_text.poe_stated(iface):
+            if iface.poe is False:
+                lines.append("no power-over-ethernet")
+            else:
+                priority = hosts_text.poe_priority(iface, ("low", "high", "critical"), add, "AOS-CX")
+                if priority:
+                    lines.append(f"power-over-ethernet priority {priority}")
+                hosts_text.poe_limit(iface, add, "AOS-CX", False)
         lines += self._port_access_interface(iface, add)
         lines += self._qos_interface(iface, add)
         lines += [f"no lldp {name}" for name, on in (("transmit", iface.lldp_tx), ("receive", iface.lldp_rx)) if not on]
