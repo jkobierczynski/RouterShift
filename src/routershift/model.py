@@ -96,6 +96,25 @@ class System:
 
 
 @dataclass
+class VrfInfo:
+    """What a VRF shares with others: its route distinguisher and the route targets it imports and exports."""
+    rd: str = ""
+    rt_import: List[str] = field(default_factory=list)
+    rt_export: List[str] = field(default_factory=list)
+
+
+@dataclass
+class Mlag:
+    """A pair of switches that share LAGs (EOS MLAG, AOS-CX VSX). The peer link and local interface are canonical
+    names."""
+    domain: str = ""
+    peer_link: str = ""
+    peer_address: str = ""  # the peer's address on the peer link (EOS) or keepalive (AOS-CX)
+    local_interface: str = ""  # the SVI on the peer link (EOS) or the keepalive source (AOS-CX)
+    role: str = ""  # primary or secondary (AOS-CX)
+
+
+@dataclass
 class Management:
     """How the device is managed: its login servers and their limits, and neighbor discovery. None means the
     source does not say, and the target keeps its own default."""
@@ -179,6 +198,7 @@ class Interface:
     port_security_max: Optional[int] = None  # MAC addresses allowed
     port_security_violation: str = ""  # shutdown, restrict (drop and report) or protect (drop)
     storm_control: Dict[str, float] = field(default_factory=dict)  # broadcast|multicast|unicast|unknown-unicast -> %
+    mlag_id: Optional[int] = None  # the multi-chassis LAG this port-channel is (EOS mlag N, AOS-CX multi-chassis)
     fhrp: List["FhrpGroup"] = field(default_factory=list)
     nat: str = ""  # "inside", "outside" or ""
     ospf_cost: Optional[int] = None
@@ -606,6 +626,7 @@ class Device:
     platform: str = ""  # source platform key: "ios", "eos", "junos", "aoscx", ...
     system: System = field(default_factory=System)
     vrfs: List[str] = field(default_factory=list)
+    vrf_info: Dict[str, VrfInfo] = field(default_factory=dict)
     vlans: Dict[int, Vlan] = field(default_factory=dict)
     interfaces: Dict[str, Interface] = field(default_factory=dict)
     static_routes: List[StaticRoute] = field(default_factory=list)
@@ -625,6 +646,7 @@ class Device:
     wlans: List[Wlan] = field(default_factory=list)
     management: Management = field(default_factory=Management)
     dhcp_snooping: bool = False  # DHCP snooping switched on
+    mlag: Optional[Mlag] = None
     qos_classes: Dict[str, QosClass] = field(default_factory=dict)
     qos_policies: Dict[str, QosPolicy] = field(default_factory=dict)
     snmp: Snmp = field(default_factory=Snmp)

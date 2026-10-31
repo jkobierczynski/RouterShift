@@ -20,6 +20,7 @@ from .. import snmp as snmp_text
 from .. import stp as stp_text
 from .. import l2sec as l2sec_text
 from .. import mgmt as mgmt_text
+from .. import vrfs as vrfs_text
 from .. import mpls as mpls_text
 from .. import qos as qos_text
 from .. import wlan as wlan_text
@@ -78,6 +79,8 @@ class Writer:
         self.routes()
         if self.device.bgp is not None:
             self.bgp()
+        vrfs_text.mlag_unsupported(self.device, self.report, "Comware",
+                                   "Comware pairs switches with IRF or DRNI; configure it by hand")
         self.out.append("return")
         self.report.unparsed(self.device.unparsed)
         return "\n".join(self.out) + "\n"
@@ -465,6 +468,12 @@ class Writer:
         # the management VRF too: Comware binds its management port to a VPN instance like any other interface
         for name in self.device.vrfs:
             self.out.append(f"ip vpn-instance {name}")
+            info = self.device.vrf_info.get(name)
+            if info and info.rd:
+                self.out.append(f"{_IND}route-distinguisher {info.rd}")
+            if info:
+                kinds = {"import": "import-extcommunity", "export": "export-extcommunity", "both": "both"}
+                self.out += [f"{_IND}vpn-target {v} {kinds[d]}" for d, v in vrfs_text.targets(info)]
             self.block_end()
             self.report.item("system", f"vrf {name}")
 

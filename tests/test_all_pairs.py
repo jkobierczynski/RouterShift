@@ -14,6 +14,7 @@ from routershift import qos as qos_text
 from routershift import stp as stp_text
 from routershift import wlan as wlan_text
 from routershift import vpn as vpn_text
+from routershift import vrfs as vrfs_text
 from routershift import ospf as ospf_text
 from routershift.acl import safe_name
 from routershift.convert import PLATFORMS, convert, parse
@@ -258,4 +259,23 @@ def test_converts_and_reads_back(source: str, target: str) -> None:
         assert bgp_text.flat(back.bgp) == bgp_text.flat(first.bgp)
         assert sorted(back.bgp.networks) == sorted(first.bgp.networks)
         assert (back.bgp.redistribute, back.bgp.redistribute6) == (first.bgp.redistribute, first.bgp.redistribute6)
+    # VRF route leaking keeps every route distinguisher and route target outside the management VRF; AOS-S has no
+    # VRFs and EOS sets them under router bgp
+    def leaking(dev: Device) -> list:
+        mgmt = {i.vrf for i in dev.interfaces.values() if i.kind == InterfaceKind.MANAGEMENT}
+        return sorted((v.rd, sorted(vrfs_text.targets(v))) for name, v in dev.vrf_info.items()
+                      if name not in mgmt and (v.rd or v.rt_import or v.rt_export))
+    if target == "aoss" or (target == "eos" and first.bgp is None):
+        assert not vrfs_text.has_leaking(back)
+    else:
+        assert leaking(back) == leaking(first)
+    # a multi-chassis LAG pair (EOS MLAG, AOS-CX VSX) keeps its peer link and shared LAGs on EOS and AOS-CX
+    if (first.mlag is not None or vrfs_text.mlag_members(first)) and target in ("eos", "aoscx"):
+        assert back.mlag is not None and first.mlag is not None
+        assert back.interfaces[back.mlag.peer_link].kind == InterfaceKind.LAG
+        assert len(vrfs_text.mlag_members(back)) == len(vrfs_text.mlag_members(first))
+        if back.mlag.peer_address:
+            assert back.mlag.peer_address == first.mlag.peer_address
+    elif first.mlag is not None:
+        assert back.mlag is None and "multi-chassis LAG" in report.to_text()
     assert report.counts()

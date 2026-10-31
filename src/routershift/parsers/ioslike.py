@@ -21,6 +21,7 @@ from .. import fhrp
 from .. import ospf as ospf_text
 from .. import l2sec as l2sec_text
 from .. import mgmt as mgmt_text
+from .. import vrfs as vrfs_text
 from .. import qos as qos_text
 from .. import confparse, names
 from .. import dhcp as dhcp_text
@@ -29,7 +30,7 @@ from .. import aaa as aaa_text
 from ..confparse import Node
 from ..errors import ParseError
 from ..model import (AaaGroup, AaaMethod, AaaServer, Acl, Device, LocalUser, DhcpPool, FhrpGroup, IkePolicy, IpsecPeer, IpsecTransform, NtpKey, PreSharedKey,
-                     SnmpCommunity, SnmpGroup, SnmpHost, SnmpUser, NatPool, NatRule, Interface, InterfaceKind, LacpMode, Origin, Ospf, OspfNetwork, Wlan,
+                     SnmpCommunity, SnmpGroup, SnmpHost, SnmpUser, NatPool, NatRule, Interface, InterfaceKind, LacpMode, Origin, Ospf, OspfNetwork, Wlan, Mlag,
                      QosAction, QosClass, QosPolicy, StaticRoute, StpMode, SwitchportMode, Unparsed, Vlan)
 
 # Lines that only describe the file or the software, not the device's behaviour.
@@ -143,6 +144,7 @@ class _Reader:
             "cdp": self.discovery,
             "no": self.no_global,
             "management": self.management,
+            "mlag": self.mlag,
         }
         for node in roots:
             if node.text.startswith(_NOISE) or node.text == "end":
@@ -337,6 +339,10 @@ class _Reader:
         m = self.device.management
         if w[1:] == ["dhcp", "snooping"]:
             self.device.dhcp_snooping = True
+            return True
+        if w[1] == "vrf" and len(w) == 3:  # IOS: ip vrf NAME
+            self._add_vrf(w[2])
+            self._vrf_children(w[2], node)
             return True
         if w[1:4] in (["dhcp", "snooping", "vlan"], ["arp", "inspection", "vlan"]) and len(w) == 5:
             for vid in _vlan_ids(w[4]):
@@ -1149,6 +1155,9 @@ class _Reader:
         for child in node.children:
             w = child.words
             af = ""
+            if w[0] == "vrf" and len(w) == 2 and self.device.platform == "eos":
+                self._eos_bgp_vrf(w[1], child)
+                continue
             if w[0] == "address-family" and w[1:] in (["ipv4"], ["ipv4", "unicast"], ["ipv6"], ["ipv6", "unicast"]):
                 af = w[1]
             elif w[0] == "address-family":
@@ -1165,6 +1174,20 @@ class _Reader:
                     self.unparsed(line, child.text if af else node.text)
         self.device.bgp = b.finish()
         return True
+
+    def _eos_bgp_vrf(self, name: str, node: Node) -> None:
+        """EOS: router bgp / vrf NAME with rd and route-target import|export [vpn-ipv4|evpn] X; the rest of a BGP VRF
+        is not converted yet."""
+        info = vrfs_text.info(self.device, name)
+        for child in node.children:
+            c = child.words
+            if c[0] == "rd" and len(c) == 2:
+                info.rd = c[1]
+            elif c[0] == "route-target" and len(c) in (3, 4) and c[2:3] != ["evpn"] and \
+                    vrfs_text.route_target(info, c[1], c[-1]):
+                pass
+            else:
+                self.unparsed(child, node.text)
 
     @staticmethod
     def bgp_line(b: bgp_text.Builder, w: List[str], af: str) -> bool:
@@ -1296,15 +1319,30 @@ class _Reader:
         # IOS XE: vrf definition NAME; EOS: vrf instance NAME (or vrf definition on older releases)
         if len(w) == 3 and w[1] in ("definition", "instance"):
             self._add_vrf(w[2])
-            for child in node.children:
-                if child.words[0] in ("rd", "description", "address-family", "exit-address-family"):
-                    if child.words[0] == "address-family" and any(
-                            c.words[0] != "exit-address-family" for c in child.children):
-                        self.unparsed(child, node.text)
-                    continue
-                self.unparsed(child, node.text)
+            self._vrf_children(w[2], node)
             return True
         return False
+
+    def _vrf_children(self, name: str, node: Node) -> None:
+        """rd, route-target import|export|both X (directly, or in address-family ipv4 as on IOS XE)."""
+        for child in node.children:
+            c = child.words
+            if c[0] == "rd" and len(c) == 2:
+                vrfs_text.info(self.device, name).rd = c[1]
+            elif c[0] == "route-target" and len(c) == 3 and vrfs_text.route_target(
+                    vrfs_text.info(self.device, name), c[1], c[2]):
+                pass
+            elif c[0] == "address-family" and c[1:2] == ["ipv4"]:
+                for g in child.children:
+                    gw = g.words
+                    if gw == ["exit-address-family"] or gw[0] == "route-target" and len(gw) == 3 and \
+                            vrfs_text.route_target(vrfs_text.info(self.device, name), gw[1], gw[2]):
+                        continue
+                    self.unparsed(g, child.text)
+            elif c[0] in ("description", "exit-address-family") or c[0] == "address-family" and not child.children:
+                pass
+            else:
+                self.unparsed(child, node.text)
 
     def spanning_tree(self, node: Node) -> bool:
         w = node.words
@@ -1383,6 +1421,21 @@ class _Reader:
             setattr(m, "http" if w[3] == "server" else "https", False)
             return True
         return False
+
+    def mlag(self, node: Node) -> bool:
+        """EOS: mlag configuration with domain-id, local-interface, peer-address and peer-link."""
+        if node.words[1:] != ["configuration"]:
+            return False
+        m = self.device.mlag = Mlag()
+        for child in node.children:
+            c = child.words
+            if len(c) == 2 and c[0] in ("domain-id", "peer-address"):
+                setattr(m, "domain" if c[0] == "domain-id" else "peer_address", c[1])
+            elif len(c) == 2 and c[0] in ("local-interface", "peer-link"):
+                setattr(m, c[0].replace("-", "_"), names.canonical(c[1])[0])
+            else:
+                self.unparsed(child, node.text)
+        return True
 
     def management(self, node: Node) -> bool:
         """EOS: management ssh (shutdown, idle-timeout, ip access-group, vrf V with no shutdown) and management
@@ -1845,6 +1898,8 @@ class _Reader:
             iface.qos_trust = "none" if w[2] == "disabled" else w[2]
         elif w in (["no", "lldp", "transmit"], ["no", "lldp", "receive"]):
             setattr(iface, "lldp_tx" if w[2] == "transmit" else "lldp_rx", False)
+        elif w[0] == "mlag" and n == 2 and w[1].isdigit():
+            iface.mlag_id = int(w[1])
         elif w in (["cdp", "enable"], ["no", "cdp", "enable"]):
             iface.cdp = w[0] == "cdp"
         elif w == ["mpls", "ip"] or w == ["mpls", "ldp", "interface"]:

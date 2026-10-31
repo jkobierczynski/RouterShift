@@ -24,6 +24,7 @@ from .. import mpls as mpls_text
 from .. import nat as nat_text
 from .. import wlan as wlan_text
 from .. import vpn as vpn_text
+from .. import vrfs as vrfs_text
 from .. import fhrp
 from .. import ospf as ospf_text
 from .. import stp as stp_text
@@ -112,6 +113,9 @@ class Writer:
         mpls_text.unsupported(self.device, self.report, "AOS-S")
         wlan_text.unsupported(self.device, self.report, "AOS-S")
         vpn_text.skip_all(self.device, self.report, "AOS-S")
+        vrfs_text.no_vrfs(self.device, self.report, "AOS-S")
+        vrfs_text.mlag_unsupported(self.device, self.report, "AOS-S",
+                                   "AOS-S pairs switches with distributed trunking; configure it by hand")
         if self.device.bgp is not None:
             self.report.skip("bgp", f"bgp {self.device.bgp.local_as}", "bgp",
                              "not written: BGP on AOS-S depends on the model and release; configure it by hand")

@@ -51,7 +51,9 @@ platform converts to and from all the others.
 | Management access: SSH, Telnet, HTTP and HTTPS servers, remote login ACL and idle timeout, syslog level and source, LLDP and CDP | `Management`, `System.logging_*`, `Interface.lldp_*` | 3 (done) |
 | L2 security: DHCP snooping and ARP inspection (per VLAN, trusted ports), IP source guard, port security, storm control | `Vlan.dhcp_snooping`, `Vlan.arp_inspection`, `Interface.dhcp_trust` ... | 4 (done) |
 | LDAP and Kerberos servers (listed under "Not understood") | to come | 3+ |
-| Route maps, prefix lists, MLAG/VSX/vPC, VXLAN/EVPN | to come | 3+ |
+| VRF route leaking: route distinguisher, import and export route targets | `VrfInfo` | 4 (done) |
+| Multi-chassis LAG: EOS MLAG and AOS-CX VSX (peer link, keepalive, shared LAGs) | `Mlag`, `Interface.mlag_id` | 4 (done) |
+| Route maps, prefix lists, vPC (NX-OS), VXLAN/EVPN | to come | 3+ |
 
 ### AOS-S specifics
 
@@ -210,6 +212,29 @@ platform converts to and from all the others.
   VLAN, and from Comware the VLANs defined are listed; IOS limits all unicast and the others unknown unicast; AOS-S
   limits broadcast only, and AOS-S and Comware take whole percents; AOS-CX rate-limits in kbps or pps, so storm
   control is left to a person.
+
+## VRF route leaking
+
+* Each VRF keeps its route distinguisher and its import and export route targets. A target both imported and exported
+  is written as `both` where the platform has it.
+* IOS: `vrf definition` (or `ip vrf`) with `rd` and `route-target import|export|both`, directly or under
+  `address-family ipv4`. EOS: `rd` and `route-target import|export vpn-ipv4` under `vrf V` in `router bgp`. AOS-CX:
+  `rd` and `address-family ipv4 unicast` / `route-target import|export|both` in the `vrf` block. Comware:
+  `route-distinguisher` and `vpn-target V import-extcommunity|export-extcommunity|both` in `ip vpn-instance`.
+* Reported limits: AOS-S has no VRFs; EOS needs `router bgp` for them (without BGP they are left out); the AOS-CX
+  management VRF takes none.
+
+## Multi-chassis LAG (MLAG, VSX)
+
+* The pair keeps its peer link, its keepalive (peer address and source interface) and the LAGs shared by both
+  switches.
+* EOS: `mlag configuration` with `domain-id`, `local-interface`, `peer-address` and `peer-link`, and `mlag N` on a
+  port channel. AOS-CX: `vsx` with `inter-switch-link lag N`, `role` and `keepalive peer A source B [vrf V]`, and
+  `interface lag N multi-chassis`.
+* Reported limits: VSX has no domain name and EOS no role (primary is written to AOS-CX, to be swapped on the peer);
+  the EOS peer address on the peer-link SVI becomes the VSX keepalive, which VSX prefers outside the inter-switch
+  link. IOS (StackWise Virtual), AOS-S (distributed trunking) and Comware (IRF, DRNI) pair switches in other ways,
+  left to a person.
 
 ## Management access, logging, LLDP and CDP
 

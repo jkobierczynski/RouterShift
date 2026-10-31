@@ -28,6 +28,7 @@ from .. import confparse
 from .. import dhcp as dhcp_text
 from .. import ospf as ospf_text
 from .. import mgmt as mgmt_text
+from .. import vrfs as vrfs_text
 from .. import qos as qos_text
 from .. import vpn as vpn_text
 from ..confparse import Node
@@ -730,8 +731,18 @@ class _Reader:
         if w[1:2] == ["vpn-instance"] and len(w) == 3:
             if w[2] not in self.device.vrfs:
                 self.device.vrfs.append(w[2])
+            info = vrfs_text.info(self.device, w[2])
             for child in node.children:
-                if child.words[0] not in ("route-distinguisher", "description"):
+                c = child.words
+                if c[0] == "route-distinguisher" and len(c) == 2:
+                    info.rd = c[1]
+                elif c[0] == "vpn-target" and len(c) >= 2:
+                    kinds = {"import-extcommunity": "import", "export-extcommunity": "export", "both": "both"}
+                    direction = kinds.get(c[-1], "")
+                    values = c[1:-1] if direction else c[1:]
+                    for value in values:
+                        vrfs_text.route_target(info, direction or "both", value)
+                elif c[0] != "description":
                     self.unparsed(child, node.text)
             return True
         if w[1:2] == ["route-static"]:
