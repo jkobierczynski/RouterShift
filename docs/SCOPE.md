@@ -12,7 +12,7 @@ approximated and what a person has to look at.
 | `ios` | Cisco IOS and IOS XE | `show running-config` | CLI configuration | 1 (done) |
 | `eos` | Arista EOS | `show running-config` | CLI configuration | 1 (done) |
 | `junos` | Juniper Junos (EX and QFX with ELS, MX, SRX in switching/routing) | `show configuration`, or `\| display set` | curly braces, for `load merge terminal` | 2 (core done) |
-| `nxos` | Cisco NX-OS | `show running-config` | CLI configuration | 2 |
+| `nxos` | Cisco NX-OS (Nexus 9000/3000, 9.x and 10.x) | `show running-config` | CLI configuration | 2 (core done) |
 | `aoscx` | HPE Aruba AOS-CX (10.x) | `show running-config` | CLI configuration | 1 (done) |
 | `aoss` | HPE Aruba AOS-S (ProCurve / ProVision, 16.x) | `show running-config` | CLI configuration | 1 (done) |
 | `comware` | HPE Comware 7 (FlexFabric, 5130/5140/5510...) | `display current-configuration` | system-view commands | 1 (done) |
@@ -115,6 +115,26 @@ platform converts to and from all the others.
   802.1X, SNMP notifications and v3, port security and storm control, mirroring, sFlow, MPLS, RIP, IS-IS,
   multicast, MC-LAG, VXLAN, RPM tracking, PoE and the voice VLAN. The reader leaves those statements under
   "Not understood".
+
+### NX-OS specifics
+
+* The IOS reader reads NX-OS too. It knows `feature` lines, `vrf context` blocks with their static routes,
+  `vrf member`, `ip router ospf TAG area A` and `ip ospf passive-interface` on interfaces, OSPF `vrf` sub-blocks,
+  BGP `neighbor` blocks with their address families (a neighbor is active only where listed), `hsrp N` and
+  `vrrp N` blocks, `use-vrf` on NTP, DNS and syslog, `username ... role` and `ip dhcp relay address`.
+* Port names: `Ethernet1/N` (the writer numbers ports from 1), `port-channelN`, `VlanN`, `loopbackN`, `mgmt0`.
+* The writer adds the `feature` lines the configuration needs (interface-vlan, lacp, hsrp, vrrp, dhcp, lldp, ospf,
+  bgp, bfd, telnet) and `nv overlay evpn` for the EVPN address family.
+* `mgmt0` is always in VRF `management`; the source's management VRF becomes it, without RD or route targets.
+* OSPF runs on the interfaces; the processes of VRFs become `vrf` blocks of the first process. Passive interfaces
+  are set per interface.
+* NX-OS redistributes only through a route map; where the source has none, `RS-PERMIT-ALL` (permit everything) is
+  written and flagged.
+* BGP peer groups are written into each neighbor (no templates). NTP keys are MD5 only. STP and RSTP become MST,
+  PVST becomes rapid PVST+.
+* Not written for NX-OS yet, and so listed in the report: vPC (MLAG), VXLAN, the DHCP server, NAT, IPsec, QoS,
+  AAA servers and 802.1X, SNMP notifications and v3, port security and DHCP snooping, mirroring, sFlow, NetFlow,
+  MPLS, RIP, IS-IS, multicast, tracking, BFD timers, PoE and the voice VLAN.
 
 ## Access lists
 

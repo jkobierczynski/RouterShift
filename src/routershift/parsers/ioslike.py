@@ -2,12 +2,13 @@
 # Copyright (C) 2026 Jurgen Kobierczynski
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-"""Reader for the Cisco-style CLI that IOS, IOS XE and Arista EOS share.
+"""Reader for the Cisco-style CLI that IOS, IOS XE, Arista EOS and Cisco NX-OS share.
 
 The two dialects differ in details (a mask or a prefix length after ``ip address``,
 ``vrf forwarding`` or ``vrf``, ``ip domain-name`` or ``dns domain``); the reader takes
 either spelling from either platform, so it also copes with configurations that were
-pasted together by hand.
+pasted together by hand. NX-OS adds its own blocks (vrf context, neighbor blocks in router
+bgp, hsrp and vrrp blocks, use-vrf on the services), read when the platform is "nxos".
 """
 
 from __future__ import annotations
@@ -41,7 +42,8 @@ from ..model import (IpSla, Netflow, Sflow, AaaGroup, AaaMethod, AaaServer, Acl,
 
 # Lines that only describe the file or the software, not the device's behaviour.
 _NOISE = ("Building configuration", "Current configuration", "version ", "end", "boot-start-marker",
-          "boot-end-marker", "! Command:", "! device:", "! boot system")
+          "boot-end-marker", "! Command:", "! device:", "! boot system", "!Command:", "!Running configuration",
+          "!Time:", "boot nxos", "copp profile", "system default switchport", "vdc ")
 
 _MGMT_VRFS = {"mgmt-vrf", "mgmt-intf", "management", "mgmt"}
 
@@ -78,7 +80,10 @@ _EOS_ROLES = [(15, "network-admin"), (1, "network-operator")]
 class _Reader:
     def __init__(self, platform: str) -> None:
         self.device = Device(platform=platform)
-        self.switch_defaults = platform == "eos"  # physical ports start as switchports
+        self.switch_defaults = platform in ("eos", "nxos")  # physical ports start as switchports
+        self.nxos = platform == "nxos"
+        self._ospf_passive: Dict[str, bool] = {}  # NX-OS: ip ospf passive-interface on the interface
+        self._ospf_vrfs: Dict[Tuple[str, str], str] = {}  # NX-OS: (router ospf tag, VRF) -> the VRF's process
         self._explicit_mode: Dict[str, bool] = {}  # "no switchport" seen
         self._switchport_seen: Dict[str, bool] = {}  # any switchport line seen
         self._varp_mac = ""  # EOS: ip virtual-router mac-address
@@ -121,6 +126,9 @@ class _Reader:
                 c.text.startswith("switchport") for n in roots if n.text.startswith("interface ") for c in n.children)
         handlers: Dict[str, Callable[[Node], bool]] = {
             "hostname": self.hostname,
+            "switchname": self.hostname,
+            "feature": self.feature,
+            "nv": lambda node: node.words == ["nv", "overlay", "evpn"],
             "ip": self.ip,
             "ipv6": self.ipv6,
             "dns": self.dns,
@@ -182,6 +190,27 @@ class _Reader:
         self.device.system.hostname = node.words[1] if len(node.words) > 1 else ""
         return True
 
+    def feature(self, node: Node) -> bool:
+        """NX-OS: feature X switches a protocol on; the writer works out the features it needs."""
+        w = node.words
+        if len(w) != 2:
+            return False
+        m = self.device.management
+        if w[1] == "telnet":
+            m.telnet = True
+        elif w[1] == "ssh":
+            m.ssh = True
+        elif w[1] == "lldp":
+            m.lldp = True
+        return True
+
+    @staticmethod
+    def _use_vrf(args: List[str]) -> Tuple[List[str], str]:
+        """NX-OS: the words before 'use-vrf V', and V."""
+        if "use-vrf" in args and args.index("use-vrf") == len(args) - 2:
+            return args[:-2], args[-1]
+        return args, ""
+
     def dns(self, node: Node) -> bool:  # EOS: dns domain example.com
         if len(node.words) == 3 and node.words[1] == "domain":
             self.device.system.domain_name = node.words[2]
@@ -196,6 +225,9 @@ class _Reader:
             if args[0] == "vrf" and len(args) >= 3:
                 s.service_vrf = args[1]
                 args = args[2:]
+            args, vrf = self._use_vrf(args)
+            if vrf:
+                s.service_vrf = vrf
             server = args[0]
             s.ntp_servers.append(server)
             options = args[1:]
@@ -218,8 +250,8 @@ class _Reader:
         if w[1] == "authentication-key" and len(w) >= 5:
             # IOS: ntp authentication-key 1 md5 KEY [7]; EOS: ntp authentication-key 1 md5 [0|7] KEY
             algorithm, rest = {"hmac-sha1": "sha1", "hmac-sha2-256": "sha256"}.get(w[3], w[3]), w[4:]
-            if len(rest) == 2 and rest[1] == "7":
-                key, encrypted = rest[0], True
+            if len(rest) == 2 and rest[1] in ("0", "7") and rest[0] not in ("0", "7"):  # IOS, NX-OS
+                key, encrypted = rest[0], rest[1] == "7"
             elif len(rest) == 2 and rest[0] in ("0", "7"):
                 key, encrypted = rest[1], rest[0] == "7"
             elif len(rest) == 1:
@@ -232,7 +264,7 @@ class _Reader:
         if w[1] == "trusted-key" and len(w) == 3:
             self._ntp_key(int(w[2])).trusted = True
             return True
-        if w[1] in ("source", "local-interface") and len(w) >= 3:
+        if w[1] in ("source", "local-interface", "source-interface") and len(w) >= 3:
             s.ntp_source = names.canonical(" ".join(w[2:]))[0]
             return True
         return False
@@ -251,6 +283,10 @@ class _Reader:
                 return False
             if args and args[0].lower() in ("ro", "rw"):
                 community.access, args = args[0].lower(), args[1:]
+            elif args[:1] == ["group"] and len(args) == 2 and args[1] in ("network-operator", "network-admin"):
+                community.access, args = "rw" if args[1] == "network-admin" else "ro", []
+            if args[:1] == ["use-acl"] and len(args) == 2:  # NX-OS
+                args = args[1:]
             if len(args) > 1:
                 return False
             community.acl = args[0] if args else ""
@@ -333,6 +369,16 @@ class _Reader:
         if len(w) == 3 and w[1] == "source-interface":
             s.logging_source = names.canonical(w[2])[0]
             return True
+        if w[1] == "server" and len(w) >= 3:  # NX-OS: logging server A [level] [use-vrf V]
+            args, vrf = self._use_vrf(w[3:])
+            if vrf:
+                s.service_vrf = vrf
+            if args and args[0].isdigit() and len(args) == 1:
+                s.logging_level = int(args[0])
+            elif args:
+                return False
+            s.syslog_servers.append(str(ipaddress.ip_address(w[2])))
+            return True
         args = w[2:] if len(w) >= 3 and w[1] == "host" else w[1:]
         if args and args[0] == "vrf" and len(args) >= 3:  # EOS: logging vrf X host Y
             self.device.system.service_vrf = args[1]
@@ -403,8 +449,8 @@ class _Reader:
         if w[1:] in (["http", "server"], ["http", "secure-server"]):
             setattr(m, "http" if w[2] == "server" else "https", True)
             return True
-        if w[1:2] == ["routing"]:
-            return True  # implied by the presence of layer 3 configuration
+        if w[1:2] == ["routing"] or w[1:] == ["dhcp", "relay"]:
+            return True  # implied by the presence of layer 3 configuration, and of relay addresses (NX-OS)
         if w[1:3] in (["domain", "lookup"], ["domain-lookup"]) or w[1:2] == ["domain-lookup"]:
             rest = w[2:] if w[1] == "domain-lookup" else w[3:]
             if rest == []:
@@ -429,6 +475,9 @@ class _Reader:
             if args and args[0] == "vrf" and len(args) >= 2:
                 self.device.system.service_vrf = args[1]
                 args = args[2:]
+            args, vrf = self._use_vrf(args)
+            if vrf:
+                self.device.system.service_vrf = vrf
             self.device.system.dns_servers.extend(args)
             return True
         if w[1:2] == ["route"]:
@@ -566,6 +615,9 @@ class _Reader:
         w = node.words
         user = LocalUser(w[1], origin=Origin(node.line, node.text))
         args = w[2:]
+        if self.nxos and "role" in args[:-1]:  # NX-OS: username U password 5 X role R
+            at = args.index("role")
+            args = args[at:at + 2] + args[:at] + args[at + 2:]
         while args:
             if args[0] == "privilege" and len(args) >= 2:
                 user.privilege, args = int(args[1]), args[2:]
@@ -1528,9 +1580,14 @@ class _Reader:
     def bgp(self, node: Node, local_as: str) -> bool:
         b = bgp_text.Builder(local_as)
         b.bgp.origin = Origin(node.line, node.text)
+        if self.nxos:
+            b.default_ipv4 = False  # NX-OS: a neighbor is active only in the families listed under it
         for child in node.children:
-            w = child.words
+            w = self._direct(child.words)
             af = ""
+            if self.nxos and w[0] == "neighbor" and len(w) in (2, 4) and (len(w) == 2 or w[2] == "remote-as"):
+                self._nxos_neighbor(b, child)
+                continue
             if w[0] == "vrf" and len(w) == 2 and self.device.platform == "eos":
                 self._eos_bgp_vrf(w[1], child)
                 continue
@@ -1548,13 +1605,40 @@ class _Reader:
                 if line.words == ["exit-address-family"]:
                     continue
                 try:
-                    understood = self.bgp_line(b, line.words, af)
+                    understood = self.bgp_line(b, self._direct(line.words), af)
                 except (ValueError, IndexError):
                     understood = False
                 if not understood:
                     self.unparsed(line, child.text if af else node.text)
         self.device.bgp = b.finish()
         return True
+
+    def _nxos_neighbor(self, b: bgp_text.Builder, node: Node) -> None:
+        """NX-OS: neighbor A [remote-as X], with its settings and address families inside."""
+        address = node.words[1]
+        b.peer(address)
+        if len(node.words) == 4:
+            ioslike_neighbor(b, address, node.words[2:], "")
+        for child in node.children:
+            w = child.words
+            families = {("ipv4", "unicast"): "ipv4", ("ipv6", "unicast"): "ipv6", ("l2vpn", "evpn"): "evpn"}
+            if w[0] == "address-family" and len(w) == 3 and (w[1], w[2]) in families:
+                af = families[(w[1], w[2])]
+                b.activate(address, af)
+                for line in child.children:
+                    try:
+                        ok = ioslike_neighbor(b, address, line.words, af)
+                    except (ValueError, IndexError):
+                        ok = False
+                    if not ok:
+                        self.unparsed(line, f"{node.text} / {child.text}")
+                continue
+            try:
+                ok = ioslike_neighbor(b, address, w, "")
+            except (ValueError, IndexError):
+                ok = False
+            if not ok:
+                self.unparsed(child, node.text)
 
     def _eos_evpn_vlan(self, vid: int, node: Node) -> None:
         """EOS: router bgp / vlan N with rd auto, route-target both auto, redistribute learned."""
@@ -1662,7 +1746,8 @@ class _Reader:
         bgp = b.bgp
         if w[0] in ("bgp", "router-id") and w[-2:-1] == ["router-id"] and n in (2, 3):
             bgp.router_id = str(ipaddress.IPv4Address(w[-1]))
-        elif w in (["bgp", "log-neighbor-changes"], ["no", "synchronization"], ["no", "auto-summary"]):
+        elif w in (["bgp", "log-neighbor-changes"], ["log-neighbor-changes"], ["no", "synchronization"],
+                   ["no", "auto-summary"]):
             pass
         elif w == ["no", "bgp", "default", "ipv4-unicast"]:
             b.default_ipv4 = False
@@ -1696,13 +1781,32 @@ class _Reader:
         if vrf:
             self._add_vrf(vrf)
         for child in node.children:
+            if self.nxos and child.words[0] == "vrf" and len(child.words) == 2:  # NX-OS: OSPF in a VRF
+                numbers = [int(q.process) for q in self.device.ospf if q.process.isdigit()]
+                sub = Ospf(process=str(max(numbers, default=0) + 1), vrf=child.words[1],
+                           origin=Origin(child.line, child.text))
+                self.device.ospf.append(sub)
+                self._add_vrf(sub.vrf)
+                self._ospf_vrfs[(number, sub.vrf)] = sub.process
+                for line in child.children:
+                    try:
+                        ok = self.ospf_line(sub, self._direct(line.words))
+                    except (ValueError, IndexError):
+                        ok = False
+                    if not ok:
+                        self.unparsed(line, child.text)
+                continue
             try:
-                understood = self.ospf_line(p, child.words)
+                understood = self.ospf_line(p, self._direct(child.words))
             except (ValueError, IndexError):
                 understood = False
             if not understood:
                 self.unparsed(child, node.text)
         return True
+
+    def _direct(self, w: List[str]) -> List[str]:
+        """NX-OS calls connected routes direct."""
+        return [w[0], "connected"] + w[2:] if self.nxos and w[:2] == ["redistribute", "direct"] else w
 
     @staticmethod
     def ospf_line(p: Ospf, w: List[str]) -> bool:
@@ -1731,8 +1835,8 @@ class _Reader:
             p.bfd_all = True
         elif w[:2] == ["default-information", "originate"] and w[2:] in ([], ["always"]):
             p.default_originate = "always" if n == 3 else "on"
-        elif w[:2] == ["auto-cost", "reference-bandwidth"] and n == 3:
-            p.reference_bandwidth = int(w[2])
+        elif w[:2] == ["auto-cost", "reference-bandwidth"] and n in (3, 4) and w[3:] in ([], ["Mbps"], ["Gbps"]):
+            p.reference_bandwidth = int(w[2]) * (1000 if w[3:] == ["Gbps"] else 1)
         elif w[0] == "log-adjacency-changes" or w == ["max-lsa", "12000"]:
             pass  # logging, and the EOS default
         else:
@@ -1790,7 +1894,7 @@ class _Reader:
     def vrf(self, node: Node) -> bool:
         w = node.words
         # IOS XE: vrf definition NAME; EOS: vrf instance NAME (or vrf definition on older releases)
-        if len(w) == 3 and w[1] in ("definition", "instance"):
+        if len(w) == 3 and w[1] in ("definition", "instance", "context"):
             self._add_vrf(w[2])
             self._vrf_children(w[2], node)
             return True
@@ -1805,7 +1909,10 @@ class _Reader:
             elif c[0] == "route-target" and len(c) == 3 and vrfs_text.route_target(
                     vrfs_text.info(self.device, name), c[1], c[2]):
                 pass
-            elif c[0] == "address-family" and c[1:2] == ["ipv4"]:
+            elif c[:2] == ["ip", "route"] and len(c) >= 4:  # NX-OS: static routes in vrf context
+                if not self.route(child, ["vrf", name] + c[2:], 4):
+                    self.unparsed(child, node.text)
+            elif c[0] == "address-family" and c[1:2] == ["ipv4"] and child.children:
                 for g in child.children:
                     gw = g.words
                     if gw == ["exit-address-family"] or gw[0] == "route-target" and len(gw) == 3 and \
@@ -1857,6 +1964,8 @@ class _Reader:
     def line(self, node: Node) -> bool:
         """IOS: line vty 0 15 with transport input, access-class and exec-timeout; other lines stay unread."""
         w = node.words
+        if w[1:] == ["console"] and not node.children:
+            return True  # NX-OS lists the console line with nothing set
         if w[1:2] != ["vty"]:
             return False
         m = self.device.management
@@ -1879,7 +1988,7 @@ class _Reader:
 
     def discovery(self, node: Node) -> bool:
         """lldp run, cdp run (the no forms come through no_global)."""
-        if node.words[1:] == ["run"]:
+        if node.words[1:] == ["run"] or node.words == ["cdp", "enable"]:
             setattr(self.device.management, node.words[0], True)
             return True
         return False
@@ -1910,8 +2019,11 @@ class _Reader:
         if w[1:] in (["ip", "domain", "lookup"], ["ip", "domain-lookup"]):
             self.device.system.dns_lookup = False
             return True
-        if w[1:] in (["lldp", "run"], ["cdp", "run"]):
+        if w[1:] in (["lldp", "run"], ["cdp", "run"], ["cdp", "enable"]):
             setattr(m, w[1], False)
+            return True
+        if w[1:2] == ["feature"] and w[2:] in (["ssh"], ["telnet"], ["lldp"]):  # NX-OS
+            setattr(m, w[2], False)
             return True
         if w[1:] in (["ip", "http", "server"], ["ip", "http", "secure-server"]):
             setattr(m, "http" if w[3] == "server" else "https", False)
@@ -2116,11 +2228,16 @@ class _Reader:
         for child in node.children:
             if child.words[0] == "switchport":
                 self._switchport_seen[canon] = True
-            if child.words[:2] == ["standby", "version"] and len(child.words) == 3 and child.words[2] in ("1", "2"):
+            if child.words[:2] in (["standby", "version"], ["hsrp", "version"]) and len(child.words) == 3 and \
+                    child.words[2] in ("1", "2"):
                 hsrp_version = int(child.words[2])
                 continue
             if child.words[0] == "vrrp" and child.words[2:] == ["address-family", "ipv4"]:
                 self._vrrp_block(iface, child)
+                continue
+            if self.nxos and child.words[0] in ("hsrp", "vrrp") and len(child.words) == 2 and \
+                    child.words[1].isdigit():
+                self._nxos_fhrp(iface, child)
                 continue
             try:
                 understood = self.interface_line(iface, child.words)
@@ -2248,6 +2365,34 @@ class _Reader:
             return False
         return True
 
+    def _nxos_fhrp(self, iface: Interface, node: Node) -> None:
+        """NX-OS: hsrp N and vrrp N blocks; their lines are the IOS one-line forms without the prefix."""
+        protocol, number = node.words[0], node.words[1]
+        group = self._fhrp_group(iface, protocol, int(number))
+        if protocol == "vrrp":
+            group.preempt = True  # NX-OS VRRP preempts unless told otherwise
+        for child in node.children:
+            w = child.words
+            if protocol == "vrrp" and w[0] == "address" and len(w) in (2, 3):
+                ok = self._virtual_ip(group, w[1:])
+            elif protocol == "vrrp" and w == ["no", "shutdown"]:
+                ok = True
+            elif protocol == "vrrp" and w == ["no", "preempt"]:
+                group.preempt, ok = False, True
+            elif protocol == "vrrp" and w[0] == "advertisement-interval" and len(w) == 2:
+                group.hello_ms, ok = int(w[1]) * 1000, True
+            elif protocol == "hsrp" and w == ["no", "shutdown"]:
+                ok = True
+            elif protocol == "hsrp" and w[:2] == ["preempt", "delay"]:
+                group.preempt, ok = True, False
+            else:
+                try:
+                    ok = (self._hsrp if protocol == "hsrp" else self._vrrp)(iface, [number] + w)
+                except (ValueError, IndexError):
+                    ok = False
+            if not ok:
+                self.unparsed(child, node.text)
+
     def _vrrp_block(self, iface: Interface, node: Node) -> None:
         """IOS XE VRRPv3: vrrp N address-family ipv4, with its settings inside."""
         group = self._fhrp_group(iface, "vrrp", int(node.words[1]))
@@ -2341,9 +2486,20 @@ class _Reader:
         elif w[:2] in (["vrf", "forwarding"], ["ip", "vrf"]) and n >= 3:
             iface.vrf = w[-1]
             self._add_vrf(iface.vrf)
-        elif w[0] == "vrf" and n == 2:
-            iface.vrf = w[1]
+        elif w[0] == "vrf" and n == 2 or w[:2] == ["vrf", "member"] and n == 3:
+            iface.vrf = w[-1]
             self._add_vrf(iface.vrf)
+        elif w[:3] == ["ip", "router", "ospf"] and n == 6 and w[4] == "area":  # NX-OS
+            self._ospf_areas.append((iface.name, w[3], ospf_text.area(w[5])))
+        elif w == ["ip", "ospf", "passive-interface"]:
+            self._ospf_passive[iface.name] = True
+        elif w[:2] == ["spanning-tree", "port"] and w[2:4] == ["type", "edge"] and w[4:] in ([], ["trunk"]):
+            iface.stp_portfast = True
+        elif w[:4] == ["ip", "dhcp", "relay", "address"] and n in (5, 7):
+            iface.helper_addresses.append(str(ipaddress.ip_address(w[4])))
+            return n == 5
+        elif w[:3] == ["ip", "port", "access-group"] and n == 5 and w[4] == "in":
+            iface.acl_in = w[3]
         elif w[:2] == ["ip", "address"] and n >= 3:
             return self._ip_address(iface, w[2:])
         elif w[:2] == ["ipv6", "address"] and n >= 3:
@@ -2564,9 +2720,21 @@ class _Reader:
         self.device.interfaces = renamed
         for route in self.device.static_routes:
             route.interface = old_to_new.get(route.interface, route.interface)
-        ospf_text.attach(self.device, [(old_to_new.get(n, n), p, a) for n, p, a in self._ospf_areas], {})
+        sy = self.device.system
+        for attr in ("ntp_source", "logging_source", "dns_source"):
+            setattr(sy, attr, old_to_new.get(getattr(sy, attr), getattr(sy, attr)))
+        self.device.snmp.source = old_to_new.get(self.device.snmp.source, self.device.snmp.source)
+        # NX-OS: ip router ospf TAG on an interface in a VRF means the VRF's part of that process
+        areas = [(n, self._ospf_vrfs.get((p, self.device.interfaces[n].vrf), p) if n in self.device.interfaces else p,
+                  a) for n, p, a in self._ospf_areas]
+        ospf_text.attach(self.device, [(old_to_new.get(n, n), p, a) for n, p, a in areas],
+                         {old_to_new.get(n, n): v for n, v in self._ospf_passive.items()})
         for p in self.device.ospf:
             ospf_text.rename(p, old_to_new)
+        # NX-OS: a router ospf that only holds VRFs is no process of its own
+        tags = {tag for tag, _ in self._ospf_vrfs}
+        self.device.ospf = [p for p in self.device.ospf if not (
+            p.process in tags and not p.vrf and p == Ospf(process=p.process, origin=p.origin))]
 
     def _lag_mode(self, lag: Interface) -> SwitchportMode:
         if lag.mode != SwitchportMode.ROUTED:

@@ -52,7 +52,7 @@ def test_comware_reader() -> None:
 
 def test_host_pools_are_flagged() -> None:
     text = "ip dhcp pool PRINTER\n host 10.10.0.50 255.255.255.0\n client-identifier 0100.1122.3344.55\n"
-    for target in sorted(set(PLATFORMS) - {"junos"}):
+    for target in sorted(set(PLATFORMS) - {"junos", "nxos"}):
         out, report = convert(text, "ios", target)
         assert "PRINTER" not in out, target
         assert "PRINTER: skipped" in report.to_text(), target
@@ -75,7 +75,7 @@ def test_infinite_lease() -> None:
         assert pool.lease_seconds == 0, target
 
 
-@pytest.mark.parametrize("target", sorted(set(PLATFORMS) - {"junos"}))
+@pytest.mark.parametrize("target", sorted(set(PLATFORMS) - {"junos", "nxos"}))
 def test_every_writer_round_trips(target: str) -> None:
     text = ("ip dhcp excluded-address 10.20.0.1 10.20.0.9\nip dhcp excluded-address 10.20.0.200 10.20.0.254\n"
             "ip dhcp pool VOICE\n network 10.20.0.0 255.255.255.0\n default-router 10.20.0.1\n"

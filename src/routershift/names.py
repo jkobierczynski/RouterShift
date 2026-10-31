@@ -141,7 +141,7 @@ class PortMapper:
         """member/slot/port of the port on the target, if it can keep its numbers."""
         parts = iface.name[len("Ethernet"):].split("/")
         if (len(parts) != 3 or not all(p.isdigit() for p in parts) or self.target == "eos"
-                or "junos" in (self.target, self.device.platform)):
+                or {"junos", "nxos"} & {self.target, self.device.platform}):
             return None
         member, slot, port = (int(p) for p in parts)
         if self.target == "aoss":
@@ -163,6 +163,8 @@ class PortMapper:
             return kept or str(index)
         if self.target == "comware":
             return f"{_COMWARE_PREFIX.get(iface.media, 'GigabitEthernet')}{kept or f'1/0/{index}'}"
+        if self.target == "nxos":
+            return f"Ethernet1/{index}"
         if self.target == "junos":
             return f"{_JUNOS_PREFIX.get(iface.media, 'ge')}-0/0/{index - 1}"
         # eos: front-panel ports are numbered 1..n
@@ -178,6 +180,8 @@ class PortMapper:
             return self._comware_logical(iface)
         if self.target == "junos":
             return self._junos_logical(iface)
+        if self.target == "nxos":
+            return self._nxos_logical(iface)
         if iface.kind == InterfaceKind.LAG:
             number = name[len("Port-channel"):]
             return f"Port-Channel{number}" if self.target == "eos" else f"Port-channel{number}"
@@ -237,6 +241,19 @@ class PortMapper:
             return f"lo0.{name[len('Loopback'):]}"
         if iface.kind == InterfaceKind.MANAGEMENT:
             return "me0"
+        if iface.kind == InterfaceKind.SUBINTERFACE and iface.parent:
+            return f"{self(iface.parent)}.{name.rsplit('.', 1)[1]}"
+        return name
+
+    def _nxos_logical(self, iface: Interface) -> str:
+        """NX-OS names: port-channelN, VlanN, loopbackN, mgmt0."""
+        name = iface.name
+        if iface.kind == InterfaceKind.LAG:
+            return f"port-channel{name[len('Port-channel'):]}"
+        if iface.kind == InterfaceKind.LOOPBACK:
+            return f"loopback{name[len('Loopback'):]}"
+        if iface.kind == InterfaceKind.MANAGEMENT:
+            return "mgmt0"
         if iface.kind == InterfaceKind.SUBINTERFACE and iface.parent:
             return f"{self(iface.parent)}.{name.rsplit('.', 1)[1]}"
         return name

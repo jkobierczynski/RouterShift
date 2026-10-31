@@ -22,6 +22,7 @@ PLATFORMS = {
     "aoss": "HPE Aruba AOS-S (ProCurve)",
     "comware": "HPE Comware 7",
     "junos": "Juniper Junos",
+    "nxos": "Cisco NX-OS",
 }
 
 

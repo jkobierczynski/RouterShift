@@ -18,4 +18,5 @@ PARSERS: Dict[str, Callable[[str], Device]] = {
     "aoss": aoss.parse,
     "comware": comware.parse,
     "junos": junos.parse,
+    "nxos": lambda text: ioslike.parse(text, "nxos"),
 }

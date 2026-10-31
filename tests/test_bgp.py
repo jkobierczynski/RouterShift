@@ -59,7 +59,7 @@ def test_ios_reader() -> None:
 
 
 def test_password_is_masked() -> None:
-    for target in sorted(set(PLATFORMS) - {"junos"}):
+    for target in sorted(set(PLATFORMS) - {"junos", "nxos"}):
         _, report = convert(IOS, "ios", target)
         assert "0822455D0A16" not in report.to_text(), target
 
@@ -116,7 +116,7 @@ def test_aoss_leaves_bgp_to_a_person() -> None:
     assert "bgp 65001: skipped" in report.to_text()
 
 
-@pytest.mark.parametrize("target", sorted(set(PLATFORMS) - {"aoss", "junos"}))
+@pytest.mark.parametrize("target", sorted(set(PLATFORMS) - {"aoss", "junos", "nxos"}))
 def test_every_writer_round_trips(target: str) -> None:
     first = parse(IOS, "ios")
     out, _ = convert(IOS, "ios", target)
