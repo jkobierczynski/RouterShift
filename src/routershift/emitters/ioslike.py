@@ -27,6 +27,7 @@ from .. import vrfs as vrfs_text
 from .. import multicast as multicast_text
 from .. import monitor as monitor_text
 from .. import tracking as tracking_text
+from .. import hosts as hosts_text
 from .. import igp as igp_text
 from .. import bfd as bfd_text
 from .. import routemap as routemap_text
@@ -132,6 +133,14 @@ class Writer:
             via = f"vrf {self.vrf(s.service_vrf)} " if s.service_vrf else ""
             self.out.append(f"ip name-server {via}" + " ".join(s.dns_servers))
             rep.item("system", "name servers")
+        hosts_text.dns_unsupported(self.device, rep, "IOS" if self.ios else "EOS", lookup=self.ios, search=True,
+                                   source=True, hosts=True)
+        if s.dns_lookup is False and self.ios:
+            self.out.append("no ip domain lookup")
+        self.out += [f"ip domain list {d}" if self.ios else f"ip domain-list {d}" for d in s.dns_search]
+        if s.dns_source:
+            self.out.append(f"ip domain lookup source-interface {self.port(s.dns_source)}")
+        self.out += [f"ip host {name} {address}" for name, address in s.dns_hosts.items()]
         if self.vrrp_v3:
             self.out.append("fhrp version vrrp v3")
         self._anycast_mac()
@@ -246,6 +255,7 @@ class Writer:
         lines += self._isis_interface(iface)
         lines += self._multicast_interface(iface, add)
         lines += self._flow_interface(iface)
+        lines += self._poe(iface, add)
         lines += bfd_text.joined_line(iface, "ios" if self.ios else "eos", self.report, label)
         if iface.pbr:
             lines.append(f"ip policy route-map {iface.pbr}" if self.ios else f"service-policy type pbr input {iface.pbr}")
@@ -1016,6 +1026,29 @@ class Writer:
                 [f"{self.ind * 2}rp address {rp}" for rp in d.pim_rps] + ["!"]
         if lines:
             self.out += lines + (["!"] if lines[-1] != "!" else [])
+
+    def _poe(self, iface: Interface, add: _Add) -> List[str]:
+        if not hosts_text.poe_stated(iface):
+            return []
+        lines: List[str] = []
+        limit = hosts_text.poe_limit(iface, add, "IOS" if self.ios else "EOS", True)
+        if self.ios:
+            if iface.poe is False:
+                lines.append("power inline never")
+            elif limit is not None:
+                lines.append(f"power inline auto max {limit}")
+            priority = hosts_text.poe_priority(iface, ("low", "high"), add, "IOS")
+            if priority and iface.poe is not False:
+                lines.append(f"power inline port priority {priority}")
+            return lines
+        if iface.poe is False:
+            return ["poe disabled"]
+        priority = hosts_text.poe_priority(iface, hosts_text.PRIORITIES, add, "EOS")
+        if priority:
+            lines.append(f"poe priority {priority}")
+        if limit is not None:
+            lines.append(f"poe limit {hosts_text.watts(limit)} watts")
+        return lines
 
     def tracking(self) -> None:
         """IP SLA probes (IOS) and tracked objects."""

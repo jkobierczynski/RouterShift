@@ -689,6 +689,10 @@ class _Reader:
             monitor_text.session(self.device, w[4]).sources[iface.name] = monitor_text.direction(w[2]) or "both"
         elif w[0] == "sflow" and len(w) == 4 and w[2] in ("sampling", "polling"):
             return self._sflow_rate(w[2], int(w[3]), [iface])
+        elif w == ["no", "power-over-ethernet"]:
+            iface.poe = False
+        elif w[0] == "power-over-ethernet" and len(w) == 2 and w[1] in ("low", "high", "critical"):
+            iface.poe_priority = w[1]
         elif w[0] == "broadcast-limit" and len(w) == 2:
             iface.storm_control["broadcast"] = float(w[1])
         elif w[0] == "name" and len(w) >= 2:

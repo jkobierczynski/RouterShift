@@ -24,6 +24,7 @@ from .. import vrfs as vrfs_text
 from .. import multicast as multicast_text
 from .. import monitor as monitor_text
 from .. import tracking as tracking_text
+from .. import hosts as hosts_text
 from .. import igp as igp_text
 from .. import bfd as bfd_text
 from .. import routemap as routemap_text
@@ -227,6 +228,11 @@ class Writer:
             self.out.append(f"{_IND}dns server {server}{vpn}")
         if s.dns_servers:
             rep.item("system", "name servers")
+        hosts_text.dns_unsupported(self.device, rep, "Comware", search=True, source=True, hosts=True)
+        self.out += [f"{_IND}dns domain {d}" for d in s.dns_search]
+        if s.dns_source:
+            self.out.append(f"{_IND}dns source-interface {self.port(s.dns_source)}")
+        self.out += [f"{_IND}ip host {name} {address}" for name, address in s.dns_hosts.items()]
         if s.ntp_servers:
             self.out.append(f"{_IND}ntp-service enable")
             for key in s.ntp_keys.values():
@@ -903,6 +909,15 @@ class Writer:
         if iface.igmp_version is not None:
             lines.append(f"igmp version {iface.igmp_version}")
         lines += self._monitor_interface(iface)
+        if hosts_text.poe_stated(iface):
+            if iface.poe is not False:
+                lines.append("poe enable")
+                priority = hosts_text.poe_priority(iface, ("low", "high", "critical"), add, "Comware")
+                if priority:
+                    lines.append(f"poe priority {priority}")
+                limit = hosts_text.poe_limit(iface, add, "Comware", True)
+                if limit is not None:
+                    lines.append(f"poe max-power {limit}")
         if iface.name in bfd_text.ospf_interfaces(self.device):
             lines.append("ospf bfd enable")
         lines += bfd_text.separate_lines(iface)

@@ -81,6 +81,10 @@ class System:
     banner_motd: str = ""
     timezone: str = ""  # IANA name where the source allows it, else as written
     dns_servers: List[str] = field(default_factory=list)
+    dns_lookup: Optional[bool] = None  # name lookup by the device itself; None = not stated (on)
+    dns_search: List[str] = field(default_factory=list)  # further domains tried after domain_name
+    dns_source: str = ""  # canonical name of the interface DNS queries leave from
+    dns_hosts: Dict[str, str] = field(default_factory=dict)  # static host name -> address
     ntp_servers: List[str] = field(default_factory=list)
     syslog_servers: List[str] = field(default_factory=list)
     # VRF through which the device reaches its DNS, NTP and syslog servers ("" = the default VRF).
@@ -217,6 +221,9 @@ class Interface:
     igmp_version: Optional[int] = None  # IGMP version towards hosts (2, 3)
     sflow: bool = False  # sFlow samples the port's traffic
     flow: str = ""  # NetFlow/NetStream records flows the port "input", "output" or "both" ways; "" = none
+    poe: Optional[bool] = None  # PoE switched on or off on the port; None = not stated
+    poe_priority: str = ""  # "low", "medium" (EOS), "high", "critical"
+    poe_max_mw: Optional[int] = None  # the most power the port gives, milliwatts
     pbr: str = ""  # policy-based routing: the route map (Comware policy-based-route, EOS pbr policy) on received packets
     crypto_map: str = ""  # policy-based IPsec applied on the interface
     tunnel_source: str = ""  # tunnel: a canonical interface name or an address
