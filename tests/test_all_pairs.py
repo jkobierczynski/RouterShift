@@ -32,11 +32,12 @@ SAMPLES = {"ios": "ios_access.cfg", "eos": "eos_leaf.cfg", "aoscx": "aoscx_acces
 
 
 def test_every_platform_has_a_sample() -> None:
-    assert set(SAMPLES) == set(PLATFORMS)
+    # Junos is written for the core features only; tests/test_junos.py converts to and from it
+    assert set(SAMPLES) | {"junos"} == set(PLATFORMS)
 
 
 @pytest.mark.parametrize("source", sorted(SAMPLES))
-@pytest.mark.parametrize("target", sorted(PLATFORMS))
+@pytest.mark.parametrize("target", sorted(SAMPLES))
 def test_converts_and_reads_back(source: str, target: str) -> None:
     text = (DATA / SAMPLES[source]).read_text(encoding="utf-8")
     first = parse(text, source)

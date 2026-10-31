@@ -47,6 +47,12 @@ The DNS client (lookup switch, search domains, source interface, static hosts) a
 (on/off, priority, power limit) convert as far as each platform has the setting.
 VXLAN (VTEP source, VLAN and VRF VNIs, static flood lists) and BGP EVPN (neighbors, advertised VLANs)
 convert between IOS, EOS and AOS-CX, and are flagged on AOS-S and Comware.
+Juniper Junos reads and writes the core of a switch or router configuration, in either the curly-brace
+form or `display set` lines: system settings (hostname, DNS, NTP with keys, syslog, time zone, banner, SSH,
+local users), SNMP communities, VLANs, ports and aggregates with LACP, access and trunk ports, irb, loopback and
+management interfaces, subinterfaces, IPv4/IPv6 addresses, VRFs (routing instances with RD and route targets),
+static routes, OSPF, BGP (groups, EVPN family), LLDP and spanning tree (RSTP, MSTP, VSTP). Every other feature
+read from another platform is listed in the report as "not written for Junos yet".
 Everything else (LDAP, ...) is listed in the report under "Not understood", line by
 line, with secrets masked.
 

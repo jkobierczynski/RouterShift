@@ -11,7 +11,7 @@ approximated and what a person has to look at.
 |---|---|---|---|---|
 | `ios` | Cisco IOS and IOS XE | `show running-config` | CLI configuration | 1 (done) |
 | `eos` | Arista EOS | `show running-config` | CLI configuration | 1 (done) |
-| `junos` | Juniper Junos (EX, QFX, MX, SRX in switching/routing) | `show configuration \| display set`, or braces | `set` commands, for `load set` | 2 |
+| `junos` | Juniper Junos (EX and QFX with ELS, MX, SRX in switching/routing) | `show configuration`, or `\| display set` | curly braces, for `load merge terminal` | 2 (core done) |
 | `nxos` | Cisco NX-OS | `show running-config` | CLI configuration | 2 |
 | `aoscx` | HPE Aruba AOS-CX (10.x) | `show running-config` | CLI configuration | 1 (done) |
 | `aoss` | HPE Aruba AOS-S (ProCurve / ProVision, 16.x) | `show running-config` | CLI configuration | 1 (done) |
@@ -91,6 +91,30 @@ platform converts to and from all the others.
   `link-aggregation mode dynamic` means LACP.
 * BPDU protection is global (`stp bpdu-protection`) and guards every edge port.
 * VRFs are VPN instances, the management VRF included: `M-GigabitEthernet0/0/0` is bound to one like any port.
+
+### Junos specifics
+
+* The reader takes the curly-brace hierarchy or `display set` lines; both become the same word lists, one per
+  leaf, and `[ A B ]` lists become one statement per value. Statements under `inactive:` or `deactivate` are listed
+  under "Not understood".
+* Port names: `ge-0/0/1` is `Ethernet0/0/1` (1G; `xe-` 10G, `et-` 25/40/100G, `mge-` multigig), `aeN` is
+  `Port-channel(N+1)`, `irb.N` is the VLAN interface of the VLAN whose `l3-interface` it is, `lo0.N` is
+  `LoopbackN`, `me0`, `em0` and `fxp0` are the management port. Unit 0 of a port is the port itself; any other unit,
+  or every unit of a port with `vlan-tagging`, is a subinterface. The writer numbers ports `ge-0/0/0` upwards by
+  speed class, and writes `chassis aggregated-devices ethernet device-count` for the aggregates.
+* VLAN members are names (or IDs); the writer names VLANs after the source names (`VLAN<id>` where there is
+  none) and puts a trunk's native VLAN in its members, as ELS requires.
+* Junos has one router ID for OSPF and BGP, one OSPF per routing instance, and sends BGP communities by default.
+  BGP neighbors without a peer group go into groups `IBGP` and `EBGP`. A VRF with an RD and route targets is an
+  `instance-type vrf`, any other a `virtual-router`; the management VRF becomes `system management-instance`
+  (`mgmt_junos`).
+* A fixed time zone offset becomes `Etc/GMT-N` (the tz database inverts the sign), without summer time.
+* Junos counts the Ethernet header in the MTU; the value is written as it is and flagged.
+* Not written for Junos yet, and so listed in the report: firewall filters (ACLs), policy statements (prefix lists,
+  route maps, BGP and OSPF export), VRRP, DHCP server and relay, NAT, IPsec, class of service, AAA servers and
+  802.1X, SNMP notifications and v3, port security and storm control, mirroring, sFlow, MPLS, RIP, IS-IS,
+  multicast, MC-LAG, VXLAN, RPM tracking, PoE and the voice VLAN. The reader leaves those statements under
+  "Not understood".
 
 ## Access lists
 
