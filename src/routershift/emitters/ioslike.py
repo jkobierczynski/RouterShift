@@ -15,6 +15,7 @@ from .. import dhcp as dhcp_text
 from .. import fhrp
 from .. import nat as nat_text
 from .. import ospf as ospf_text
+from .. import mpls as mpls_text
 from .. import qos as qos_text
 from .. import snmp as snmp_text
 from .. import stp as stp_text
@@ -75,6 +76,7 @@ class Writer:
         self.vlans()
         self.vpn()
         self.qos()
+        self.mpls()
         for iface in self.device.interfaces.values():
             self.interface(iface)
         self.routing()
@@ -223,6 +225,8 @@ class Writer:
         lines += self._speed(iface, add)
         lines += self._dot1x(iface, add)
         lines += self._qos_interface(iface, add)
+        if iface.mpls:
+            lines.append("mpls ip" if self.ios else "mpls ldp interface")
         if iface.stp_portfast:
             trunk = iface.mode == SwitchportMode.TRUNK
             lines.append("spanning-tree portfast trunk" if self.ios and trunk else "spanning-tree portfast")
@@ -1063,6 +1067,32 @@ class Writer:
         if form == "sha512-crypt":
             return f"secret sha512 {value}"
         return f"secret {form[len('ios-type'):]} {value}"
+
+    def mpls(self) -> None:
+        """IOS: mpls label protocol ldp and mpls ldp router-id IFACE force; EOS: mpls ip and an mpls ldp block that
+        runs LDP only on the interfaces marked (interface disabled default)."""
+        d = self.device
+        if not mpls_text.has_mpls(d):
+            return
+        rep = self.report
+        label = "MPLS and LDP"
+        rep.item("mpls", label)
+        if self.ios:
+            self.out.append("mpls label protocol ldp")
+            if d.mpls.router_id or d.mpls.router_id_interface:
+                name = mpls_text.router_interface(d)
+                if name:
+                    self.out.append(f"mpls ldp router-id {self.port(name)} force")
+                else:
+                    mpls_text.router_id_missing(d, rep, "interface")
+        else:
+            self.out += ["mpls ip", "!", "mpls ldp"]
+            if d.mpls.router_id_interface:
+                self.out.append(f"{self.ind}router-id interface {self.port(d.mpls.router_id_interface)}")
+            elif d.mpls.router_id:
+                self.out.append(f"{self.ind}router-id {d.mpls.router_id}")
+            self.out += [f"{self.ind}interface disabled default", f"{self.ind}no shutdown"]
+        self.out.append("!")
 
     def qos(self) -> None:
         """Class maps and policy maps; EOS takes the policies as 'quality-of-service' and classes as 'qos'."""

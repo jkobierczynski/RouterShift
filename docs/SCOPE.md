@@ -46,6 +46,7 @@ platform converts to and from all the others.
 | 802.1X and MAC authentication on ports: host mode, reauthentication, the RADIUS servers used | `Aaa.dot1x`, `Interface.dot1x`, `Interface.mab` ... | 3 (done) |
 | TFTP and FTP client source interface | `System.transfer_source` | 3 (done) |
 | QoS: classes (DSCP or ACL), policies with DSCP marking and policing, policies on ports, port trust | `QosClass`, `QosPolicy`, `QosAction`, `Interface.qos_*` | 3 (done) |
+| MPLS: label switching with LDP on interfaces, the LDP router ID | `Mpls`, `Interface.mpls` | 3 (done) |
 | LDAP and Kerberos servers (listed under "Not understood") | to come | 3+ |
 | Route maps, prefix lists, MLAG/VSX/vPC, VXLAN/EVPN | to come | 3+ |
 
@@ -187,6 +188,19 @@ platform converts to and from all the others.
   `loop-protect` as the alternative).
 * Per-instance and per-VLAN port costs and priorities, and timers (hello, forward delay, max age), are listed under
   "Not understood" for now.
+
+## MPLS
+
+* An interface keeps MPLS label switching with LDP, and the device keeps LDP and its router ID.
+* IOS: `mpls label protocol ldp`, `mpls ldp router-id IFACE force`, `mpls ip` on the interface. EOS: `mpls ip` and an
+  `mpls ldp` block with `router-id [interface]`; the writer adds `interface disabled default` so LDP runs only on the
+  interfaces with `mpls ldp interface`. Comware: `mpls lsr-id`, the `mpls ldp` view, `mpls enable` and `mpls ldp
+  enable` on the interface.
+* IOS takes the router ID as an interface and Comware as an address: the writers use the interface that holds the
+  address, or the address of the interface (reported when there is none).
+* AOS-CX and AOS-S have no MPLS; it is reported.
+* MPLS L3VPN (VRF route distinguishers and targets, VPNv4 BGP), RSVP-TE, segment routing and LDP options (timers,
+  authentication, label filters) are listed under "Not understood" for now.
 
 ## QoS
 
