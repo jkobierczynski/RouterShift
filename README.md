@@ -5,16 +5,21 @@ configuration, turns it into a vendor-neutral model, and writes it out for anoth
 platform, together with a report that says, item by item, what was converted
 exactly, what was approximated and what a person has to look at.
 
-Planned platforms: Cisco IOS / IOS XE and NX-OS, Arista EOS, Juniper Junos,
-HPE Aruba AOS-CX, AOS-S (ProCurve) and Comware. See [docs/SCOPE.md](docs/SCOPE.md)
-for the platforms, the configuration areas and the order they arrive in.
+Platforms: Cisco IOS / IOS XE and NX-OS, Arista EOS, Juniper Junos, HPE Aruba
+AOS-CX, AOS-S (ProCurve) and Comware 7. The [manual](docs/MANUAL.md) explains how to
+use it, [docs/SCOPE.md](docs/SCOPE.md) lists what converts per area and platform,
+[CONTRIBUTING.md](CONTRIBUTING.md) explains how to help and [CHANGELOG.md](CHANGELOG.md)
+lists the releases.
+
+It is a quick reference for how a configuration looks on another platform, not a
+migration tool: read the output and the report before anything goes near a live device.
 
 RouterShift is the sibling of [FWShift](https://github.com/jkobierczynski/FWShift),
 which does the same for firewall policies.
 
 ## Status
 
-Pre-alpha. Cisco IOS / IOS XE, Arista EOS, HPE Aruba AOS-CX, AOS-S (ProCurve) and
+Alpha (0.1.0). Cisco IOS / IOS XE, Arista EOS, HPE Aruba AOS-CX, AOS-S (ProCurve) and
 HPE Comware 7 convert in every direction for the system settings (hostname,
 domain, DNS, NTP with authentication keys, syslog, banner, spanning tree (mode, priorities, MST region, port guards), SNMP
 communities, v3 users and notification hosts), VLANs, interfaces
@@ -65,7 +70,7 @@ line, with secrets masked.
 ## Usage
 
 ```
-pip install .
+pip install routershift      # or, from a checkout: pip install .
 routershift convert --from ios --to aoscx running-config.txt -o aoscx.cfg --report report.txt
 routershift parse --from eos running-config.txt      # the vendor-neutral model as JSON
 routershift platforms
