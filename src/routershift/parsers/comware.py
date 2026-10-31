@@ -184,6 +184,7 @@ class _Reader:
             "tftp": self.transfer,
             "traffic": self.traffic,
             "qos": self.qos_policy,
+            "mpls": self.mpls,
             "ftp": self.transfer,
         }
         for node in roots:
@@ -737,6 +738,24 @@ class _Reader:
                 elif vid == ids[0]:
                     self.unparsed(child, node.text)
         return True
+
+    def mpls(self, node: Node) -> bool:
+        """mpls lsr-id A.B.C.D, and the mpls ldp view (lsr-id may be given there too)."""
+        w = node.words
+        m = self.device.mpls
+        m.origin = Origin(node.line, node.text)
+        if w[1] == "lsr-id" and len(w) == 3:
+            m.router_id = str(ipaddress.ip_address(w[2]))
+            return True
+        if w[1:] == ["ldp"]:
+            m.ldp = True
+            for child in node.children:
+                if child.words[0] == "lsr-id" and len(child.words) == 2:
+                    m.router_id = str(ipaddress.ip_address(child.words[1]))
+                else:
+                    self.unparsed(child, node.text)
+            return True
+        return False
 
     def stp(self, node: Node) -> bool:
         w = node.words
@@ -1369,6 +1388,10 @@ class _Reader:
             setattr(iface, f"qos_policy_{'in' if w[4] == 'inbound' else 'out'}", w[3])
         elif w[:2] == ["qos", "trust"] and n == 3 and w[2] in ("dscp", "dot1p"):
             iface.qos_trust = "cos" if w[2] == "dot1p" else "dscp"
+        elif w in (["mpls", "enable"], ["mpls", "ldp", "enable"]):
+            iface.mpls = True
+            if w[1] == "ldp":
+                self.device.mpls.ldp = True
         elif w[0] == "packet-filter" and w[-1] in ("inbound", "outbound"):
             v6 = w[1:2] == ["ipv6"]
             args = w[2:-1] if v6 else w[1:-1]

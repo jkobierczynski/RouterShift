@@ -25,7 +25,8 @@ redundancy (HSRP, VRRP, anycast gateways), OSPF, BGP, NAT and site-to-site
 IPsec VPNs (on IOS, EOS and Comware; the AOS switches have neither), local users and
 privilege levels, and AAA (RADIUS and TACACS+ servers and groups, login, enable, command
 and accounting method lists), 802.1X and MAC authentication on ports, the TFTP/FTP
-source interface, and QoS (classes, policies with DSCP marking and policing, port trust).
+source interface, QoS (classes, policies with DSCP marking and policing, port trust), and MPLS with LDP
+(on IOS, EOS and Comware).
 Everything else (route maps, LDAP, ...) is listed in the report under "Not understood", line by
 line, with secrets masked.
 

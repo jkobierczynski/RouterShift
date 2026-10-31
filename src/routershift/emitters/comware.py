@@ -18,6 +18,7 @@ from .. import vpn as vpn_text
 from .. import ospf as ospf_text
 from .. import snmp as snmp_text
 from .. import stp as stp_text
+from .. import mpls as mpls_text
 from .. import qos as qos_text
 from ..model import (AaaMethod, AaaServer, AclAction, AclEntry, BgpNeighbor, Device, FhrpGroup, IpsecPeer, SnmpGroup, Interface, InterfaceKind, LacpMode, NatRule,
                      Ospf, StaticRoute, StpMode, SwitchportMode)
@@ -61,6 +62,7 @@ class Writer:
         self.spanning_tree()
         self.acls()
         self.qos()
+        self.mpls()
         for p in self.device.ospf:
             self.ospf(p)
         self.dhcp()
@@ -474,6 +476,21 @@ class Writer:
 
     # access lists ----------------------------------------------------------------------------------------------------
 
+    def mpls(self) -> None:
+        """mpls lsr-id (an address: taken from the router ID interface when given as one) and the mpls ldp view."""
+        d = self.device
+        if not mpls_text.has_mpls(d):
+            return
+        self.report.item("mpls", "MPLS and LDP")
+        address = mpls_text.router_address(d)
+        if address:
+            self.out.append(f"{_IND}mpls lsr-id {address}")
+            self.block_end()
+        else:
+            mpls_text.router_id_missing(d, self.report, "IPv4 address")
+        self.out.append("mpls ldp")
+        self.block_end()
+
     def qos(self) -> None:
         """Traffic classifiers, one traffic behavior per policy action, and QoS policies pairing them."""
         rep = self.report
@@ -606,6 +623,8 @@ class Writer:
                 add(Severity.REVIEW, "qos-policy", f"policy {policy} is applied but not defined; left out")
         if iface.qos_trust in ("dscp", "cos"):
             lines.append(f"qos trust {'dot1p' if iface.qos_trust == 'cos' else 'dscp'}")
+        if iface.mpls:
+            lines += ["mpls enable", "mpls ldp enable"]
         for attr, v6, direction in (("acl_in", "", "inbound"), ("acl_out", "", "outbound"),
                                     ("acl6_in", "ipv6 ", "inbound"), ("acl6_out", "ipv6 ", "outbound")):
             acl_name = getattr(iface, attr)

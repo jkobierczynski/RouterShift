@@ -131,6 +131,7 @@ class _Reader:
             "class-map": self.class_map,
             "policy-map": self.policy_map,
             "mls": lambda node: node.words == ["mls", "qos"],
+            "mpls": self.mpls,
         }
         for node in roots:
             if node.text.startswith(_NOISE) or node.text == "end":
@@ -1309,6 +1310,38 @@ class _Reader:
             return True
         return False
 
+    def mpls(self, node: Node) -> bool:
+        """IOS: mpls label protocol ldp, mpls ldp router-id IFACE [force]; EOS: mpls ip, and the mpls ldp block with
+        router-id [interface] X and [no] shutdown."""
+        w = node.words
+        m = self.device.mpls
+        m.origin = Origin(node.line, node.text)
+        if w[1:] == ["ip"]:
+            return True  # label switching on (the IOS default)
+        if w[1:] == ["label", "protocol", "ldp"]:
+            m.ldp = True
+            return True
+        if w[1:3] == ["ldp", "router-id"] and len(w) in (4, 5) and w[4:] in ([], ["force"]):
+            m.router_id_interface = names.canonical(w[3])[0]
+            m.ldp = True
+            return True
+        if w[1:] == ["ldp"]:
+            m.ldp = True
+            for child in node.children:
+                c = child.words
+                if c[0] == "router-id" and len(c) == 2:
+                    m.router_id = c[1]
+                elif c[:2] == ["router-id", "interface"] and len(c) == 3:
+                    m.router_id_interface = names.canonical(c[2])[0]
+                elif c in (["no", "shutdown"], ["interface", "disabled", "default"]):
+                    pass
+                elif c == ["shutdown"]:
+                    m.ldp = False
+                else:
+                    self.unparsed(child, node.text)
+            return True
+        return False
+
     def vlan(self, node: Node) -> bool:
         w = node.words
         if len(w) != 2:
@@ -1654,6 +1687,11 @@ class _Reader:
             iface.qos_trust = w[3]
         elif w[:2] == ["qos", "trust"] and n == 3 and w[2] in ("dscp", "cos", "disabled"):
             iface.qos_trust = "none" if w[2] == "disabled" else w[2]
+        elif w == ["mpls", "ip"] or w == ["mpls", "ldp", "interface"]:
+            # IOS: mpls ip (label switching and LDP); EOS: mpls ldp interface (mpls ip is the EOS default)
+            if self.device.platform == "ios" or w[1] == "ldp":
+                iface.mpls = True
+                self.device.mpls.ldp = True
         else:
             return False
         return True

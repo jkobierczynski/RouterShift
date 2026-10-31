@@ -149,6 +149,7 @@ class Interface:
     qos_trust: str = ""  # "dscp", "cos" or "none"; "" = the platform default
     qos_policy_in: str = ""  # QosPolicy names
     qos_policy_out: str = ""
+    mpls: bool = False  # MPLS label switching with LDP on the interface
     fhrp: List["FhrpGroup"] = field(default_factory=list)
     nat: str = ""  # "inside", "outside" or ""
     ospf_cost: Optional[int] = None
@@ -529,6 +530,15 @@ class QosPolicy:
 
 
 @dataclass
+class Mpls:
+    """MPLS label switching with LDP. The router ID is an address or an interface (canonical name)."""
+    ldp: bool = False
+    router_id: str = ""
+    router_id_interface: str = ""
+    origin: Origin = field(default_factory=Origin)
+
+
+@dataclass
 class Stp:
     """Spanning tree beyond its mode: bridge priorities and the MST region."""
 
@@ -569,6 +579,7 @@ class Device:
     psks: Dict[str, PreSharedKey] = field(default_factory=dict)  # by peer address
     stp_mode: Optional[StpMode] = None
     stp: Stp = field(default_factory=Stp)
+    mpls: Mpls = field(default_factory=Mpls)
     qos_classes: Dict[str, QosClass] = field(default_factory=dict)
     qos_policies: Dict[str, QosPolicy] = field(default_factory=dict)
     snmp: Snmp = field(default_factory=Snmp)
