@@ -21,6 +21,7 @@ from .. import stp as stp_text
 from .. import l2sec as l2sec_text
 from .. import mgmt as mgmt_text
 from .. import vrfs as vrfs_text
+from .. import bfd as bfd_text
 from .. import routemap as routemap_text
 from .. import mpls as mpls_text
 from .. import qos as qos_text
@@ -766,6 +767,11 @@ class Writer:
             lines.append(f"ospf cost {iface.ospf_cost}")
         if iface.ospf_network:
             lines.append(f"ospf network-type {'p2p' if iface.ospf_network == 'point-to-point' else 'broadcast'}")
+        if iface.name in bfd_text.ospf_interfaces(self.device):
+            lines.append("ospf bfd enable")
+        lines += bfd_text.separate_lines(iface)
+        if iface.pbr:
+            lines.append(f"ip policy-based-route {iface.pbr}")
         lines += self._nat_interface(iface)
         lines += self._tunnel(iface)
         if iface.helper_addresses:
@@ -1051,8 +1057,21 @@ class Writer:
             self.out += routemap_text.comware_prefix_lines(pl)
         if self.device.prefix_lists:
             self.block_end()
+        skip = bfd_text.pbr_only(self.device)
         for rm in self.device.route_maps.values():
-            self.out += routemap_text.comware_route_policy_lines(rm, self.report, _IND)
+            if rm.name not in skip:
+                self.out += routemap_text.comware_route_policy_lines(rm, self.report, _IND)
+        for name in bfd_text.pbr_maps(self.device):
+            for seq, acls, next_hop in bfd_text.pbr_entries(self.device, name, self.report, "Comware"):
+                self.out.append(f"policy-based-route {name} permit node {seq}")
+                if acls:
+                    self.out.append(f"{_IND}if-match acl name {acl_text.safe_name(acls[0])}")
+                    if len(acls) > 1:
+                        self.report.add("policy", f"route-map {name}", Severity.REVIEW, "rm-match-many",
+                                        f"node {seq} matches any of ACLs {', '.join(acls)}; one is written")
+                if next_hop:
+                    self.out.append(f"{_IND}apply next-hop {next_hop}")
+                self.block_end()
 
     def bgp(self) -> None:
         bgp = self.device.bgp
@@ -1111,6 +1130,8 @@ class Writer:
             lines.append(f"{pre} ebgp-max-hop {peer.ebgp_multihop}")
         if peer.shutdown:
             lines.append(f"{pre} ignore")
+        if peer.bfd:
+            lines.append(f"{pre} bfd")
         return lines
 
     @staticmethod

@@ -10,6 +10,7 @@ import ipaddress
 from typing import Callable, Dict, List, Tuple
 
 from .. import acl as acl_text
+from .. import bfd as bfd_text
 from .. import routemap as routemap_text
 from .. import bgp as bgp_text
 from .. import dhcp as dhcp_text
@@ -59,6 +60,9 @@ class Writer:
         self.spanning_tree()
         self.acls()
         self.policies()
+        if bfd_text.uses_bfd(self.device):
+            self.out.append("bfd")
+        bfd_text.pbr_unsupported(self.device, self.report, "AOS-CX")
         self.qos()
         self.vlans()
         self.groups = {i.name: fhrp.plan(i, "aoscx", self.report, self.port(i.name))
@@ -687,6 +691,8 @@ class Writer:
         for source in p.redistribute:
             rm = p.redistribute_maps.get(source)
             lines.append(f"redistribute {source}" + (f" route-map {rm}" if rm else ""))
+        if p.bfd_all:
+            lines.append("bfd all-interfaces")
         if p.default_originate:
             lines.append("default-information originate" + (" always" if p.default_originate == "always" else ""))
         for dotted in sorted(set(areas.values()) | set(p.area_types), key=ospf_text.area_number):
@@ -726,8 +732,10 @@ class Writer:
         routemap_text.items(self.device, self.report)
         for pl in self.device.prefix_lists.values():
             self.out += routemap_text.ios_prefix_lines(pl, "aoscx")
+        skip = bfd_text.pbr_only(self.device)  # reported with the interface
         for rm in self.device.route_maps.values():
-            self.out += routemap_text.ios_route_map_lines(rm, "aoscx", self.report, _IND)
+            if rm.name not in skip:
+                self.out += routemap_text.ios_route_map_lines(rm, "aoscx", self.report, _IND)
 
     def bgp(self) -> None:
         bgp = self.device.bgp
@@ -754,6 +762,8 @@ class Writer:
                 lines.append(f"{pre} ebgp-multihop {peer.ebgp_multihop}")
             if peer.shutdown:
                 lines.append(f"{pre} shutdown")
+            if peer.bfd:
+                lines.append(f"{pre} fall-over bfd")
         for af in ("ipv4", "ipv6"):
             body: List[str] = []
             for peer in neighbors:
@@ -790,7 +800,9 @@ class Writer:
             lines.append(f"ip ospf cost {iface.ospf_cost}")
         if iface.ospf_network:
             lines.append(f"ip ospf network {iface.ospf_network}")
-        return lines
+        if iface.ospf_bfd and not any(p.bfd_all for p in self.device.ospf):
+            lines.append("ip ospf bfd")
+        return lines + bfd_text.separate_lines(iface)
 
     def _layer2(self, iface: Interface, add: _Add) -> List[str]:
         if iface.lag:

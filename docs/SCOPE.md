@@ -54,6 +54,8 @@ platform converts to and from all the others.
 | VRF route leaking: route distinguisher, import and export route targets | `VrfInfo` | 4 (done) |
 | Multi-chassis LAG: EOS MLAG and AOS-CX VSX (peer link, keepalive, shared LAGs) | `Mlag`, `Interface.mlag_id` | 4 (done) |
 | Prefix lists and route maps (Comware route policies), on BGP neighbors and redistribution | `PrefixList`, `RouteMap`, `BgpNeighbor.route_map_*` | 4 (done) |
+| Policy-based routing (route map on an interface; EOS pbr policy, Comware policy-based-route) | `Interface.pbr` | 4 (done) |
+| BFD: interface timers, BGP neighbors, OSPF interfaces | `Interface.bfd_*`, `BgpNeighbor.bfd`, `Ospf.bfd_all` | 4 (done) |
 | vPC (NX-OS), VXLAN/EVPN | to come | 3+ |
 
 ### AOS-S specifics
@@ -230,6 +232,20 @@ platform converts to and from all the others.
   route maps match no ACLs (the entry is written without the match); AOS-S writes no prefix lists or route maps, and
   its OSPF redistribution goes without the route map. Other match and set clauses (continue, communities lists, ...)
   are listed under "Not understood".
+
+## Policy-based routing and BFD
+
+* PBR is a route map on the interface, with entries that match ACLs and set a next hop. IOS: `ip policy route-map`.
+  EOS: `service-policy type pbr input P` with `policy-map type pbr` and a `class-map type pbr` per entry (read back
+  as a route map, entries numbered 10, 20, ...). Comware: `ip policy-based-route P` with `policy-based-route P
+  permit node N`, `if-match acl name`, `apply next-hop`. A route map used only for PBR is written in the PBR form only.
+* Reported limits: deny entries, and matches or sets other than ACLs and the next hop, are left out of EOS and
+  Comware PBR policies; AOS-CX (PBR action lists) and AOS-S leave PBR to a person.
+* BFD keeps its interface timers (IOS `bfd interval T min_rx R multiplier M`, EOS `min-rx`; AOS-CX and Comware
+  `bfd min-transmit-interval`, `min-receive-interval`, `detect-multiplier`), BGP neighbors (IOS and AOS-CX
+  `fall-over bfd`, EOS `bfd`, Comware `peer X bfd`) and OSPF (IOS `ip ospf bfd` or `bfd all-interfaces`, EOS
+  `ip ospf neighbor bfd` or `bfd default`, AOS-CX `ip ospf bfd` or `bfd all-interfaces` with global `bfd`, Comware
+  `ospf bfd enable` on each OSPF interface). AOS-S has no BFD (reported).
 
 ## VRF route leaking
 

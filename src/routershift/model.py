@@ -203,6 +203,11 @@ class Interface:
     nat: str = ""  # "inside", "outside" or ""
     ospf_cost: Optional[int] = None
     ospf_network: str = ""  # "", "point-to-point", "broadcast"
+    ospf_bfd: bool = False  # OSPF neighbors on this interface are watched by BFD
+    bfd_interval: Optional[int] = None  # BFD transmit interval, ms
+    bfd_min_rx: Optional[int] = None  # BFD receive interval, ms
+    bfd_multiplier: Optional[int] = None  # BFD detection multiplier
+    pbr: str = ""  # policy-based routing: the route map (Comware policy-based-route, EOS pbr policy) on received packets
     crypto_map: str = ""  # policy-based IPsec applied on the interface
     tunnel_source: str = ""  # tunnel: a canonical interface name or an address
     tunnel_destination: str = ""
@@ -274,6 +279,7 @@ class Ospf:
     redistribute: List[str] = field(default_factory=list)  # "connected", "static", "bgp"
     redistribute_maps: Dict[str, str] = field(default_factory=dict)  # source -> route map that filters it
     default_originate: str = ""  # "", "on", "always"
+    bfd_all: bool = False  # BFD on every OSPF interface (IOS bfd all-interfaces, EOS bfd default)
     reference_bandwidth: Optional[int] = None  # Mbit/s
     origin: Origin = field(default_factory=Origin)
 
@@ -296,6 +302,7 @@ class BgpNeighbor:
     ebgp_multihop: Optional[int] = None  # TTL
     next_hop_self: bool = False
     send_community: bool = False
+    bfd: bool = False  # BFD watches the session (IOS fall-over bfd)
     families: List[str] = field(default_factory=list)  # address families it is active in: "ipv4", "ipv6"
     route_map_in: str = ""  # route map on received routes, in every address family the neighbor is active in
     route_map_out: str = ""

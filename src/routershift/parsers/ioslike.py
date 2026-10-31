@@ -78,6 +78,7 @@ class _Reader:
         self._switchport_seen: Dict[str, bool] = {}  # any switchport line seen
         self._varp_mac = ""  # EOS: ip virtual-router mac-address
         self._vrrp_v3 = False  # IOS XE: fhrp version vrrp v3
+        self._pbr_classes: Dict[str, List[str]] = {}  # EOS class-map type pbr -> its ACLs
         self._ospf_areas: List[Tuple[str, str, str]] = []  # interface, process ("" = the interface's VRF), area
         self._dhcp_excluded: Dict[str, List[Tuple[str, str]]] = {}  # VRF -> excluded ranges
         self._ikev2_lifetime: Optional[int] = None
@@ -604,6 +605,8 @@ class _Reader:
     def class_map(self, node: Node) -> bool:
         """IOS: class-map [match-any|match-all] NAME; EOS: class-map type qos [match-any] NAME"""
         w = node.words[1:]
+        if w[:2] == ["type", "pbr"]:
+            return self._pbr_class(node, w[2:])
         if w[:2] == ["type", "qos"]:
             w = w[2:]
         match_all = w[0] != "match-any"  # IOS defaults to match-all
@@ -631,6 +634,8 @@ class _Reader:
     def policy_map(self, node: Node) -> bool:
         """IOS: policy-map NAME; EOS: policy-map type quality-of-service NAME"""
         w = node.words[1:]
+        if w[:2] == ["type", "pbr"] and len(w) == 3:
+            return self._pbr_policy(node, w[2])
         if w[:2] == ["type", "quality-of-service"]:
             w = w[2:]
         if len(w) != 1:
@@ -649,6 +654,41 @@ class _Reader:
                 except (ValueError, IndexError):
                     understood = False
                 if not understood:
+                    self.unparsed(line, f"{node.text} / {child.text}")
+        return True
+
+    def _pbr_class(self, node: Node, w: List[str]) -> bool:
+        """EOS: class-map type pbr [match-any] NAME with match ip access-group ACL."""
+        if w[:1] == ["match-any"]:
+            w = w[1:]
+        if len(w) != 1:
+            return False
+        acls = self._pbr_classes.setdefault(w[0], [])
+        for child in node.children:
+            c = child.words
+            if c[:3] == ["match", "ip", "access-group"] and len(c) == 4:
+                acls.append(c[3])
+            else:
+                self.unparsed(child, node.text)
+        return True
+
+    def _pbr_policy(self, node: Node, name: str) -> bool:
+        """EOS: policy-map type pbr NAME, read as a route map with an entry per class (match its ACLs, set the next
+        hop)."""
+        rm = routemap_text.route_map(self.device, name)
+        rm.origin = Origin(node.line, node.text)
+        for child in node.children:
+            c = child.words
+            if c[0] != "class" or len(c) != 2 or c[1] not in self._pbr_classes:
+                self.unparsed(child, node.text)
+                continue
+            e = routemap_text.entry(rm, 10 * (len(rm.entries) + 1), "permit")
+            e.match_acls += self._pbr_classes[c[1]]
+            for line in child.children:
+                x = line.words
+                if x[:2] == ["set", "nexthop"] and len(x) in (3, 4) and x[2:3] in ([x[-1]], ["recursive"]):
+                    e.sets["next-hop"] = str(ipaddress.ip_address(x[-1]))
+                else:
                     self.unparsed(line, f"{node.text} / {child.text}")
         return True
 
@@ -1280,6 +1320,8 @@ class _Reader:
             elif rest:
                 return False  # a metric
             p.redistribute.append(w[1])
+        elif w in (["bfd", "all-interfaces"], ["bfd", "default"]):
+            p.bfd_all = True
         elif w[:2] == ["default-information", "originate"] and w[2:] in ([], ["always"]):
             p.default_originate = "always" if n == 3 else "on"
         elif w[:2] == ["auto-cost", "reference-bandwidth"] and n == 3:
@@ -1910,6 +1952,15 @@ class _Reader:
             iface.stp_port_priority = int(w[2])
         elif w[0] in ("authentication", "access-session", "dot1x", "mab") and n >= 1:
             return self.dot1x_line(iface, w)
+        elif w[:4] == ["service-policy", "type", "pbr", "input"] and n == 5:
+            iface.pbr = w[4]
+        elif w[:3] == ["ip", "policy", "route-map"] and n == 4:
+            iface.pbr = w[3]
+        elif w[0] == "bfd" and n == 7 and w[1] == "interval" and w[3] in ("min_rx", "min-rx") and \
+                w[5] == "multiplier":
+            iface.bfd_interval, iface.bfd_min_rx, iface.bfd_multiplier = int(w[2]), int(w[4]), int(w[6])
+        elif w in (["ip", "ospf", "bfd"], ["ip", "ospf", "neighbor", "bfd"]):
+            iface.ospf_bfd = True
         elif w[0] == "service-policy" and n in (3, 5):
             # IOS: service-policy input|output P; EOS: service-policy type qos input P
             args = w[3:] if w[1:3] == ["type", "qos"] else w[1:]
@@ -2064,6 +2115,8 @@ def ioslike_neighbor(b: bgp_text.Builder, name: str, w: List[str], af: str) -> b
         peer.send_community = True
     elif w == ["activate"]:
         b.activate(name, af or "ipv4")
+    elif w in (["fall-over", "bfd"], ["bfd"]):
+        peer.bfd = True
     elif routemap_text.neighbor_policy(peer, w):
         pass
     else:

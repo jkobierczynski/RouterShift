@@ -77,6 +77,7 @@ def effective(bgp: Bgp, neighbor: BgpNeighbor) -> BgpNeighbor:
     result.ebgp_multihop = result.ebgp_multihop if result.ebgp_multihop is not None else group.ebgp_multihop
     result.next_hop_self = result.next_hop_self or group.next_hop_self
     result.send_community = result.send_community or group.send_community
+    result.bfd = result.bfd or group.bfd
     for attr in ("route_map_in", "route_map_out", "prefix_list_in", "prefix_list_out"):
         setattr(result, attr, getattr(result, attr) or getattr(group, attr))
     result.families = sorted(set(result.families) | set(group.families))

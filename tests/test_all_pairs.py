@@ -15,6 +15,7 @@ from routershift import stp as stp_text
 from routershift import wlan as wlan_text
 from routershift import vpn as vpn_text
 from routershift import vrfs as vrfs_text
+from routershift import bfd as bfd_text
 from routershift import routemap as routemap_text
 from routershift import ospf as ospf_text
 from routershift.acl import safe_name
@@ -285,11 +286,20 @@ def test_converts_and_reads_back(source: str, target: str) -> None:
         prefixes = lambda dev: {n: (p.family, p.entries) for n, p in dev.prefix_lists.items()}  # noqa: E731
         assert prefixes(back) == prefixes(first)
 
+        # (a route map only used for PBR is a PBR policy, its entries numbered anew on EOS, and missing on AOS-CX)
+        pbr = bfd_text.pbr_only(first)
+
         def entries(dev: Device) -> dict:
             return {n: [(e.seq, e.action, e.match_prefix_lists, e.match_prefix_lists6,
                          [] if target == "aoscx" else [safe_name(a) for a in e.match_acls], e.match_tags, e.sets,
-                         e.community_additive) for e in rm.entries] for n, rm in dev.route_maps.items()}
+                         e.community_additive) for e in rm.entries] for n, rm in dev.route_maps.items()
+                    if n not in pbr}
         assert entries(back) == entries(first)
+        def pbr_entries(dev: Device) -> dict:
+            return {n: [([safe_name(a) for a in e.match_acls], e.sets) for e in dev.route_maps[n].entries]
+                    for n in pbr}
+        if target != "aoscx":
+            assert pbr_entries(back) == pbr_entries(first)
         policies = lambda dev: [(n.route_map_in, n.route_map_out, n.prefix_list_in, n.prefix_list_out)  # noqa: E731
                                 for n in bgp_text.flat(dev.bgp)] if dev.bgp else []
         assert policies(back) == policies(first)
@@ -300,4 +310,17 @@ def test_converts_and_reads_back(source: str, target: str) -> None:
         assert not back.route_maps and not back.prefix_lists
         if first.route_maps:
             assert "route maps are not written" in report.to_text()
+    # BFD keeps its timers, BGP neighbors and OSPF interfaces (an "all interfaces" setting may be spread over them),
+    # and PBR its route map on the interface; AOS-S has neither, AOS-CX no PBR
+    if target == "aoss":
+        assert not bfd_text.uses_bfd(back) and not bfd_text.pbr_maps(back)
+    else:
+        timers = lambda dev: sorted((i.bfd_interval, i.bfd_min_rx, i.bfd_multiplier)  # noqa: E731
+                                    for i in dev.interfaces.values() if bfd_text.has_timers(i))
+        assert timers(back) == timers(first)
+        peers = lambda dev: [n.bfd for n in bgp_text.flat(dev.bgp)] if dev.bgp else []  # noqa: E731
+        assert peers(back) == peers(first)
+        assert len(bfd_text.ospf_interfaces(back)) == len(bfd_text.ospf_interfaces(first))
+        if target != "aoscx":
+            assert bfd_text.pbr_maps(back) == bfd_text.pbr_maps(first)
     assert report.counts()
