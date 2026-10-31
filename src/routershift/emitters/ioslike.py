@@ -15,6 +15,7 @@ from .. import dhcp as dhcp_text
 from .. import fhrp
 from .. import nat as nat_text
 from .. import ospf as ospf_text
+from .. import mgmt as mgmt_text
 from .. import mpls as mpls_text
 from .. import qos as qos_text
 from .. import snmp as snmp_text
@@ -229,6 +230,9 @@ class Writer:
         lines += self._qos_interface(iface, add)
         if iface.mpls:
             lines.append("mpls ip" if self.ios else "mpls ldp interface")
+        lines += [f"no lldp {name}" for name, on in (("transmit", iface.lldp_tx), ("receive", iface.lldp_rx)) if not on]
+        if iface.cdp is not None and self.ios:
+            lines.append("cdp enable" if iface.cdp else "no cdp enable")
         if iface.stp_portfast:
             trunk = iface.mode == SwitchportMode.TRUNK
             lines.append("spanning-tree portfast trunk" if self.ios and trunk else "spanning-tree portfast")
@@ -1418,9 +1422,65 @@ class Writer:
                 self.out.append(f"logging host {host} vrf {vrf}" if self.ios else f"logging vrf {vrf} host {host}")
         if s.syslog_servers:
             self.report.item("system", "syslog servers")
+        if s.logging_level is not None:
+            self.out.append(f"logging trap {mgmt_text.LEVELS[s.logging_level]}")
+            self.report.item("system", "syslog level")
+        if s.logging_source:
+            self.out.append(f"logging source-interface {self.port(s.logging_source)}")
+            self.report.item("system", "syslog source")
+        self._management()
         if s.timezone:
             self._timezone(s.timezone)
         self.out.append("!")
+
+    def _management(self) -> None:
+        """SSH, Telnet and HTTP(S) servers, the remote login limits, LLDP and CDP."""
+        m = self.device.management
+        rep = self.report
+        mgmt_text.items(self.device, rep)
+        ind = self.ind
+        if self.ios:
+            if m.ssh:
+                self.out.append("ip ssh version 2")
+                rep.add("management", "ssh server", Severity.REVIEW, "ssh-keys",
+                        "generate the host key on the device (crypto key generate rsa modulus 3072)")
+            for name, value in (("server", m.http), ("secure-server", m.https)):
+                if value is not None:
+                    self.out.append(f"{'' if value else 'no '}ip http {name}")
+            if mgmt_text.has_lines(self.device):
+                self.out.append("line vty 0 15")
+                if m.ssh is not None or m.telnet is not None:
+                    self.out.append(f"{ind}transport input {mgmt_text.transport(self.device)}")
+                if m.vty_acl:
+                    self.out.append(f"{ind}access-class {acl_text.safe_name(m.vty_acl)} in")
+                if m.exec_timeout is not None:
+                    self.out.append(f"{ind}exec-timeout {m.exec_timeout} 0")
+                self.out.append("!")
+        else:
+            if m.ssh is not None or m.vty_acl or m.exec_timeout is not None or m.vrf:
+                self.out.append("management ssh")
+                if m.vty_acl:
+                    self.out.append(f"{ind}ip access-group {acl_text.safe_name(m.vty_acl)} in")
+                if m.exec_timeout is not None:
+                    self.out.append(f"{ind}idle-timeout {m.exec_timeout}")
+                if m.ssh is False:
+                    self.out.append(f"{ind}shutdown")
+                if m.vrf:
+                    self.out += [f"{ind}vrf {self.vrf(m.vrf)}", f"{ind * 2}no shutdown"]
+                self.out.append("!")
+            if m.telnet is not None:
+                self.out += ["management telnet", f"{ind}{'no shutdown' if m.telnet else 'shutdown'}", "!"]
+            for name, value in (("http server", m.http), ("https server", m.https)):
+                if value:
+                    rep.add("management", name, Severity.REVIEW, "mgmt-unsupported",
+                            "EOS has no web interface (its HTTP service is the eAPI, management api "
+                            "http-commands); left out")
+        if m.lldp is not None:
+            self.out.append("lldp run" if m.lldp else "no lldp run")
+        if m.cdp is not None and self.ios:
+            self.out.append("cdp run" if m.cdp else "no cdp run")
+        elif m.cdp:
+            rep.add("management", "CDP", Severity.APPROX, "cdp-lldp", "EOS has no CDP; LLDP announces the switch")
 
     def _timezone(self, tz: str) -> None:
         words = tz.split()

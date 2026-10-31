@@ -12,6 +12,7 @@ from typing import Callable, Dict, List, Tuple
 from .. import acl as acl_text
 from .. import bgp as bgp_text
 from .. import dhcp as dhcp_text
+from .. import mgmt as mgmt_text
 from .. import mpls as mpls_text
 from .. import nat as nat_text
 from .. import wlan as wlan_text
@@ -137,14 +138,50 @@ class Writer:
         if s.dns_servers:
             self.out.append(f"ip dns server-address {' '.join(s.dns_servers)}{via}")
             rep.item("system", "name servers")
+        severity = f" severity {mgmt_text.SHORT[s.logging_level]}" if s.logging_level is not None else ""
         for host in s.syslog_servers:
-            self.out.append(f"logging {host}{via}")
+            self.out.append(f"logging {host}{severity}{via}")
         if s.syslog_servers:
             rep.item("system", "syslog servers")
+        if s.logging_level is not None:
+            rep.item("system", "syslog level")
+            if not s.syslog_servers:
+                rep.add("system", "syslog level", Severity.REVIEW, "syslog-level",
+                        "AOS-CX sets the level per syslog server and there is none; left out")
+        if s.logging_source:
+            self.out.append(f"ip source-interface syslog interface {self.port(s.logging_source).replace(' ', '')}")
+            rep.item("system", "syslog source")
+        self.management()
         self.snmp()
         self.users()
         self.aaa()
         self.out.append("!")
+
+    def management(self) -> None:
+        """SSH and HTTPS servers in a VRF, the CLI session timeout and LLDP; AOS-CX has no Telnet or plain HTTP
+        server, and no CDP."""
+        d = self.device
+        m = d.management
+        rep = self.report
+        mgmt_text.items(d, rep)
+        mgmt = any(i.kind == InterfaceKind.MANAGEMENT for i in d.interfaces.values())
+        vrf = self.vrf(m.vrf) if m.vrf else MGMT_VRF if mgmt else "default"
+        if m.ssh:
+            self.out.append(f"ssh server vrf {vrf}")
+        if m.https:
+            self.out.append(f"https-server vrf {vrf}")
+        mgmt_text.no_server(rep, "telnet server", "AOS-CX", m.telnet)
+        mgmt_text.no_server(rep, "http server", "AOS-CX", m.http)
+        if m.vty_acl:
+            rep.add("management", "remote login ACL", Severity.REVIEW, "mgmt-acl",
+                    f"apply ACL {m.vty_acl} to the control plane by hand (apply access-list ip ... control-plane vrf "
+                    f"{vrf})")
+        if m.exec_timeout is not None:
+            self.out += ["cli-session", f"    timeout {m.exec_timeout}"]
+        if m.lldp is False:
+            self.out.append("no lldp")
+        if m.cdp:
+            rep.add("management", "CDP", Severity.APPROX, "cdp-lldp", "AOS-CX has no CDP; LLDP announces the switch")
 
     def users(self) -> None:
         if self.device.aaa.enable_secret is not None:
@@ -501,6 +538,7 @@ class Writer:
         lines += self._ospf_interface(iface)
         lines += self._port_access_interface(iface, add)
         lines += self._qos_interface(iface, add)
+        lines += [f"no lldp {name}" for name, on in (("transmit", iface.lldp_tx), ("receive", iface.lldp_rx)) if not on]
         if iface.stp_portfast:
             lines.append("spanning-tree port-type admin-edge")
         if iface.stp_bpduguard:

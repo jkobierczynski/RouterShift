@@ -7,6 +7,7 @@ from routershift import bgp as bgp_text
 from routershift import nat as nat_text
 from routershift import aaa as aaa_text
 from routershift import snmp as snmp_text
+from routershift import mgmt as mgmt_text
 from routershift import mpls as mpls_text
 from routershift import qos as qos_text
 from routershift import stp as stp_text
@@ -173,6 +174,28 @@ def test_converts_and_reads_back(source: str, target: str) -> None:
         assert wlans(first) == wlans(back)
     elif first.wlans:
         assert not back.wlans and "is no wireless controller" in report.to_text()
+    # Syslog keeps its level (AOS-S has five) and source; the management servers, the remote login limits and LLDP
+    # keep what the target can say (AOS-CX has no Telnet or HTTP, EOS no web interface; only IOS and EOS take a login
+    # ACL; AOS-CX only writes LLDP off; CDP lives on IOS and AOS-S)
+    s1, s2 = first.system, back.system
+    if s1.logging_level is not None and not (target == "aoscx" and not s1.syslog_servers):  # (set per server)
+        assert s2.logging_level == (mgmt_text.level(mgmt_text.AOSS[s1.logging_level]) if target == "aoss"
+                                    else s1.logging_level)
+    if not (target == "aoss" and not s1.logging_source.startswith(("Vlan", "Loopback"))):
+        assert bool(s2.logging_source) == bool(s1.logging_source)  # (management ports are renamed)
+    m1, m2 = first.management, back.management
+    assert (m2.ssh, m2.exec_timeout) == (m1.ssh or (None if target == "aoscx" else m1.ssh), m1.exec_timeout)
+    # (an IOS or Comware VTY line that allows SSH shuts Telnet out)
+    assert bool(m2.telnet) == bool(m1.telnet) and (m2.telnet is None) == (target == "aoscx" or m1.telnet is None
+                                                                         and target not in ("ios", "comware"))
+    assert m2.http == (None if target in ("aoscx", "eos") else m1.http)
+    assert m2.https == (None if target == "eos" else m1.https)
+    assert m2.vty_acl == (safe_name(m1.vty_acl) if target in ("ios", "eos") else "")
+    assert m2.lldp == (None if target == "aoscx" and m1.lldp else m1.lldp)
+    assert m2.cdp == (m1.cdp if target in ("ios", "aoss") else None)
+    lldp_ports = lambda dev: sorted((i.lldp_tx, i.lldp_rx) for i in dev.interfaces.values()  # noqa: E731
+                                    if not (i.lldp_tx and i.lldp_rx))
+    assert lldp_ports(first) == lldp_ports(back)
     # QoS keeps every applied policy with its classes (DSCP values, or an ACL with as many rules), markings and
     # police rates, and the trust of every port (AOS-CX has no default class; EOS takes no output policy)
     def qos(dev: Device) -> list:

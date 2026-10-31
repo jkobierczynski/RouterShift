@@ -91,6 +91,23 @@ class System:
     ntp_authenticate: bool = False  # only take time from authenticated servers
     ntp_source: str = ""  # canonical name of the interface NTP packets leave from
     transfer_source: Dict[str, str] = field(default_factory=dict)  # "tftp" / "ftp" -> canonical source interface
+    logging_level: Optional[int] = None  # severity sent to the syslog servers, 0 (emergencies) to 7 (debugging)
+    logging_source: str = ""  # canonical name of the interface syslog packets leave from
+
+
+@dataclass
+class Management:
+    """How the device is managed: its login servers and their limits, and neighbor discovery. None means the
+    source does not say, and the target keeps its own default."""
+    ssh: Optional[bool] = None
+    telnet: Optional[bool] = None
+    http: Optional[bool] = None
+    https: Optional[bool] = None
+    vrf: str = ""  # the VRF the SSH and HTTPS servers listen in, where the platform names one
+    vty_acl: str = ""  # IPv4 ACL that limits who may log in remotely
+    exec_timeout: Optional[int] = None  # idle timeout of remote sessions, in minutes (0 = never)
+    lldp: Optional[bool] = None
+    cdp: Optional[bool] = None
 
 
 @dataclass
@@ -150,6 +167,9 @@ class Interface:
     qos_policy_in: str = ""  # QosPolicy names
     qos_policy_out: str = ""
     mpls: bool = False  # MPLS label switching with LDP on the interface
+    lldp_tx: bool = True  # LLDP sends on the port (where LLDP runs)
+    lldp_rx: bool = True  # LLDP listens on the port
+    cdp: Optional[bool] = None  # CDP on the port, where stated
     fhrp: List["FhrpGroup"] = field(default_factory=list)
     nat: str = ""  # "inside", "outside" or ""
     ospf_cost: Optional[int] = None
@@ -594,6 +614,7 @@ class Device:
     stp: Stp = field(default_factory=Stp)
     mpls: Mpls = field(default_factory=Mpls)
     wlans: List[Wlan] = field(default_factory=list)
+    management: Management = field(default_factory=Management)
     qos_classes: Dict[str, QosClass] = field(default_factory=dict)
     qos_policies: Dict[str, QosPolicy] = field(default_factory=dict)
     snmp: Snmp = field(default_factory=Snmp)

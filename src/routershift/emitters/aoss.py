@@ -18,6 +18,7 @@ from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from .. import acl as acl_text
 from .. import dhcp as dhcp_text
+from .. import mgmt as mgmt_text
 from .. import mpls as mpls_text
 from .. import nat as nat_text
 from .. import wlan as wlan_text
@@ -231,6 +232,17 @@ class Writer:
             self.out.append(f"logging {host}")
         if s.syslog_servers:
             rep.item("system", "syslog servers")
+        if s.logging_level is not None:
+            rep.item("system", "syslog level")
+            self.out.append(f"logging severity {mgmt_text.aoss_level(s.logging_level, rep)}")
+        if s.logging_source.startswith(("Vlan", "Loopback")):
+            kind = "vlan" if s.logging_source.startswith("Vlan") else "loopback"
+            self.out.append(f"ip source-interface syslog {kind} {s.logging_source.lstrip('VlanLoopback')}")
+            rep.item("system", "syslog source")
+        elif s.logging_source:
+            rep.add("system", "syslog source", Severity.REVIEW, "syslog-source",
+                    f"source {s.logging_source} is not a VLAN or loopback; set 'ip source-interface syslog' by hand")
+        self.management()
         self.snmp()
         self.users()
         self.aaa()
@@ -339,6 +351,37 @@ class Writer:
                 rep.skip("management", label, "aaa-list",
                          "AOS-S has no such list (only per-access authentication, command authorization and "
                          "default accounting); configure it by hand")
+
+    def management(self) -> None:
+        """SSH, Telnet and web servers, the session timeout, LLDP (with per-port admin status) and CDP."""
+        d = self.device
+        m = d.management
+        rep = self.report
+        mgmt_text.items(d, rep)
+        if m.ssh is not None:
+            self.out.append("ip ssh" if m.ssh else "no ip ssh")
+        if m.telnet is not None:
+            self.out.append("telnet-server" if m.telnet else "no telnet-server")
+        for name, value in (("plaintext", m.http), ("ssl", m.https)):
+            if value is not None:
+                self.out.append(f"{'' if value else 'no '}web-management {name}")
+        if m.vty_acl:
+            rep.add("management", "remote login ACL", Severity.REVIEW, "mgmt-acl",
+                    f"AOS-S limits management access with 'ip authorized-managers'; write ACL {m.vty_acl} as such by "
+                    "hand")
+        if m.exec_timeout is not None:
+            self.out.append(f"console idle-timeout {m.exec_timeout * 60}")
+        if m.vrf:
+            rep.add("management", "ssh server", Severity.APPROX, "mgmt-vrf",
+                    f"AOS-S has no VRFs; the servers listen on every interface (the source used VRF {m.vrf})")
+        if m.lldp is not None:
+            self.out.append("lldp run" if m.lldp else "no lldp run")
+        if m.cdp is not None:
+            self.out.append("cdp run" if m.cdp else "no cdp run")
+        for status, tx, rx in (("txonly", True, False), ("rxonly", False, True), ("disable", False, False)):
+            names = [self.port(i.name) for i in d.interfaces.values() if (i.lldp_tx, i.lldp_rx) == (tx, rx)]
+            if names:
+                self.out.append(f"lldp admin-status {port_list(names)} {status}")
 
     def _port_access(self) -> None:
         """802.1X (authenticator) and MAC authentication (mac-based) on the ports, and the servers they use."""

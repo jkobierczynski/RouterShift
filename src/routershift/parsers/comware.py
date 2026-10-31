@@ -27,6 +27,7 @@ from .. import bgp as bgp_text
 from .. import confparse
 from .. import dhcp as dhcp_text
 from .. import ospf as ospf_text
+from .. import mgmt as mgmt_text
 from .. import qos as qos_text
 from .. import vpn as vpn_text
 from ..confparse import Node
@@ -187,6 +188,10 @@ class _Reader:
             "mpls": self.mpls,
             "wlan": self.wlan,
             "ftp": self.transfer,
+            "ssh": self.server,
+            "telnet": self.server,
+            "lldp": self.server,
+            "undo": self.undo,
         }
         for node in roots:
             if node.text.startswith(_NOISE):
@@ -614,13 +619,45 @@ class _Reader:
         return True
 
     def line(self, node: Node) -> bool:
-        """line vty|class ...: AAA ('authentication-mode scheme') is what the method lists describe"""
+        """line vty|class ...: AAA ('authentication-mode scheme') is what the method lists describe; the VTY lines
+        also say which protocols come in and the idle timeout."""
         if node.words[1] not in ("vty", "class", "aux", "console"):
             return False
+        m = self.device.management
+        vty = node.words[1] == "vty"
         for child in node.children:
-            if child.words != ["authentication-mode", "scheme"]:
+            c = child.words
+            if c == ["authentication-mode", "scheme"]:
+                continue
+            if vty and c[:2] == ["protocol", "inbound"] and len(c) == 3 and c[2] in ("ssh", "telnet", "all"):
+                m.ssh = c[2] in ("ssh", "all") if m.ssh is not False else m.ssh
+                m.telnet = c[2] in ("telnet", "all") if m.telnet is not False else m.telnet
+            elif vty and c[0] == "idle-timeout" and len(c) in (2, 3) and all(x.isdigit() for x in c[1:]):
+                m.exec_timeout = int(c[1]) + (1 if c[2:] and int(c[2]) else 0)
+            else:
                 self.unparsed(child, node.text)
         return True
+
+    def server(self, node: Node) -> bool:
+        """ssh server enable, telnet server enable, lldp global enable."""
+        w = node.words
+        if w in (["ssh", "server", "enable"], ["telnet", "server", "enable"], ["lldp", "global", "enable"]):
+            setattr(self.device.management, w[0], True)
+            return True
+        return False
+
+    def undo(self, node: Node) -> bool:
+        w = node.words[1:]
+        m = self.device.management
+        if w in (["ssh", "server", "enable"], ["telnet", "server", "enable"], ["lldp", "global", "enable"]):
+            setattr(m, w[0], False)
+            return True
+        if w in (["ip", "http", "enable"], ["ip", "https", "enable"]):
+            setattr(m, w[1], False)
+            return True
+        if w[:1] == ["stp"]:
+            return self.stp(node)
+        return False
 
     @staticmethod
     def _methods(words: List[str]) -> Optional[List[str]]:
@@ -670,6 +707,13 @@ class _Reader:
 
     def info_center(self, node: Node) -> bool:
         w = node.words
+        if w[1:3] == ["loghost", "source"] and len(w) == 4:
+            self.device.system.logging_source = canonical(w[3])[0]
+            return True
+        if w[1:4] == ["source", "default", "loghost"] and len(w) == 6 and w[4] == "level" \
+                and mgmt_text.level(w[5]) is not None:
+            self.device.system.logging_level = mgmt_text.level(w[5])
+            return True
         if w[1:2] == ["loghost"]:
             args = self._vpn(w[2:])
             if len(args) == 1 and _is_address(args[0]):
@@ -679,6 +723,9 @@ class _Reader:
 
     def ip(self, node: Node) -> bool:
         w = node.words
+        if w[1:] in (["http", "enable"], ["https", "enable"]):
+            setattr(self.device.management, w[1], True)
+            return True
         if w[1:2] == ["vpn-instance"] and len(w) == 3:
             if w[2] not in self.device.vrfs:
                 self.device.vrfs.append(w[2])
@@ -1416,6 +1463,10 @@ class _Reader:
             setattr(iface, f"qos_policy_{'in' if w[4] == 'inbound' else 'out'}", w[3])
         elif w[:2] == ["qos", "trust"] and n == 3 and w[2] in ("dscp", "dot1p"):
             iface.qos_trust = "cos" if w[2] == "dot1p" else "dscp"
+        elif w[:2] == ["lldp", "admin-status"] and n == 3 and w[2] in ("tx", "rx", "disable", "txrx"):
+            iface.lldp_tx, iface.lldp_rx = w[2] in ("tx", "txrx"), w[2] in ("rx", "txrx")
+        elif w == ["undo", "lldp", "enable"]:
+            iface.lldp_tx = iface.lldp_rx = False
         elif w in (["mpls", "enable"], ["mpls", "ldp", "enable"]):
             iface.mpls = True
             if w[1] == "ldp":
