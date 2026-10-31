@@ -76,6 +76,7 @@ _KIND_TITLES = [
     ("nat", "NAT"),
     ("vpn", "Site-to-site VPN (IPsec)"),
     ("qos", "QoS"),
+    ("monitor", "Port mirroring, sFlow and NetFlow"),
     ("wlan", "Wireless (WLAN)"),
     ("management", "Management"),
     ("unparsed", "Not understood"),

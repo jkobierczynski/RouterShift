@@ -59,6 +59,9 @@ platform converts to and from all the others.
 | RIP: version, networks, passive interfaces, redistribution, default route, summary (IOS, EOS, Comware) | `Rip` | 4 (done) |
 | IS-IS: NETs, level, wide metrics, redistribution, interfaces (passive, metric, point-to-point) (IOS, EOS, Comware) | `Isis`, `Interface.isis*` | 4 (done) |
 | Multicast: IGMP snooping per VLAN and querier, multicast routing, PIM mode and IGMP version per interface, static RPs | `Vlan.igmp_*`, `Device.multicast_routing`, `Interface.pim` | 4 (done) |
+| Port mirroring (SPAN): local sessions, source ports with direction, destination port | `MirrorSession` | 4 (done) |
+| sFlow: collectors, agent address, sampling rate, polling interval, sampled ports (not IOS) | `Sflow`, `Interface.sflow` | 4 (done) |
+| NetFlow: collectors, export version, source interface, ports by direction (IOS, Comware) | `Netflow`, `Interface.flow` | 4 (done) |
 | vPC (NX-OS), VXLAN/EVPN | to come | 3+ |
 
 ### AOS-S specifics
@@ -251,6 +254,30 @@ platform converts to and from all the others.
   mode and IGMP version (IOS `ip pim sparse-mode`, EOS `pim ipv4 sparse-mode`, AOS-CX `ip pim-sparse enable` with
   `ip igmp enable`, Comware `pim sm` with `igmp enable`). EOS runs sparse mode only, and sparse-dense mode becomes
   sparse mode (reported). AOS-S multicast routing is left to a person (reported).
+
+## Port mirroring, sFlow and NetFlow
+
+* Mirror sessions keep their source ports, each with its direction (both, received or sent), and the destination
+  port: IOS `monitor session N source interface P [rx|tx]`, EOS `monitor session NAME source P`, AOS-CX `mirror
+  session N` with `source interface P both|rx|tx` and `destination interface P`, AOS-S `mirror N port P` with
+  `monitor all both|in|out mirror N` in the source port, Comware `mirroring-group N local` with `mirroring-port P
+  both|inbound|outbound` and `monitor-port P`. EOS names its sessions; the others number them (renumbered sessions
+  are reported). AOS-CX, AOS-S and Comware take four sessions; more are reported and left out. VLAN sources, RSPAN
+  and ERSPAN are listed under "Not understood".
+* sFlow keeps its collectors (address, port, VRF), agent address, sampling rate, polling interval and the ports that
+  sample: EOS `sflow destination`, `sflow source` or `sflow source-interface`, `sflow sample`, `sflow polling-interval`
+  and `sflow run` (every port samples; `no sflow enable` on the ones that do not), AOS-CX `sflow collector`,
+  `sflow agent-ip`, `sflow sampling`, `sflow polling` and `sflow` (globally, and in the ports when not all sample),
+  AOS-S `sflow 1 destination`, `sflow 1 sampling PORTS RATE` and `sflow 1 polling PORTS SECONDS` (one instance per
+  collector, three at most; no agent address), Comware `sflow agent ip`, `sflow collector N ip` and in the ports
+  `sflow sampling-rate`, `sflow flow collector`, `sflow counter interval`. The model keeps one rate for the device.
+  A target that takes an agent address writes the source interface's address. IOS has no sFlow (reported).
+* NetFlow keeps its collectors, export version, source interface and the ports that record flows (input, output or
+  both): IOS Flexible NetFlow (`flow exporter` and `flow monitor`, applied with `ip flow monitor M input`; the
+  traditional `ip flow-export` and `ip flow ingress` are read too) and Comware NetStream (`ip netstream export host`,
+  `ip netstream export version`, `ip netstream export source interface`, `ip netstream inbound`). The IOS writer
+  names its exporters RS-EXPORT-N and its monitor RS-MONITOR, with the predefined record `netflow ipv4
+  original-input` (a record of the source's own is reported). EOS, AOS-CX and AOS-S NetFlow is reported, not written.
 
 ## RIP and IS-IS
 

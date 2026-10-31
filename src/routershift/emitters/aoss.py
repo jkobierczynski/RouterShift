@@ -26,6 +26,7 @@ from .. import wlan as wlan_text
 from .. import vpn as vpn_text
 from .. import vrfs as vrfs_text
 from .. import multicast as multicast_text
+from .. import monitor as monitor_text
 from .. import bfd as bfd_text
 from .. import igp as igp_text
 from .. import routemap as routemap_text
@@ -92,6 +93,7 @@ class Writer:
         self.ospf_areas: Dict[str, str] = {}  # interface -> area, of the one process AOS-S runs
         self.voice: Set[int] = set()
         self.gateway_only: Optional[StaticRoute] = None  # the one default route, written as ip default-gateway
+        self.mirror_lines: Dict[str, List[str]] = {}  # port -> its monitor lines
 
     def label(self, iface: Interface) -> str:
         return f"{iface.source_name or iface.name} -> {self.port(iface.name)}"
@@ -107,6 +109,7 @@ class Writer:
         self.oobm()
         self.acls()
         self.qos()
+        self.monitor()
         self.interfaces()
         self.l2sec()
         self.routes()
@@ -564,6 +567,48 @@ class Writer:
             self.out += [_IND + line for line in lines]
             self.out.append(_IND + "exit")
 
+    def monitor(self) -> None:
+        """Mirror sessions (the destination globally, the sources in their ports) and sFlow; NetFlow is reported."""
+        d = self.device
+        rep = self.report
+        numbers = monitor_text.numbers(d, rep, "AOS-S", 4)
+        words = {"both": "both", "rx": "in", "tx": "out"}
+        for s in d.mirror_sessions:
+            sources = monitor_text.sources(s, rep, "AOS-S") if s.name in numbers else None
+            if sources is None:
+                continue
+            number = numbers[s.name]
+            self.out.append(f"mirror {number} port {self.port(s.destination)}")
+            for port, way in sources.items():
+                iface = d.interfaces.get(port)
+                if iface is None or iface.kind != InterfaceKind.ETHERNET:
+                    rep.add(monitor_text.KIND, monitor_text.label(s), Severity.REVIEW, "mirror-source",
+                            f"AOS-S mirrors ports here; source {port} is left out")
+                    continue
+                self.mirror_lines.setdefault(port, []).append(f"monitor all {words[way]} mirror {number}")
+        sf = d.sflow
+        if sf is not None:
+            rep.item(monitor_text.KIND, monitor_text.SFLOW)
+            if sf.agent or sf.source_interface:
+                rep.add(monitor_text.KIND, monitor_text.SFLOW, Severity.APPROX, "sflow-agent",
+                        "AOS-S has no agent address setting: it sends from its own address towards the collector")
+            monitor_text.vrf_unsupported(sf.collectors, rep, monitor_text.SFLOW, "AOS-S")
+            sampled = port_list([self.port(i.name) for i in monitor_text.sflow_ports(d)
+                                 if i.kind in (InterfaceKind.ETHERNET, InterfaceKind.LAG)])
+            if sf.collectors[3:]:
+                rep.add(monitor_text.KIND, monitor_text.SFLOW, Severity.REVIEW, "sflow-collectors",
+                        f"AOS-S has three sFlow instances; collectors past {sf.collectors[2].address} are left out")
+            if sampled and sf.sample_rate is None:
+                rep.add(monitor_text.KIND, monitor_text.SFLOW, Severity.REVIEW, "sflow-rate",
+                        "the source states no sampling rate, which AOS-S needs to sample; set one by hand")
+            for n, c in enumerate(sf.collectors[:3], 1):
+                self.out.append(f"sflow {n} destination {c.address}" + (f" {c.port}" if c.port is not None else ""))
+                if sampled and sf.sample_rate is not None:
+                    self.out.append(f"sflow {n} sampling {sampled} {sf.sample_rate}")
+                if sampled and sf.polling_interval is not None:
+                    self.out.append(f"sflow {n} polling {sampled} {sf.polling_interval}")
+        monitor_text.netflow_unsupported(d, rep, "AOS-S")
+
     def interfaces(self) -> None:
         for iface in self.device.interfaces.values():
             if iface.kind == InterfaceKind.LOOPBACK:
@@ -594,6 +639,7 @@ class Writer:
                         self.add(iface, Severity.APPROX, "storm-control",
                                  f"AOS-S takes whole percents: broadcast limit {level:g}% written as {round(level)}%")
                     lines.append(f"broadcast-limit {round(level)}")
+            lines += self.mirror_lines.get(iface.name, [])
             if iface.shutdown:
                 lines.append("disable")
             if iface.speed is not None:

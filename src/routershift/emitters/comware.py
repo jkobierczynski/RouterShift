@@ -22,6 +22,7 @@ from .. import l2sec as l2sec_text
 from .. import mgmt as mgmt_text
 from .. import vrfs as vrfs_text
 from .. import multicast as multicast_text
+from .. import monitor as monitor_text
 from .. import igp as igp_text
 from .. import bfd as bfd_text
 from .. import routemap as routemap_text
@@ -80,6 +81,7 @@ class Writer:
         self.dhcp()
         self.nat()
         self.vpn()
+        self.monitor()
         order = {InterfaceKind.LAG: 0}
         for iface in sorted(self.device.interfaces.values(), key=lambda i: order.get(i.kind, 1)):
             self.interface(iface)
@@ -91,6 +93,69 @@ class Writer:
         self.out.append("return")
         self.report.unparsed(self.device.unparsed)
         return "\n".join(self.out) + "\n"
+
+    def monitor(self) -> None:
+        """Mirroring groups, sFlow and NetStream; the ports name themselves in their interfaces."""
+        d = self.device
+        rep = self.report
+        numbers = monitor_text.numbers(d, rep, "Comware", 4)
+        words = {"both": "both", "rx": "inbound", "tx": "outbound"}
+        lines: List[str] = []
+        for s in d.mirror_sessions:
+            sources = monitor_text.sources(s, rep, "Comware") if s.name in numbers else None
+            if sources is None:
+                continue
+            head = f"mirroring-group {numbers[s.name]}"
+            lines += [f"{head} local"] + \
+                [f"{head} mirroring-port {self.port(p)} {words[way]}" for p, way in sources.items()] + \
+                [f"{head} monitor-port {self.port(s.destination)}"]
+        sf = d.sflow
+        if sf is not None:
+            rep.item(monitor_text.KIND, monitor_text.SFLOW)
+            agent = monitor_text.agent(d, sf, rep, "Comware")
+            if agent:
+                lines.append(f"sflow agent ip {agent}")
+            for n, c in enumerate(sf.collectors, 1):
+                vrf = f" vpn-instance {c.vrf}" if c.vrf else ""
+                port = f" port {c.port}" if c.port is not None else ""
+                lines.append(f"sflow collector {n}{vrf} ip {c.address}{port}")
+            if sf.collectors[1:]:
+                rep.add(monitor_text.KIND, monitor_text.SFLOW, Severity.APPROX, "sflow-collectors",
+                        f"a Comware port sends its samples to one collector: the ports use {sf.collectors[0].address}")
+        nf = d.netflow
+        if nf is not None:
+            monitor_text.netflow_item(nf, rep)
+            for c in nf.collectors:
+                vrf = f" vpn-instance {c.vrf}" if c.vrf else ""
+                if c.port is None:
+                    rep.add(monitor_text.KIND, monitor_text.NETFLOW, Severity.APPROX, "netflow-port",
+                            f"Comware takes a collector port: {c.address} written with 9995")
+                lines.append(f"ip netstream export host {c.address} {9995 if c.port is None else c.port}{vrf}")
+            if nf.version is not None:
+                lines.append(f"ip netstream export version {nf.version}")
+            if nf.source_interface:
+                lines.append(f"ip netstream export source interface {self.port(nf.source_interface)}")
+        if lines:
+            self.out += lines
+            self.block_end()
+
+    def _monitor_interface(self, iface: Interface) -> List[str]:
+        d = self.device
+        lines: List[str] = []
+        sf = d.sflow
+        if sf is not None and iface.sflow:
+            if sf.sample_rate is not None:
+                lines.append(f"sflow sampling-rate {sf.sample_rate}")
+            if sf.collectors:
+                lines.append("sflow flow collector 1")
+            if sf.polling_interval is not None:
+                lines.append(f"sflow counter interval {sf.polling_interval}")
+            if sf.collectors:
+                lines.append("sflow counter collector 1")
+        if d.netflow is not None and iface.flow:
+            lines += [f"ip netstream {word}" for way, word in (("input", "inbound"), ("output", "outbound"))
+                      if iface.flow in (way, "both")]
+        return lines
 
     def block_end(self) -> None:
         self.out.append("#")
@@ -798,6 +863,7 @@ class Writer:
                 add(Severity.APPROX, "pim-mode", "PIM sparse-dense mode written as sparse mode")
         if iface.igmp_version is not None:
             lines.append(f"igmp version {iface.igmp_version}")
+        lines += self._monitor_interface(iface)
         if iface.name in bfd_text.ospf_interfaces(self.device):
             lines.append("ospf bfd enable")
         lines += bfd_text.separate_lines(iface)

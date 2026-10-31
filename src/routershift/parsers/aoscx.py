@@ -21,6 +21,7 @@ import ipaddress
 import re
 from typing import Callable, Dict, List, Optional, Tuple
 
+from .. import monitor as monitor_text
 from .. import acl as acl_text
 from .. import bfd as bfd_text
 from .. import routemap as routemap_text
@@ -35,7 +36,7 @@ from .. import qos as qos_text
 from .. import confparse
 from ..confparse import Node
 from ..errors import ParseError
-from ..model import (AaaGroup, AaaMethod, AaaServer, Acl, Device, LocalUser, DhcpPool, FhrpGroup, NtpKey, SnmpCommunity, SnmpHost, SnmpUser, Interface, InterfaceKind, LacpMode, Origin, Ospf, QosAction, QosClass,
+from ..model import (Sflow, AaaGroup, AaaMethod, AaaServer, Acl, Device, LocalUser, DhcpPool, FhrpGroup, NtpKey, SnmpCommunity, SnmpHost, SnmpUser, Interface, InterfaceKind, LacpMode, Origin, Ospf, QosAction, QosClass,
                      QosPolicy, StaticRoute, StpMode, SwitchportMode, Unparsed, Vlan, Mlag)
 from .ioslike import _is_address, _vlan_ids
 
@@ -78,6 +79,7 @@ class _Reader:
         self._class_acls: List[Tuple[QosClass, Acl]] = []
         self._client_limit: Dict[str, int] = {}  # port access, per port
         self._auth_mode: Dict[str, str] = {}
+        self._sflow_global = False  # sflow: every port samples unless ports name themselves
 
     def unparsed(self, node: Node, section: str = "") -> None:
         self.device.unparsed.append(Unparsed(node.line, node.text, section))
@@ -119,6 +121,8 @@ class _Reader:
             "policy": self.qos_policy,
             "dhcpv4-snooping": lambda node: node.words == ["dhcpv4-snooping"] and self._snooping(),
             "vsx": self.vsx,
+            "mirror": self.mirror,
+            "sflow": self.sflow,
             "ssh": self.server,
             "https-server": self.server,
             "cli-session": self.cli_session,
@@ -645,6 +649,52 @@ class _Reader:
             except ValueError:
                 self.unparsed(child, node.text)
 
+    def mirror(self, node: Node) -> bool:
+        """mirror session N / source interface P [both|rx|tx] / destination interface P / enable."""
+        w = node.words
+        if w[1:2] != ["session"] or len(w) != 3:
+            return False
+        s = monitor_text.session(self.device, w[2], node.line, node.text)
+        for child in node.children:
+            c = child.words
+            if c[:2] == ["source", "interface"] and len(c) in (3, 4) and \
+                    (len(c) == 3 or monitor_text.direction(c[3]) is not None):
+                s.sources[canonical(c[2])[0]] = monitor_text.direction(c[3]) or "both" if len(c) == 4 else "both"
+            elif c[:2] == ["destination", "interface"] and len(c) == 3:
+                s.destination = canonical(c[2])[0]
+            elif c in (["enable"], ["comment"]) or c[0] == "comment":
+                pass
+            else:
+                self.unparsed(child, node.text)
+        return True
+
+    def sflow(self, node: Node) -> bool:
+        """sflow, sflow collector A [port P] [vrf V], sflow agent-ip A, sflow sampling N, sflow polling N."""
+        w = node.words[1:]
+        n = len(w)
+        if node.children:
+            return False
+        sf = self.device.sflow
+        if sf is None:
+            sf = self.device.sflow = Sflow(origin=Origin(node.line, node.text))
+        if not w:
+            self._sflow_global = True
+        elif w[0] == "collector" and n in (2, 4, 6):
+            opts = dict(zip(w[2::2], w[3::2]))
+            if set(opts) - {"port", "vrf"}:
+                return False
+            port = int(opts["port"]) if "port" in opts else None
+            sf.collectors.append(monitor_text.collector(str(ipaddress.ip_address(w[1])), port, opts.get("vrf", "")))
+        elif w[0] == "agent-ip" and n == 2:
+            sf.agent = str(ipaddress.ip_address(w[1]))
+        elif w[0] == "sampling" and n == 2:
+            sf.sample_rate = int(w[1])
+        elif w[0] == "polling" and n == 2:
+            sf.polling_interval = int(w[1])
+        else:
+            return False
+        return True
+
     def router(self, node: Node) -> bool:
         w = node.words
         if w == ["router", "vrrp", "enable"]:
@@ -989,6 +1039,8 @@ class _Reader:
             iface.ospf_network = w[3]
         elif w in (["ip", "pim-sparse", "enable"], ["ip", "pim-dense", "enable"]):
             iface.pim = w[1][len("pim-"):]
+        elif w == ["sflow"]:
+            iface.sflow = True
         elif w == ["ip", "igmp", "enable"]:
             pass  # written wherever PIM or an IGMP version is
         elif w[:3] == ["ip", "igmp", "version"] and n == 4 and w[3] in ("2", "3"):
@@ -1028,6 +1080,9 @@ class _Reader:
 
     def _finish(self) -> None:
         qos_text.adopt(self.device, self._class_acls)
+        if self._sflow_global and not monitor_text.sflow_ports(self.device):
+            for iface in monitor_text.physical(self.device):
+                iface.sflow = True
         if self.device.mlag is not None and self._vsx_source:
             address = ipaddress.ip_address(self._vsx_source)
             self.device.mlag.local_interface = next(

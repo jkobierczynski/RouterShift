@@ -39,7 +39,9 @@ redistribution that apply them, and so do policy-based routing and BFD (timers, 
 RIP and IS-IS convert between IOS, EOS and Comware (flagged on the Aruba switches).
 Multicast converts too: IGMP snooping per VLAN with its querier, and multicast routing (PIM mode,
 IGMP version, static RPs).
-Everything else (SPAN, LDAP, ...) is listed in the report under "Not understood", line by
+Port mirroring (SPAN) and sFlow convert on every platform; NetFlow between IOS (Flexible NetFlow)
+and Comware (NetStream), and is flagged elsewhere, as is sFlow on IOS.
+Everything else (IP SLA, LDAP, ...) is listed in the report under "Not understood", line by
 line, with secrets masked.
 
 ## Usage

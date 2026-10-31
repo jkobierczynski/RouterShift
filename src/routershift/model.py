@@ -215,6 +215,8 @@ class Interface:
     isis_network: str = ""  # "", "point-to-point"
     pim: str = ""  # PIM mode: "", "sparse", "dense", "sparse-dense"
     igmp_version: Optional[int] = None  # IGMP version towards hosts (2, 3)
+    sflow: bool = False  # sFlow samples the port's traffic
+    flow: str = ""  # NetFlow/NetStream records flows the port "input", "output" or "both" ways; "" = none
     pbr: str = ""  # policy-based routing: the route map (Comware policy-based-route, EOS pbr policy) on received packets
     crypto_map: str = ""  # policy-based IPsec applied on the interface
     tunnel_source: str = ""  # tunnel: a canonical interface name or an address
@@ -704,6 +706,47 @@ class Stp:
 
 
 @dataclass
+class MirrorSession:
+    """A local port mirror (SPAN): copies of the traffic of the source ports go out of the destination port."""
+
+    name: str  # the session number (a name on EOS)
+    sources: Dict[str, str] = field(default_factory=dict)  # canonical interface -> "both", "rx" or "tx"
+    destination: str = ""  # canonical interface
+    origin: Origin = field(default_factory=Origin)
+
+
+@dataclass
+class FlowCollector:
+    address: str
+    port: Optional[int] = None  # None: the platform default (sFlow 6343)
+    vrf: str = ""
+
+
+@dataclass
+class Sflow:
+    """sFlow: packet samples and interface counters of the ports with sflow set, sent to collectors."""
+
+    collectors: List[FlowCollector] = field(default_factory=list)
+    agent: str = ""  # the agent address in the datagrams
+    source_interface: str = ""  # or the interface (canonical) whose address it is
+    sample_rate: Optional[int] = None  # one packet in N
+    polling_interval: Optional[int] = None  # counter polling, seconds
+    origin: Origin = field(default_factory=Origin)
+
+
+@dataclass
+class Netflow:
+    """NetFlow (IOS Flexible NetFlow, Comware NetStream): flow records of the ports with flow set, exported to
+    collectors."""
+
+    collectors: List[FlowCollector] = field(default_factory=list)
+    version: Optional[int] = None  # export format: 5, 9 or 10 (IPFIX)
+    source_interface: str = ""  # canonical
+    record: str = ""  # IOS: the flow record of the monitor
+    origin: Origin = field(default_factory=Origin)
+
+
+@dataclass
 class Unparsed:
     """A line or block of the source no parser section claimed."""
 
@@ -746,6 +789,9 @@ class Device:
     multicast_routing: bool = False
     pim_rps: List[str] = field(default_factory=list)  # static PIM rendezvous point addresses
     mlag: Optional[Mlag] = None
+    mirror_sessions: List[MirrorSession] = field(default_factory=list)
+    sflow: Optional[Sflow] = None
+    netflow: Optional[Netflow] = None
     qos_classes: Dict[str, QosClass] = field(default_factory=dict)
     qos_policies: Dict[str, QosPolicy] = field(default_factory=dict)
     snmp: Snmp = field(default_factory=Snmp)
