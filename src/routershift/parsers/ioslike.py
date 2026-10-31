@@ -22,6 +22,7 @@ from .. import ospf as ospf_text
 from .. import l2sec as l2sec_text
 from .. import mgmt as mgmt_text
 from .. import vrfs as vrfs_text
+from .. import multicast as multicast_text
 from .. import igp as igp_text
 from .. import routemap as routemap_text
 from .. import qos as qos_text
@@ -353,6 +354,14 @@ class _Reader:
     def ip(self, node: Node) -> bool:
         w = node.words
         m = self.device.management
+        if w[1:3] == ["igmp", "snooping"]:
+            return self.igmp_snooping(w[3:], True)
+        if w[1:2] == ["multicast-routing"] and w[2:] in ([], ["distributed"]):
+            self.device.multicast_routing = True
+            return True
+        if w[1:3] == ["pim", "rp-address"] and len(w) == 4:
+            self.device.pim_rps.append(str(ipaddress.IPv4Address(w[3])))
+            return True
         if w[1:2] == ["prefix-list"]:
             return self.policy_node(node, routemap_text.ios_prefix_list_node(
                 self.device, w, [c.words for c in node.children]))
@@ -1208,6 +1217,10 @@ class _Reader:
             return self.ospf(node, w[2], w[4] if len(w) == 5 else "")
         if w[1:2] == ["bgp"] and len(w) == 3 and self.device.bgp is None:
             return self.bgp(node, w[2])
+        if w[1:] == ["multicast"] and self.device.platform == "eos":
+            return self._eos_multicast(node)
+        if w[1:] == ["pim", "sparse-mode"] and self.device.platform == "eos":
+            return self._eos_pim(node)
         if w[1:] == ["rip"] and self.device.rip is None:
             rip = self.device.rip = Rip(origin=Origin(node.line, node.text))
             return self._igp_children(node, lambda c: igp_text.ios_rip_line(rip, c))
@@ -1217,6 +1230,32 @@ class _Reader:
                 isis.wide_metrics = True  # EOS sends wide metrics
             return self._igp_children(node, lambda c: igp_text.ios_isis_line(self.device, isis, c))
         return False
+
+    def _eos_multicast(self, node: Node) -> bool:
+        """EOS: router multicast / ipv4 / routing."""
+        for child in node.children:
+            if child.words == ["ipv4"]:
+                for line in child.children:
+                    if line.words == ["routing"]:
+                        self.device.multicast_routing = True
+                    else:
+                        self.unparsed(line, f"{node.text} / {child.text}")
+            else:
+                self.unparsed(child, node.text)
+        return True
+
+    def _eos_pim(self, node: Node) -> bool:
+        """EOS: router pim sparse-mode / ipv4 / rp address A."""
+        for child in node.children:
+            if child.words == ["ipv4"]:
+                for line in child.children:
+                    if line.words[:2] == ["rp", "address"] and len(line.words) == 3:
+                        self.device.pim_rps.append(str(ipaddress.IPv4Address(line.words[2])))
+                    else:
+                        self.unparsed(line, f"{node.text} / {child.text}")
+            else:
+                self.unparsed(child, node.text)
+        return True
 
     def _igp_children(self, node: Node, read: Callable[[List[str]], bool]) -> bool:
         for child in node.children:
@@ -1500,9 +1539,29 @@ class _Reader:
             return True
         return False
 
+    def igmp_snooping(self, w: List[str], on: bool) -> bool:
+        """ip igmp snooping [querier | vlan N [querier]], or its no form."""
+        d = self.device
+        if w == []:
+            d.igmp_snooping = on
+        elif w == ["querier"] and on:
+            d.igmp_querier = True
+        elif w[0] == "vlan" and len(w) in (2, 3) and w[2:] in ([], ["querier"]):
+            for vid in _vlan_ids(w[1]):
+                vlan = d.vlans.setdefault(vid, Vlan(vid))
+                if len(w) == 3:
+                    vlan.igmp_querier = on
+                else:
+                    vlan.igmp_snooping = on
+        else:
+            return False
+        return True
+
     def no_global(self, node: Node) -> bool:
         w = node.words
         m = self.device.management
+        if w[1:4] == ["ip", "igmp", "snooping"]:
+            return self.igmp_snooping(w[4:], False)
         if w[1:] in (["lldp", "run"], ["cdp", "run"]):
             setattr(m, w[1], False)
             return True
@@ -1986,6 +2045,12 @@ class _Reader:
             iface.ospf_bfd = True
         elif w[:3] == ["ip", "router", "isis"] and n in (3, 4) or w[:2] == ["isis", "enable"] and n == 3:
             iface.isis = True
+        elif w[:2] == ["ip", "pim"] and n == 3 and w[2] in ("sparse-mode", "dense-mode", "sparse-dense-mode"):
+            iface.pim = w[2][:-len("-mode")]
+        elif w == ["pim", "ipv4", "sparse-mode"]:
+            iface.pim = "sparse"
+        elif w[:3] == ["ip", "igmp", "version"] and n == 4 and w[3] in ("1", "2", "3"):
+            iface.igmp_version = int(w[3])
         elif w == ["isis", "passive"]:
             iface.isis = iface.isis_passive = True
         elif w[:2] == ["isis", "metric"] and n in (3, 4) and w[3:] in ([], ["level-1"], ["level-2"]):
@@ -2069,6 +2134,7 @@ class _Reader:
 
     def _finish(self) -> None:
         self._finish_vpn()
+        multicast_text.finish(self.device)
         for wl in self.device.wlans:
             wl.vlan = self._wlan_profiles.get(self._wlan_tags.get(wl.name, ""))
         self._finish_aaa()

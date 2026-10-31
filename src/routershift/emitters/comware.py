@@ -21,6 +21,7 @@ from .. import stp as stp_text
 from .. import l2sec as l2sec_text
 from .. import mgmt as mgmt_text
 from .. import vrfs as vrfs_text
+from .. import multicast as multicast_text
 from .. import igp as igp_text
 from .. import bfd as bfd_text
 from .. import routemap as routemap_text
@@ -500,6 +501,20 @@ class Writer:
             self.block_end()
         if l2sec_text.inspection_vlans(d):
             rep.item("vlan", "ARP inspection")
+        igmp = multicast_text.snooped(d)
+        queriers = multicast_text.queriers(d)
+        if multicast_text.stated(d):
+            rep.item("vlan", multicast_text.LABEL)
+        if igmp:
+            self.out.append("igmp-snooping")
+            self.block_end()
+        if d.multicast_routing or d.pim_rps or any(i.pim for i in d.interfaces.values()):
+            rep.item("system", "multicast routing")
+            self.out.append("multicast routing")
+            self.block_end()
+        if d.pim_rps:
+            self.out += ["pim"] + [f"{_IND}static-rp {rp}" for rp in d.pim_rps]
+            self.block_end()
         for vlan in sorted(self.device.vlans.values(), key=lambda v: v.vlan_id):
             self.out.append(f"vlan {vlan.vlan_id}")
             if vlan.name:
@@ -508,6 +523,10 @@ class Writer:
                 self.out.append(f"{_IND}shutdown")
             if vlan.arp_inspection:
                 self.out.append(f"{_IND}arp detection enable")
+            if vlan.vlan_id in igmp:
+                self.out.append(f"{_IND}igmp-snooping enable")
+            if vlan.vlan_id in queriers:
+                self.out.append(f"{_IND}igmp-snooping querier")
             self.block_end()
             self.report.item("vlan", str(vlan.vlan_id))
 
@@ -771,6 +790,14 @@ class Writer:
         if iface.ospf_network:
             lines.append(f"ospf network-type {'p2p' if iface.ospf_network == 'point-to-point' else 'broadcast'}")
         lines += self._isis_interface(iface)
+        if iface.pim or iface.igmp_version is not None:
+            lines.append("igmp enable")
+        if iface.pim:
+            lines.append(f"pim {'dm' if iface.pim == 'dense' else 'sm'}")
+            if iface.pim == "sparse-dense":
+                add(Severity.APPROX, "pim-mode", "PIM sparse-dense mode written as sparse mode")
+        if iface.igmp_version is not None:
+            lines.append(f"igmp version {iface.igmp_version}")
         if iface.name in bfd_text.ospf_interfaces(self.device):
             lines.append("ospf bfd enable")
         lines += bfd_text.separate_lines(iface)

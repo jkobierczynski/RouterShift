@@ -482,6 +482,8 @@ class _Reader:
                     vlan.dhcp_snooping = True
                 elif child.text == "arp inspection":
                     vlan.arp_inspection = True
+                elif child.text in ("ip igmp snooping enable", "no ip igmp snooping enable"):
+                    vlan.igmp_snooping = child.words[0] != "no"
                 elif child.text == "no shutdown":
                     pass
                 elif vid == ids[0]:
@@ -647,6 +649,16 @@ class _Reader:
         w = node.words
         if w == ["router", "vrrp", "enable"]:
             return True  # implied by the groups
+        if w == ["router", "pim"]:
+            for child in node.children:
+                c = child.words
+                if c == ["enable"]:
+                    self.device.multicast_routing = True
+                elif c[0] == "rp-address" and len(c) == 2:
+                    self.device.pim_rps.append(str(ipaddress.IPv4Address(c[1])))
+                else:
+                    self.unparsed(child, node.text)
+            return True
         if w[1:2] == ["ospf"] and len(w) in (3, 5) and (len(w) == 3 or w[3] == "vrf"):
             vrf = w[4] if len(w) == 5 else ""
             p = ospf_text.process(self.device, w[2], vrf)
@@ -975,6 +987,12 @@ class _Reader:
             iface.ospf_cost = int(w[3])
         elif w[:3] == ["ip", "ospf", "network"] and n == 4 and w[3] in ("point-to-point", "broadcast"):
             iface.ospf_network = w[3]
+        elif w in (["ip", "pim-sparse", "enable"], ["ip", "pim-dense", "enable"]):
+            iface.pim = w[1][len("pim-"):]
+        elif w == ["ip", "igmp", "enable"]:
+            pass  # written wherever PIM or an IGMP version is
+        elif w[:3] == ["ip", "igmp", "version"] and n == 4 and w[3] in ("2", "3"):
+            iface.igmp_version = int(w[3])
         elif w == ["ip", "ospf", "bfd"]:
             iface.ospf_bfd = True
         elif bfd_text.separate_line(iface, w):

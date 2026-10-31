@@ -58,6 +58,7 @@ platform converts to and from all the others.
 | BFD: interface timers, BGP neighbors, OSPF interfaces | `Interface.bfd_*`, `BgpNeighbor.bfd`, `Ospf.bfd_all` | 4 (done) |
 | RIP: version, networks, passive interfaces, redistribution, default route, summary (IOS, EOS, Comware) | `Rip` | 4 (done) |
 | IS-IS: NETs, level, wide metrics, redistribution, interfaces (passive, metric, point-to-point) (IOS, EOS, Comware) | `Isis`, `Interface.isis*` | 4 (done) |
+| Multicast: IGMP snooping per VLAN and querier, multicast routing, PIM mode and IGMP version per interface, static RPs | `Vlan.igmp_*`, `Device.multicast_routing`, `Interface.pim` | 4 (done) |
 | vPC (NX-OS), VXLAN/EVPN | to come | 3+ |
 
 ### AOS-S specifics
@@ -234,6 +235,22 @@ platform converts to and from all the others.
   route maps match no ACLs (the entry is written without the match); AOS-S writes no prefix lists or route maps, and
   its OSPF redistribution goes without the route map. Other match and set clauses (continue, communities lists, ...)
   are listed under "Not understood".
+
+## Multicast
+
+* IGMP snooping keeps the VLANs that snoop, as the source states them. IOS and EOS snoop every VLAN by default, so
+  the writer names the ones that do not (`no ip igmp snooping vlan N`); AOS-CX (`ip igmp snooping enable`), AOS-S
+  (`ip igmp`) and Comware (`igmp-snooping` and `igmp-snooping enable`) name the ones that do. Nothing is written when
+  the source says nothing about IGMP snooping.
+* The querier: EOS `ip igmp snooping vlan N querier`, Comware `igmp-snooping querier`, AOS-S on with `ip igmp`
+  unless `no ip igmp querier`; IOS has one setting for every VLAN (`ip igmp snooping querier`, reported when the
+  source had fewer); AOS-CX sets it on the VLAN interface (reported, not written).
+* Multicast routing keeps its switch (IOS `ip multicast-routing`, EOS `router multicast` / `ipv4` / `routing`,
+  AOS-CX `router pim` / `enable`, Comware `multicast routing`), static RPs (IOS `ip pim rp-address`, EOS `router pim
+  sparse-mode` / `ipv4` / `rp address`, AOS-CX `rp-address`, Comware `pim` / `static-rp`), and per interface the PIM
+  mode and IGMP version (IOS `ip pim sparse-mode`, EOS `pim ipv4 sparse-mode`, AOS-CX `ip pim-sparse enable` with
+  `ip igmp enable`, Comware `pim sm` with `igmp enable`). EOS runs sparse mode only, and sparse-dense mode becomes
+  sparse mode (reported). AOS-S multicast routing is left to a person (reported).
 
 ## RIP and IS-IS
 

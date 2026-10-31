@@ -169,6 +169,9 @@ class _Reader:
             "route-policy": self.route_policy,
             "policy-based-route": self.policy_based_route,
             "rip": self.rip,
+            "igmp-snooping": self.igmp_snooping,
+            "multicast": self.multicast,
+            "pim": self.pim,
             "isis": self.isis,
             "vlan": self.vlan,
             "stp": self.stp,
@@ -745,6 +748,34 @@ class _Reader:
                 self.unparsed(child, node.text)
         return True
 
+    def igmp_snooping(self, node: Node) -> bool:
+        """igmp-snooping: switched on for the device; the VLANs say where it runs."""
+        if node.words != ["igmp-snooping"]:
+            return False
+        for child in node.children:
+            self.unparsed(child, node.text)
+        return True
+
+    def multicast(self, node: Node) -> bool:
+        if node.words != ["multicast", "routing"]:
+            return False
+        self.device.multicast_routing = True
+        for child in node.children:
+            self.unparsed(child, node.text)
+        return True
+
+    def pim(self, node: Node) -> bool:
+        """pim with static-rp A."""
+        if node.words != ["pim"]:
+            return False
+        for child in node.children:
+            c = child.words
+            if c[0] == "static-rp" and len(c) == 2:
+                self.device.pim_rps.append(str(ipaddress.IPv4Address(c[1])))
+            else:
+                self.unparsed(child, node.text)
+        return True
+
     def rip(self, node: Node) -> bool:
         """rip [N] with version, network, silent-interface, import-route, ..."""
         if len(node.words) > 2 or self.device.rip is not None:
@@ -869,6 +900,10 @@ class _Reader:
                     vlan.shutdown = True
                 elif child.text == "arp detection enable":
                     vlan.arp_inspection = True
+                elif child.text == "igmp-snooping enable":
+                    vlan.igmp_snooping = True
+                elif child.text == "igmp-snooping querier":
+                    vlan.igmp_querier = True
                 elif vid == ids[0]:
                     self.unparsed(child, node.text)
         return True
@@ -1598,6 +1633,12 @@ class _Reader:
             iface.ospf_cost = int(w[2])
         elif w[:2] == ["ospf", "network-type"] and n == 3 and w[2] in ("p2p", "broadcast"):
             iface.ospf_network = "point-to-point" if w[2] == "p2p" else "broadcast"
+        elif w in (["pim", "sm"], ["pim", "dm"]):
+            iface.pim = "sparse" if w[1] == "sm" else "dense"
+        elif w == ["igmp", "enable"]:
+            pass  # written wherever PIM or an IGMP version is
+        elif w[:2] == ["igmp", "version"] and n == 3 and w[2] in ("1", "2", "3"):
+            iface.igmp_version = int(w[2])
         elif w == ["ospf", "bfd", "enable"]:
             iface.ospf_bfd = True
         elif w[:2] == ["isis", "enable"] and n in (2, 3):

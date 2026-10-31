@@ -57,7 +57,7 @@ def test_ios_to_comware() -> None:
     out, _ = convert(sample("ios_access.cfg"), "ios", "comware")
     assert " sysname sw-access-01\n" in out
     assert " clock timezone CET add 01:00:00\n" in out
-    assert "vlan 10\n name USERS\n arp detection enable\n#\n" in out
+    assert "vlan 10\n name USERS\n arp detection enable\n igmp-snooping enable\n igmp-snooping querier\n#\n" in out
     assert (" port link-type hybrid\n port hybrid vlan 20 tagged\n port hybrid vlan 10 untagged\n"
             " port hybrid pvid vlan 10\n voice-vlan 20 enable\n") in out
     assert " undo port trunk permit vlan 1\n port trunk permit vlan 10 20 99\n port trunk pvid vlan 99\n" in out

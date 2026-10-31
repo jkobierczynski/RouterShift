@@ -24,6 +24,7 @@ from .. import stp as stp_text
 from .. import aaa as aaa_text
 from .. import vpn as vpn_text
 from .. import vrfs as vrfs_text
+from .. import multicast as multicast_text
 from .. import igp as igp_text
 from .. import bfd as bfd_text
 from .. import routemap as routemap_text
@@ -84,6 +85,7 @@ class Writer:
         self.vpn()
         self.qos()
         self.l2sec()
+        self.multicast()
         self.mlag()
         self.mpls()
         for iface in self.device.interfaces.values():
@@ -236,6 +238,7 @@ class Writer:
         lines += self._tunnel(iface, add)
         lines += self._ospf_interface(iface)
         lines += self._isis_interface(iface)
+        lines += self._multicast_interface(iface, add)
         lines += bfd_text.joined_line(iface, "ios" if self.ios else "eos", self.report, label)
         if iface.pbr:
             lines.append(f"ip policy route-map {iface.pbr}" if self.ios else f"service-policy type pbr input {iface.pbr}")
@@ -970,6 +973,50 @@ class Writer:
         self.out.append(f"router isis {tag}".strip())
         self.out += [self.ind + line for line in lines]
         self.out.append("!")
+
+    def multicast(self) -> None:
+        """IGMP snooping (on by default: the VLANs that do not snoop are named) and multicast routing."""
+        d = self.device
+        rep = self.report
+        lines: List[str] = []
+        if multicast_text.stated(d):
+            rep.item("vlan", multicast_text.LABEL)
+            on = multicast_text.snooped(d)
+            if d.igmp_snooping is False:
+                lines.append("no ip igmp snooping")
+            else:
+                lines += [f"no ip igmp snooping vlan {vid}" for vid in sorted(d.vlans) if vid not in on]
+            queriers = multicast_text.queriers(d)
+            if queriers and self.ios:
+                lines.append("ip igmp snooping querier")
+                if queriers != on:
+                    rep.add("vlan", multicast_text.LABEL, Severity.APPROX, "igmp-querier",
+                            f"IOS sets the querier for every snooping VLAN, not only {l2sec_text.vlan_text(queriers)}")
+            elif queriers:
+                lines += [f"ip igmp snooping vlan {vid} querier" for vid in queriers]
+        if d.multicast_routing:
+            rep.item("system", "multicast routing")
+            lines += ["ip multicast-routing"] if self.ios else ["router multicast", f"{self.ind}ipv4",
+                                                                 f"{self.ind * 2}routing", "!"]
+        if d.pim_rps and self.ios:
+            lines += [f"ip pim rp-address {rp}" for rp in d.pim_rps]
+        elif d.pim_rps:
+            lines += ["router pim sparse-mode", f"{self.ind}ipv4"] + \
+                [f"{self.ind * 2}rp address {rp}" for rp in d.pim_rps] + ["!"]
+        if lines:
+            self.out += lines + (["!"] if lines[-1] != "!" else [])
+
+    def _multicast_interface(self, iface: Interface, add: _Add) -> List[str]:
+        lines = []
+        if iface.pim and self.ios:
+            lines.append(f"ip pim {iface.pim}-mode")
+        elif iface.pim:
+            lines.append("pim ipv4 sparse-mode")
+            if iface.pim != "sparse":
+                add(Severity.APPROX, "pim-mode", f"PIM {iface.pim} mode written as sparse mode, the one EOS runs")
+        if iface.igmp_version is not None:
+            lines.append(f"ip igmp version {iface.igmp_version}")
+        return lines
 
     def _isis_interface(self, iface: Interface) -> List[str]:
         isis = self.device.isis
