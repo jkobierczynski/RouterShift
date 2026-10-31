@@ -65,7 +65,7 @@ def test_eos_to_aoss_routed_port_and_vrf() -> None:
     # a routed port gets a VLAN of its own
     assert 'vlan 3999\n   name "routed 3"\n   untagged 3\n   ip address 10.255.0.1 255.255.255.254\n' in out
     # a trunk that does not allow its native VLAN takes no untagged VLAN
-    assert "vlan 1\n   name \"DEFAULT_VLAN\"\n   no untagged 1-3,Trk10\n" in out
+    assert "vlan 1\n   name \"DEFAULT_VLAN\"\n   no untagged 1-3,Trk10,Trk20\n" in out
     assert "ip route 10.200.0.0 255.255.0.0 blackhole\n" in out
     assert "AOS-S has no VRFs" in report.to_text()
 

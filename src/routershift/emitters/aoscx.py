@@ -14,6 +14,7 @@ from .. import bgp as bgp_text
 from .. import dhcp as dhcp_text
 from .. import l2sec as l2sec_text
 from .. import mgmt as mgmt_text
+from .. import vrfs as vrfs_text
 from .. import mpls as mpls_text
 from .. import nat as nat_text
 from .. import wlan as wlan_text
@@ -69,6 +70,7 @@ class Writer:
         order = {InterfaceKind.MANAGEMENT: 0, InterfaceKind.LAG: 1}
         for iface in sorted(self.device.interfaces.values(), key=lambda i: order.get(i.kind, 2)):
             self.interface(iface)
+        self.vsx()
         self.routes()
         self.dhcp()
         nat_text.skip_all(self.device, self.report, "AOS-CX")
@@ -392,11 +394,54 @@ class Writer:
             rep.add("management", "snmp source", Severity.REVIEW, "snmp-source",
                     f"SNMP source interface {s.source} is not written; AOS-CX picks the source by VRF")
 
+    def vsx(self) -> None:
+        """vsx: inter-switch link, role and keepalive (by address)."""
+        d = self.device
+        m = d.mlag
+        if m is None:
+            return
+        rep = self.report
+        label = "multi-chassis LAG"
+        rep.item("interface", label)
+        lines = []
+        if m.peer_link.startswith("Port-channel"):
+            lines.append(f"inter-switch-link {self.port(m.peer_link)}")
+        elif m.peer_link:
+            rep.add("interface", label, Severity.REVIEW, "mlag-peer-link",
+                    f"peer link {m.peer_link} is not a LAG; set the VSX inter-switch link by hand")
+        lines.append(f"role {m.role or 'primary'}")
+        if not m.role:
+            rep.add("interface", label, Severity.REVIEW, "mlag-role", "role primary is written; make the peer secondary")
+        source = d.interfaces.get(m.local_interface)
+        if m.peer_address and source is not None and source.ipv4:
+            vrf = f" vrf {self.vrf(source.vrf)}" if source.vrf else ""
+            lines.append(f"keepalive peer {m.peer_address} source {source.ipv4[0].split('/')[0]}{vrf}")
+            if d.platform == "eos":
+                rep.add("interface", label, Severity.REVIEW, "mlag-keepalive",
+                        "the MLAG peer-address and local-interface are written as the VSX keepalive; VSX prefers a "
+                        "keepalive outside the inter-switch link")
+        elif m.peer_address:
+            rep.add("interface", label, Severity.REVIEW, "mlag-keepalive",
+                    f"keepalive source {m.local_interface or '?'} has no address; set the VSX keepalive by hand")
+        if m.domain:
+            rep.add("interface", label, Severity.APPROX, "mlag-domain", f"VSX has no domain name (was {m.domain})")
+        self.out += ["vsx"] + [_IND + line for line in lines]
+
     def vrfs(self) -> None:
         for name in self.device.vrfs:
-            if self.vrf(name) == MGMT_VRF:
-                continue  # predefined
+            info = self.device.vrf_info.get(name)
+            if self.vrf(name) == MGMT_VRF:  # predefined
+                if info and (info.rd or info.rt_import or info.rt_export):
+                    self.report.add("system", f"vrf {name}", Severity.REVIEW, "vrf-leaking",
+                                    f"VRF {name} becomes the AOS-CX management VRF, which takes no route "
+                                    "distinguisher or route targets; left out")
+                continue
             self.out.append(f"vrf {name}")
+            if info and info.rd:
+                self.out.append(f"{_IND}rd {info.rd}")
+            if info and (info.rt_import or info.rt_export):
+                self.out.append(f"{_IND}address-family ipv4 unicast")
+                self.out += [f"{_IND * 2}route-target {d} {v}" for d, v in vrfs_text.targets(info)]
             self.report.item("system", f"vrf {name}")
 
     def spanning_tree(self) -> None:
@@ -585,7 +630,8 @@ class Writer:
             lines.append(f"spanning-tree cost {iface.stp_cost}")
         if iface.stp_port_priority is not None:
             lines.append(f"spanning-tree port-priority {iface.stp_port_priority // 16}")
-        self.out.append(f"interface {name}")
+        self.out.append(f"interface {name}" + (" multi-chassis" if iface.mlag_id is not None
+                                               and iface.kind == InterfaceKind.LAG else ""))
         self.out += [_IND + line for line in lines]
         if (iface.source_name or iface.name, name) in self.port.renumbered:
             add(Severity.APPROX, "port-renamed",

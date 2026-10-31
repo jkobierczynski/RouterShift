@@ -32,6 +32,8 @@ Management access converts too: SSH, Telnet and HTTP(S) servers, the remote logi
 the syslog level and source, and LLDP and CDP (globally and per port).
 Layer 2 security converts as well: DHCP snooping, ARP inspection, IP source guard, port security and storm
 control.
+VRF route leaking (route distinguisher, import and export route targets) and multi-chassis LAG pairs
+(EOS MLAG and AOS-CX VSX, flagged on IOS, AOS-S and Comware) convert too.
 Everything else (route maps, LDAP, ...) is listed in the report under "Not understood", line by
 line, with secrets masked.
 

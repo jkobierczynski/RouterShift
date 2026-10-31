@@ -28,12 +28,13 @@ from .. import fhrp
 from .. import ospf as ospf_text
 from .. import aaa as aaa_text
 from .. import mgmt as mgmt_text
+from .. import vrfs as vrfs_text
 from .. import qos as qos_text
 from .. import confparse
 from ..confparse import Node
 from ..errors import ParseError
 from ..model import (AaaGroup, AaaMethod, AaaServer, Acl, Device, LocalUser, DhcpPool, FhrpGroup, NtpKey, SnmpCommunity, SnmpHost, SnmpUser, Interface, InterfaceKind, LacpMode, Origin, Ospf, QosAction, QosClass,
-                     QosPolicy, StaticRoute, StpMode, SwitchportMode, Unparsed, Vlan)
+                     QosPolicy, StaticRoute, StpMode, SwitchportMode, Unparsed, Vlan, Mlag)
 from .ioslike import _is_address, _vlan_ids
 
 MGMT_VRF = "mgmt"
@@ -68,6 +69,7 @@ class _Reader:
         self.device = Device(platform="aoscx")
         self._routing: Dict[str, bool] = {}  # explicit routing / no routing per interface
         self._lag_lacp: Dict[str, LacpMode] = {}
+        self._vsx_source = ""  # VSX keepalive source address, resolved to its interface at the end
         self._ospf_areas: List[Tuple[str, str, str]] = []
         self._ospf_passive: Dict[str, bool] = {}
         self._voice_vlans: List[int] = []
@@ -112,6 +114,7 @@ class _Reader:
             "class": self.qos_class,
             "policy": self.qos_policy,
             "dhcpv4-snooping": lambda node: node.words == ["dhcpv4-snooping"] and self._snooping(),
+            "vsx": self.vsx,
             "ssh": self.server,
             "https-server": self.server,
             "cli-session": self.cli_session,
@@ -425,8 +428,18 @@ class _Reader:
             return False
         if node.words[1] != "default" and node.words[1] not in self.device.vrfs:
             self.device.vrfs.append(node.words[1])
+        name = node.words[1]
         for child in node.children:
-            if child.words[0] not in ("rd",):
+            c = child.words
+            if c[0] == "rd" and len(c) == 2:
+                vrfs_text.info(self.device, name).rd = c[1]
+            elif c[:2] == ["address-family", "ipv4"]:
+                for g in child.children:
+                    gw = g.words[:-1] if g.words[-1:] == ["evpn"] else g.words
+                    if not (gw[0] == "route-target" and len(gw) == 3
+                            and vrfs_text.route_target(vrfs_text.info(self.device, name), gw[1], gw[2])):
+                        self.unparsed(g, child.text)
+            else:
                 self.unparsed(child, node.text)
         return True
 
@@ -713,7 +726,26 @@ class _Reader:
             return False
         return True
 
+    def vsx(self, node: Node) -> bool:
+        """vsx with inter-switch-link lag N, role primary|secondary, keepalive peer A source B [vrf V]."""
+        m = self.device.mlag = Mlag()
+        for child in node.children:
+            c = child.words
+            if c[:2] == ["inter-switch-link", "lag"] and len(c) == 3:
+                m.peer_link = canonical(f"lag {c[2]}")[0]
+            elif c[0] == "role" and len(c) == 2 and c[1] in ("primary", "secondary"):
+                m.role = c[1]
+            elif c[:2] == ["keepalive", "peer"] and len(c) in (5, 7) and c[3] == "source" and c[5:6] in ([], ["vrf"]):
+                m.peer_address = c[2]
+                self._vsx_source = c[4]
+            else:
+                self.unparsed(child, node.text)
+        return True
+
     def interface(self, node: Node) -> bool:
+        mlag = node.words[-1] == "multi-chassis" and node.words[1] == "lag"
+        if mlag:
+            node = Node(node.line, node.text.rsplit(None, 1)[0], node.children)
         source = " ".join(node.words[1:])
         canon, kind = canonical(source)
         iface = Interface(canon, kind, source_name=source, origin=Origin(node.line, node.text))
@@ -726,6 +758,8 @@ class _Reader:
             if MGMT_VRF not in self.device.vrfs:
                 self.device.vrfs.append(MGMT_VRF)
         self.device.interfaces[canon] = iface
+        if mlag:
+            iface.mlag_id = int(node.words[2])
         for child in node.children:
             if child.words[0] == "vrrp" and child.words[2:] == ["address-family", "ipv4"]:
                 self._vrrp(iface, child)
@@ -938,6 +972,11 @@ class _Reader:
 
     def _finish(self) -> None:
         qos_text.adopt(self.device, self._class_acls)
+        if self.device.mlag is not None and self._vsx_source:
+            address = ipaddress.ip_address(self._vsx_source)
+            self.device.mlag.local_interface = next(
+                (i.name for i in self.device.interfaces.values()
+                 if any(ipaddress.ip_interface(a).ip == address for a in i.ipv4)), "")
         for iface in self.device.interfaces.values():
             self._voice_port(iface)
             if iface.dot1x or iface.mab:

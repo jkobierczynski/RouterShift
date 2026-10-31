@@ -23,6 +23,7 @@ from .. import snmp as snmp_text
 from .. import stp as stp_text
 from .. import aaa as aaa_text
 from .. import vpn as vpn_text
+from .. import vrfs as vrfs_text
 from .. import wlan as wlan_text
 from ..model import (AaaMethod, AaaServer, LocalUser, AclAction, Bgp, BgpNeighbor, Device, DhcpPool, IkePolicy, IpsecPeer, NatRule, SnmpGroup, FhrpGroup, Interface, InterfaceKind, LacpMode, Ospf,
                      StaticRoute, StpMode, SwitchportMode)
@@ -80,6 +81,7 @@ class Writer:
         self.vpn()
         self.qos()
         self.l2sec()
+        self.mlag()
         self.mpls()
         for iface in self.device.interfaces.values():
             self.interface(iface)
@@ -164,13 +166,23 @@ class Writer:
             target = self.vrf(name)
             if self.ios and target == _IOS_MGMT_VRF:
                 continue  # predefined
+            info = self.device.vrf_info.get(name)
             if self.ios:
                 self.out.append(f"vrf definition {target}")
-                self.out += [" address-family ipv4", " exit-address-family"]
+                if info and info.rd:
+                    self.out.append(f" rd {info.rd}")
+                self.out.append(" address-family ipv4")
+                if info:
+                    self.out += [f"  route-target {d} {v}" for d, v in vrfs_text.targets(info)]
+                self.out.append(" exit-address-family")
                 if self._vrf_has_ipv6(name):
                     self.out += [" address-family ipv6", " exit-address-family"]
             else:
                 self.out.append(f"vrf instance {target}")
+                if info and (info.rd or info.rt_import or info.rt_export) and self.device.bgp is None:
+                    self.report.add("system", f"vrf {name}", Severity.REVIEW, "vrf-leaking",
+                                    "EOS sets the route distinguisher and route targets under router bgp, and the "
+                                    "source has no BGP; left out")
             self.out.append("!")
             self.report.item("system", f"vrf {name}")
 
@@ -234,6 +246,8 @@ class Writer:
             lines.append("mpls ip" if self.ios else "mpls ldp interface")
         lines += [f"no lldp {name}" for name, on in (("transmit", iface.lldp_tx), ("receive", iface.lldp_rx)) if not on]
         lines += self._l2sec_interface(iface, add, label)
+        if iface.mlag_id is not None and not self.ios:
+            lines.append(f"mlag {iface.mlag_id}")
         if iface.cdp is not None and self.ios:
             lines.append("cdp enable" if iface.cdp else "no cdp enable")
         if iface.stp_portfast:
@@ -968,6 +982,17 @@ class Writer:
             lines += [ind + line for line in body]
             if self.ios:
                 lines.append("exit-address-family")
+        if not self.ios:
+            for name in self.device.vrfs:
+                info = self.device.vrf_info.get(name)
+                if not info or not (info.rd or info.rt_import or info.rt_export):
+                    continue
+                lines.append(f"vrf {self.vrf(name)}")
+                if info.rd:
+                    lines.append(f"{ind}rd {info.rd}")
+                for direction, value in vrfs_text.targets(info):
+                    for d in (["import", "export"] if direction == "both" else [direction]):
+                        lines.append(f"{ind}route-target {d} vpn-ipv4 {value}")
         self.out.append(f"router bgp {bgp.local_as}")
         self.out += [ind + line for line in lines]
         self.out.append("!")
@@ -1114,6 +1139,37 @@ class Writer:
         self.out.append("!")
         rep.add("wlan", "policy tag RS-POLICY-TAG", Severity.REVIEW, "wlan-tag",
                 "the WLANs are mapped in policy tag RS-POLICY-TAG; assign it to the access points")
+
+    def mlag(self) -> None:
+        """EOS: mlag configuration; IOS has no multi-chassis LAG (reported)."""
+        d = self.device
+        if self.ios:
+            vrfs_text.mlag_unsupported(d, self.report, "IOS", "IOS has no multi-chassis LAG (StackWise Virtual makes "
+                                                              "one switch of two instead)")
+            return
+        m = d.mlag
+        if m is None:
+            return
+        rep = self.report
+        label = "multi-chassis LAG"
+        rep.item("interface", label)
+        lines = [f"domain-id {m.domain or 'MLAG'}"]
+        if not m.domain:
+            rep.add("interface", label, Severity.REVIEW, "mlag-domain",
+                    "the source names no MLAG domain; MLAG is written, use the same on the peer")
+        if m.local_interface:
+            lines.append(f"local-interface {self.port(m.local_interface)}")
+        if m.peer_address:
+            lines.append(f"peer-address {m.peer_address}")
+        if m.peer_link:
+            lines.append(f"peer-link {self.port(m.peer_link)}")
+        if d.platform == "aoscx":
+            rep.add("interface", label, Severity.REVIEW, "mlag-keepalive",
+                    "VSX keepalive peer and source are written as MLAG peer-address and local-interface: EOS expects "
+                    "an SVI on the peer link there")
+        if m.role:
+            rep.add("interface", label, Severity.APPROX, "mlag-role", f"EOS elects the primary itself (was {m.role})")
+        self.out += ["mlag configuration"] + [self.ind + line for line in lines] + ["!"]
 
     def l2sec(self) -> None:
         """DHCP snooping and ARP inspection per VLAN (EOS snooping only adds option 82 and has no trusted ports)."""
