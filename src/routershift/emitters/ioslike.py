@@ -15,11 +15,13 @@ from .. import dhcp as dhcp_text
 from .. import fhrp
 from .. import nat as nat_text
 from .. import ospf as ospf_text
+from .. import mpls as mpls_text
 from .. import qos as qos_text
 from .. import snmp as snmp_text
 from .. import stp as stp_text
 from .. import aaa as aaa_text
 from .. import vpn as vpn_text
+from .. import wlan as wlan_text
 from ..model import (AaaMethod, AaaServer, LocalUser, AclAction, Bgp, BgpNeighbor, Device, DhcpPool, IkePolicy, IpsecPeer, NatRule, SnmpGroup, FhrpGroup, Interface, InterfaceKind, LacpMode, Ospf,
                      StaticRoute, StpMode, SwitchportMode)
 from ..names import PortMapper
@@ -75,6 +77,7 @@ class Writer:
         self.vlans()
         self.vpn()
         self.qos()
+        self.mpls()
         for iface in self.device.interfaces.values():
             self.interface(iface)
         self.routing()
@@ -82,6 +85,7 @@ class Writer:
         self.nat()
         self.dhcp()
         self.services()
+        self.wlans()
         self.banner()
         self.out.append("end")
         self.unparsed()
@@ -223,6 +227,8 @@ class Writer:
         lines += self._speed(iface, add)
         lines += self._dot1x(iface, add)
         lines += self._qos_interface(iface, add)
+        if iface.mpls:
+            lines.append("mpls ip" if self.ios else "mpls ldp interface")
         if iface.stp_portfast:
             trunk = iface.mode == SwitchportMode.TRUNK
             lines.append("spanning-tree portfast trunk" if self.ios and trunk else "spanning-tree portfast")
@@ -1063,6 +1069,70 @@ class Writer:
         if form == "sha512-crypt":
             return f"secret sha512 {value}"
         return f"secret {form[len('ios-type'):]} {value}"
+
+    def wlans(self) -> None:
+        """IOS XE controller: a wlan block per network, a policy profile per VLAN and one policy tag that maps them;
+        EOS is no wireless controller."""
+        d = self.device
+        if not d.wlans:
+            return
+        if not self.ios:
+            wlan_text.unsupported(d, self.report, "EOS")
+            return
+        rep = self.report
+        used = {w.wlan_id for w in d.wlans if w.wlan_id is not None}
+        free = (n for n in range(1, 4097) if n not in used)
+        policies = []
+        for w in d.wlans:
+            label = wlan_text.label(w)
+            rep.item("wlan", label)
+            wlan_id = w.wlan_id if w.wlan_id is not None else next(free)
+            self.out.append(f"wlan {w.name} {wlan_id} {w.ssid or w.name}")
+            if w.security == "open":
+                self.out += [f"{self.ind}no security wpa", f"{self.ind}no security wpa wpa2",
+                             f"{self.ind}no security wpa wpa2 ciphers aes", f"{self.ind}no security wpa akm dot1x"]
+            elif w.security == "psk":
+                self.out += [f"{self.ind}no security wpa akm dot1x", f"{self.ind}security wpa akm psk",
+                             f"{self.ind}security wpa psk set-key ascii 0 {wlan_text.psk(w, rep)}"]
+            self.out += [f"{self.ind}{'no shutdown' if w.enabled else 'shutdown'}", "!"]
+            if w.vlan is not None:
+                policy = f"{w.name}-POLICY"
+                self.out += [f"wireless profile policy {policy}", f"{self.ind}vlan {w.vlan}", f"{self.ind}no shutdown",
+                             "!"]
+            else:
+                policy = "default-policy-profile"
+            policies.append((w.name, policy))
+        self.out.append("wireless tag policy RS-POLICY-TAG")
+        self.out += [f"{self.ind}wlan {name} policy {policy}" for name, policy in policies]
+        self.out.append("!")
+        rep.add("wlan", "policy tag RS-POLICY-TAG", Severity.REVIEW, "wlan-tag",
+                "the WLANs are mapped in policy tag RS-POLICY-TAG; assign it to the access points")
+
+    def mpls(self) -> None:
+        """IOS: mpls label protocol ldp and mpls ldp router-id IFACE force; EOS: mpls ip and an mpls ldp block that
+        runs LDP only on the interfaces marked (interface disabled default)."""
+        d = self.device
+        if not mpls_text.has_mpls(d):
+            return
+        rep = self.report
+        label = "MPLS and LDP"
+        rep.item("mpls", label)
+        if self.ios:
+            self.out.append("mpls label protocol ldp")
+            if d.mpls.router_id or d.mpls.router_id_interface:
+                name = mpls_text.router_interface(d)
+                if name:
+                    self.out.append(f"mpls ldp router-id {self.port(name)} force")
+                else:
+                    mpls_text.router_id_missing(d, rep, "interface")
+        else:
+            self.out += ["mpls ip", "!", "mpls ldp"]
+            if d.mpls.router_id_interface:
+                self.out.append(f"{self.ind}router-id interface {self.port(d.mpls.router_id_interface)}")
+            elif d.mpls.router_id:
+                self.out.append(f"{self.ind}router-id {d.mpls.router_id}")
+            self.out += [f"{self.ind}interface disabled default", f"{self.ind}no shutdown"]
+        self.out.append("!")
 
     def qos(self) -> None:
         """Class maps and policy maps; EOS takes the policies as 'quality-of-service' and classes as 'qos'."""

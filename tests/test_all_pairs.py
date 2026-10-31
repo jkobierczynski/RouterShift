@@ -7,8 +7,10 @@ from routershift import bgp as bgp_text
 from routershift import nat as nat_text
 from routershift import aaa as aaa_text
 from routershift import snmp as snmp_text
+from routershift import mpls as mpls_text
 from routershift import qos as qos_text
 from routershift import stp as stp_text
+from routershift import wlan as wlan_text
 from routershift import vpn as vpn_text
 from routershift import ospf as ospf_text
 from routershift.acl import safe_name
@@ -158,6 +160,19 @@ def test_converts_and_reads_back(source: str, target: str) -> None:
         and not (target == "aoss" and i.stp_guard == "loop" and not (i.stp_bpdufilter or i.stp_cost or
                                                                      i.stp_port_priority)))
     assert stp_ports(first) == stp_ports(back)
+    # MPLS keeps LDP on the same interfaces (known by their addresses) and the router ID; the AOS switches report it
+    mpls_ports = lambda dev: sorted(tuple(i.ipv4) for i in mpls_text.interfaces(dev))  # noqa: E731
+    if target in mpls_text.SUPPORTED:
+        assert mpls_ports(first) == mpls_ports(back) and first.mpls.ldp == back.mpls.ldp
+        assert mpls_text.router_address(first) == mpls_text.router_address(back)
+    elif mpls_text.has_mpls(first):
+        assert not mpls_text.has_mpls(back) and "has no MPLS" in report.to_text()
+    # WLANs keep their SSID, VLAN, security and state on the controllers; the switches report each one
+    wlans = lambda dev: sorted((w.ssid, w.vlan, w.security, w.enabled) for w in dev.wlans)  # noqa: E731
+    if target in wlan_text.SUPPORTED:
+        assert wlans(first) == wlans(back)
+    elif first.wlans:
+        assert not back.wlans and "is no wireless controller" in report.to_text()
     # QoS keeps every applied policy with its classes (DSCP values, or an ACL with as many rules), markings and
     # police rates, and the trust of every port (AOS-CX has no default class; EOS takes no output policy)
     def qos(dev: Device) -> list:

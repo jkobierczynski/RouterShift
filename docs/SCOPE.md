@@ -46,6 +46,8 @@ platform converts to and from all the others.
 | 802.1X and MAC authentication on ports: host mode, reauthentication, the RADIUS servers used | `Aaa.dot1x`, `Interface.dot1x`, `Interface.mab` ... | 3 (done) |
 | TFTP and FTP client source interface | `System.transfer_source` | 3 (done) |
 | QoS: classes (DSCP or ACL), policies with DSCP marking and policing, policies on ports, port trust | `QosClass`, `QosPolicy`, `QosAction`, `Interface.qos_*` | 3 (done) |
+| MPLS: label switching with LDP on interfaces, the LDP router ID | `Mpls`, `Interface.mpls` | 3 (done) |
+| WLAN: SSIDs with their VLAN, security (open, WPA2-PSK, WPA2-Enterprise) and state, on IOS XE and Comware controllers | `Wlan` | 3 (done) |
 | LDAP and Kerberos servers (listed under "Not understood") | to come | 3+ |
 | Route maps, prefix lists, MLAG/VSX/vPC, VXLAN/EVPN | to come | 3+ |
 
@@ -187,6 +189,35 @@ platform converts to and from all the others.
   `loop-protect` as the alternative).
 * Per-instance and per-VLAN port costs and priorities, and timers (hello, forward delay, max age), are listed under
   "Not understood" for now.
+
+## Wireless (WLAN)
+
+* Only IOS XE (Catalyst 9800 and embedded wireless controllers) and Comware (WX controllers) carry wireless networks.
+  On EOS, AOS-CX and AOS-S every WLAN is reported with its VLAN and security, and left out; RouterShift does not guess
+  a wireless configuration for a switch.
+* A WLAN keeps its SSID, VLAN, security (open, WPA2-PSK, WPA2-Enterprise with 802.1X) and whether it is enabled. A
+  clear-text pre-shared key carries over; an encrypted one becomes `CHANGE-ME` (reported).
+* IOS XE: `wlan NAME ID SSID` (WPA2 with 802.1X unless the `security wpa` lines say otherwise), the VLAN through
+  `wireless tag policy` and `wireless profile policy`. The writer adds a policy profile per WLAN with a VLAN and one
+  tag, `RS-POLICY-TAG`, to assign to the access points (reported).
+* Comware: `wlan service-template` with `ssid`, `vlan`, `akm mode`, `preshared-key`, `service-template enable`.
+  Binding the templates to the AP radios is left to a person (reported).
+* RF profiles, AP groups and tags, radio settings, guest portals, WPA3 and per-WLAN RADIUS lists are listed under "Not
+  understood" for now. Other wireless platforms (Aruba controllers and Instant, Juniper Mist) are outside the five
+  platforms converted today.
+
+## MPLS
+
+* An interface keeps MPLS label switching with LDP, and the device keeps LDP and its router ID.
+* IOS: `mpls label protocol ldp`, `mpls ldp router-id IFACE force`, `mpls ip` on the interface. EOS: `mpls ip` and an
+  `mpls ldp` block with `router-id [interface]`; the writer adds `interface disabled default` so LDP runs only on the
+  interfaces with `mpls ldp interface`. Comware: `mpls lsr-id`, the `mpls ldp` view, `mpls enable` and `mpls ldp
+  enable` on the interface.
+* IOS takes the router ID as an interface and Comware as an address: the writers use the interface that holds the
+  address, or the address of the interface (reported when there is none).
+* AOS-CX and AOS-S have no MPLS; it is reported.
+* MPLS L3VPN (VRF route distinguishers and targets, VPNv4 BGP), RSVP-TE, segment routing and LDP options (timers,
+  authentication, label filters) are listed under "Not understood" for now.
 
 ## QoS
 

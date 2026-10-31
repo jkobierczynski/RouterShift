@@ -33,7 +33,7 @@ from ..confparse import Node
 from ..errors import ParseError
 from ..model import (AaaGroup, AaaMethod, AaaServer, Acl, AclAction, AclEntry, Device, DhcpPool, FhrpGroup, IkePolicy, IpsecPeer, IpsecTransform,
                      NtpKey, PreSharedKey, SnmpCommunity, SnmpGroup, SnmpHost, SnmpUser, Interface, InterfaceKind, LacpMode, LocalUser,
-                     NatPool, NatRule, Origin, QosAction, QosClass, QosPolicy, Ospf, OspfNetwork, StaticRoute, StpMode, SwitchportMode, Unparsed, Vlan)
+                     NatPool, NatRule, Origin, QosAction, QosClass, QosPolicy, Ospf, Wlan, OspfNetwork, StaticRoute, StpMode, SwitchportMode, Unparsed, Vlan)
 from .ioslike import _cidr, _is_address
 
 _PREFIXES: List[Tuple[str, InterfaceKind, str]] = [
@@ -184,6 +184,8 @@ class _Reader:
             "tftp": self.transfer,
             "traffic": self.traffic,
             "qos": self.qos_policy,
+            "mpls": self.mpls,
+            "wlan": self.wlan,
             "ftp": self.transfer,
         }
         for node in roots:
@@ -737,6 +739,51 @@ class _Reader:
                 elif vid == ids[0]:
                     self.unparsed(child, node.text)
         return True
+
+    def wlan(self, node: Node) -> bool:
+        """wlan service-template NAME: ssid, vlan, akm mode psk|dot1x, preshared-key, service-template enable."""
+        w = node.words
+        if w[1] != "service-template" or len(w) != 3:
+            return False
+        wl = Wlan(w[2], ssid=w[2], security="open", enabled=False, origin=Origin(node.line, node.text))
+        for child in node.children:
+            c = child.words
+            if c[0] == "ssid" and len(c) == 2:
+                wl.ssid = c[1]
+            elif c[0] == "vlan" and len(c) == 2 and c[1].isdigit():
+                wl.vlan = int(c[1])
+            elif c[:2] == ["akm", "mode"] and len(c) == 3 and c[2] in ("psk", "dot1x"):
+                wl.security = c[2]
+            elif c[0] == "preshared-key" and len(c) == 4 and c[1] in ("pass-phrase", "raw-key") \
+                    and c[2] in ("simple", "cipher"):
+                wl.psk = c[3] if c[2] == "simple" else ""
+            elif c in (["cipher-suite", "ccmp"], ["security-ie", "rsn"],
+                       ["client-security", "authentication-mode", "dot1x"]):
+                pass
+            elif c in (["service-template", "enable"], ["undo", "service-template", "enable"]):
+                wl.enabled = c[0] != "undo"
+            else:
+                self.unparsed(child, node.text)
+        self.device.wlans.append(wl)
+        return True
+
+    def mpls(self, node: Node) -> bool:
+        """mpls lsr-id A.B.C.D, and the mpls ldp view (lsr-id may be given there too)."""
+        w = node.words
+        m = self.device.mpls
+        m.origin = Origin(node.line, node.text)
+        if w[1] == "lsr-id" and len(w) == 3:
+            m.router_id = str(ipaddress.ip_address(w[2]))
+            return True
+        if w[1:] == ["ldp"]:
+            m.ldp = True
+            for child in node.children:
+                if child.words[0] == "lsr-id" and len(child.words) == 2:
+                    m.router_id = str(ipaddress.ip_address(child.words[1]))
+                else:
+                    self.unparsed(child, node.text)
+            return True
+        return False
 
     def stp(self, node: Node) -> bool:
         w = node.words
@@ -1369,6 +1416,10 @@ class _Reader:
             setattr(iface, f"qos_policy_{'in' if w[4] == 'inbound' else 'out'}", w[3])
         elif w[:2] == ["qos", "trust"] and n == 3 and w[2] in ("dscp", "dot1p"):
             iface.qos_trust = "cos" if w[2] == "dot1p" else "dscp"
+        elif w in (["mpls", "enable"], ["mpls", "ldp", "enable"]):
+            iface.mpls = True
+            if w[1] == "ldp":
+                self.device.mpls.ldp = True
         elif w[0] == "packet-filter" and w[-1] in ("inbound", "outbound"):
             v6 = w[1:2] == ["ipv6"]
             args = w[2:-1] if v6 else w[1:-1]

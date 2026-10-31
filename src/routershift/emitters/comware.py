@@ -18,7 +18,9 @@ from .. import vpn as vpn_text
 from .. import ospf as ospf_text
 from .. import snmp as snmp_text
 from .. import stp as stp_text
+from .. import mpls as mpls_text
 from .. import qos as qos_text
+from .. import wlan as wlan_text
 from ..model import (AaaMethod, AaaServer, AclAction, AclEntry, BgpNeighbor, Device, FhrpGroup, IpsecPeer, SnmpGroup, Interface, InterfaceKind, LacpMode, NatRule,
                      Ospf, StaticRoute, StpMode, SwitchportMode)
 from ..names import PortMapper
@@ -61,6 +63,8 @@ class Writer:
         self.spanning_tree()
         self.acls()
         self.qos()
+        self.mpls()
+        self.wlans()
         for p in self.device.ospf:
             self.ospf(p)
         self.dhcp()
@@ -474,6 +478,42 @@ class Writer:
 
     # access lists ----------------------------------------------------------------------------------------------------
 
+    def wlans(self) -> None:
+        """A wlan service-template per network; binding it to the AP radios is left to a person."""
+        rep = self.report
+        for w in self.device.wlans:
+            rep.item("wlan", wlan_text.label(w))
+            self.out += [f"wlan service-template {w.name}", f"{_IND}ssid {w.ssid or w.name}"]
+            if w.vlan is not None:
+                self.out.append(f"{_IND}vlan {w.vlan}")
+            if w.security == "psk":
+                self.out += [f"{_IND}akm mode psk", f"{_IND}preshared-key pass-phrase simple {wlan_text.psk(w, rep)}"]
+            elif w.security == "dot1x":
+                self.out += [f"{_IND}akm mode dot1x", f"{_IND}client-security authentication-mode dot1x"]
+            if w.security != "open":
+                self.out += [f"{_IND}cipher-suite ccmp", f"{_IND}security-ie rsn"]
+            if w.enabled:
+                self.out.append(f"{_IND}service-template enable")
+            self.block_end()
+        if self.device.wlans:
+            rep.add("wlan", "AP radios", Severity.REVIEW, "wlan-radio",
+                    "bind the service templates to the AP radios (service-template under each radio)")
+
+    def mpls(self) -> None:
+        """mpls lsr-id (an address: taken from the router ID interface when given as one) and the mpls ldp view."""
+        d = self.device
+        if not mpls_text.has_mpls(d):
+            return
+        self.report.item("mpls", "MPLS and LDP")
+        address = mpls_text.router_address(d)
+        if address:
+            self.out.append(f"{_IND}mpls lsr-id {address}")
+            self.block_end()
+        else:
+            mpls_text.router_id_missing(d, self.report, "IPv4 address")
+        self.out.append("mpls ldp")
+        self.block_end()
+
     def qos(self) -> None:
         """Traffic classifiers, one traffic behavior per policy action, and QoS policies pairing them."""
         rep = self.report
@@ -606,6 +646,8 @@ class Writer:
                 add(Severity.REVIEW, "qos-policy", f"policy {policy} is applied but not defined; left out")
         if iface.qos_trust in ("dscp", "cos"):
             lines.append(f"qos trust {'dot1p' if iface.qos_trust == 'cos' else 'dscp'}")
+        if iface.mpls:
+            lines += ["mpls enable", "mpls ldp enable"]
         for attr, v6, direction in (("acl_in", "", "inbound"), ("acl_out", "", "outbound"),
                                     ("acl6_in", "ipv6 ", "inbound"), ("acl6_out", "ipv6 ", "outbound")):
             acl_name = getattr(iface, attr)

@@ -27,7 +27,7 @@ from .. import aaa as aaa_text
 from ..confparse import Node
 from ..errors import ParseError
 from ..model import (AaaGroup, AaaMethod, AaaServer, Acl, Device, LocalUser, DhcpPool, FhrpGroup, IkePolicy, IpsecPeer, IpsecTransform, NtpKey, PreSharedKey,
-                     SnmpCommunity, SnmpGroup, SnmpHost, SnmpUser, NatPool, NatRule, Interface, InterfaceKind, LacpMode, Origin, Ospf, OspfNetwork,
+                     SnmpCommunity, SnmpGroup, SnmpHost, SnmpUser, NatPool, NatRule, Interface, InterfaceKind, LacpMode, Origin, Ospf, OspfNetwork, Wlan,
                      QosAction, QosClass, QosPolicy, StaticRoute, StpMode, SwitchportMode, Unparsed, Vlan)
 
 # Lines that only describe the file or the software, not the device's behaviour.
@@ -80,6 +80,8 @@ class _Reader:
         self._server_names: Dict[str, str] = {}  # IOS AAA server name -> address
         self._eos_sa: Dict[str, IpsecPeer] = {}  # EOS SA policy -> its PFS group and lifetime
         self._eos_keys: Dict[str, str] = {}  # EOS profile -> shared key
+        self._wlan_profiles: Dict[str, Optional[int]] = {}  # IOS XE wireless policy profile -> VLAN
+        self._wlan_tags: Dict[str, str] = {}  # WLAN -> policy profile, from the policy tags
 
     def unparsed(self, node: Node, section: str = "") -> None:
         self.device.unparsed.append(Unparsed(node.line, node.text, section))
@@ -131,6 +133,9 @@ class _Reader:
             "class-map": self.class_map,
             "policy-map": self.policy_map,
             "mls": lambda node: node.words == ["mls", "qos"],
+            "mpls": self.mpls,
+            "wlan": self.wlan,
+            "wireless": self.wireless,
         }
         for node in roots:
             if node.text.startswith(_NOISE) or node.text == "end":
@@ -1309,6 +1314,87 @@ class _Reader:
             return True
         return False
 
+    def wlan(self, node: Node) -> bool:
+        """IOS XE controller: wlan NAME ID SSID, with WPA2 802.1X unless told otherwise."""
+        w = node.words
+        if len(w) != 4 or not w[2].isdigit():
+            return False
+        wl = Wlan(w[1], ssid=w[3], wlan_id=int(w[2]), origin=Origin(node.line, node.text))
+        wpa, akm_psk, akm_dot1x = True, False, True
+        for child in node.children:
+            c = child.words
+            if c in (["no", "security", "wpa"], ["no", "security", "wpa", "wpa2"]):
+                wpa = False
+            elif c == ["no", "security", "wpa", "wpa2", "ciphers", "aes"] and not wpa:
+                pass
+            elif c[:3] == ["security", "wpa", "akm"] and len(c) == 4 and c[3] in ("psk", "dot1x"):
+                akm_psk, akm_dot1x = (True, akm_dot1x) if c[3] == "psk" else (akm_psk, True)
+            elif c[:4] == ["no", "security", "wpa", "akm"] and len(c) == 5 and c[4] in ("psk", "dot1x"):
+                akm_psk, akm_dot1x = (False, akm_dot1x) if c[4] == "psk" else (akm_psk, False)
+            elif c[:5] == ["security", "wpa", "psk", "set-key", "ascii"] and len(c) == 7 and c[5] in ("0", "8"):
+                wl.psk = c[6] if c[5] == "0" else ""
+            elif c in (["shutdown"], ["no", "shutdown"]):
+                wl.enabled = c[0] == "no"
+            else:
+                self.unparsed(child, node.text)
+        wl.security = "open" if not wpa else "dot1x" if akm_dot1x else "psk" if akm_psk else "open"
+        self.device.wlans.append(wl)
+        return True
+
+    def wireless(self, node: Node) -> bool:
+        """IOS XE controller: wireless profile policy P (vlan N) and wireless tag policy T (wlan W policy P)."""
+        w = node.words
+        if w[1:3] == ["profile", "policy"] and len(w) == 4:
+            self._wlan_profiles[w[3]] = None
+            for child in node.children:
+                c = child.words
+                if c[0] == "vlan" and len(c) == 2 and c[1].isdigit():
+                    self._wlan_profiles[w[3]] = int(c[1])
+                elif c not in (["shutdown"], ["no", "shutdown"]):
+                    self.unparsed(child, node.text)
+            return True
+        if w[1:3] == ["tag", "policy"] and len(w) == 4:
+            for child in node.children:
+                c = child.words
+                if c[0] == "wlan" and len(c) == 4 and c[2] == "policy":
+                    self._wlan_tags[c[1]] = c[3]
+                else:
+                    self.unparsed(child, node.text)
+            return True
+        return False
+
+    def mpls(self, node: Node) -> bool:
+        """IOS: mpls label protocol ldp, mpls ldp router-id IFACE [force]; EOS: mpls ip, and the mpls ldp block with
+        router-id [interface] X and [no] shutdown."""
+        w = node.words
+        m = self.device.mpls
+        m.origin = Origin(node.line, node.text)
+        if w[1:] == ["ip"]:
+            return True  # label switching on (the IOS default)
+        if w[1:] == ["label", "protocol", "ldp"]:
+            m.ldp = True
+            return True
+        if w[1:3] == ["ldp", "router-id"] and len(w) in (4, 5) and w[4:] in ([], ["force"]):
+            m.router_id_interface = names.canonical(w[3])[0]
+            m.ldp = True
+            return True
+        if w[1:] == ["ldp"]:
+            m.ldp = True
+            for child in node.children:
+                c = child.words
+                if c[0] == "router-id" and len(c) == 2:
+                    m.router_id = c[1]
+                elif c[:2] == ["router-id", "interface"] and len(c) == 3:
+                    m.router_id_interface = names.canonical(c[2])[0]
+                elif c in (["no", "shutdown"], ["interface", "disabled", "default"]):
+                    pass
+                elif c == ["shutdown"]:
+                    m.ldp = False
+                else:
+                    self.unparsed(child, node.text)
+            return True
+        return False
+
     def vlan(self, node: Node) -> bool:
         w = node.words
         if len(w) != 2:
@@ -1654,6 +1740,11 @@ class _Reader:
             iface.qos_trust = w[3]
         elif w[:2] == ["qos", "trust"] and n == 3 and w[2] in ("dscp", "cos", "disabled"):
             iface.qos_trust = "none" if w[2] == "disabled" else w[2]
+        elif w == ["mpls", "ip"] or w == ["mpls", "ldp", "interface"]:
+            # IOS: mpls ip (label switching and LDP); EOS: mpls ldp interface (mpls ip is the EOS default)
+            if self.device.platform == "ios" or w[1] == "ldp":
+                iface.mpls = True
+                self.device.mpls.ldp = True
         else:
             return False
         return True
@@ -1693,6 +1784,8 @@ class _Reader:
 
     def _finish(self) -> None:
         self._finish_vpn()
+        for wl in self.device.wlans:
+            wl.vlan = self._wlan_profiles.get(self._wlan_tags.get(wl.name, ""))
         self._finish_aaa()
         for iface in self.device.interfaces.values():
             if (iface.dot1x or iface.mab) and not iface.dot1x_host_mode:

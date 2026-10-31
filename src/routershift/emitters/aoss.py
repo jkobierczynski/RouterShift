@@ -18,7 +18,9 @@ from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from .. import acl as acl_text
 from .. import dhcp as dhcp_text
+from .. import mpls as mpls_text
 from .. import nat as nat_text
+from .. import wlan as wlan_text
 from .. import vpn as vpn_text
 from .. import fhrp
 from .. import ospf as ospf_text
@@ -101,6 +103,8 @@ class Writer:
         self.spanning_tree()
         self.dhcp()
         nat_text.skip_all(self.device, self.report, "AOS-S")
+        mpls_text.unsupported(self.device, self.report, "AOS-S")
+        wlan_text.unsupported(self.device, self.report, "AOS-S")
         vpn_text.skip_all(self.device, self.report, "AOS-S")
         if self.device.bgp is not None:
             self.report.skip("bgp", f"bgp {self.device.bgp.local_as}", "bgp",
