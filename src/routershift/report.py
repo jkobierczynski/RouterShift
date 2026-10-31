@@ -16,10 +16,10 @@ from .model import Unparsed
 
 # Words after which a configuration line carries a secret; the report shows "<removed>" instead.
 _SECRET_WORDS = {"community", "password", "secret", "key", "key-string", "md5", "sha", "auth", "priv", "pre-shared-key",
-                 "shared-key", "authentication-key", "authentication-mode", "privacy-mode", "set-key"}
+                 "shared-key", "authentication-key", "encrypted-password", "simple-password", "value", "authentication-mode", "privacy-mode", "set-key"}
 # Words between a secret word and the secret: its form, or (SNMP) its access
 _SECRET_TYPES = {"ciphertext", "plaintext", "encrypted", "cipher", "hash", "simple", "read", "write", "text",
-                 "local", "remote", "ascii", "hex"}
+                 "local", "remote", "ascii", "hex", "ascii-text", "hexadecimal"}
 # Algorithms and key sizes that stand between a secret word and the secret ("priv aes 128 <key>")
 _ALGORITHMS = {"des", "3des", "aes", "aes128", "aes192", "aes256", "128", "192", "256", "sha1", "sha256", "sha384",
                "sha512", "hmac-sha-1", "hmac-sha-256"}

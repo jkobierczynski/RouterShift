@@ -44,6 +44,10 @@ _SLOT_BASE = {"aoscx": 1}
 _COMWARE_PREFIX = {"100g": "HundredGigE", "40g": "FortyGigE", "25g": "Twenty-FiveGigE", "10g": "Ten-GigabitEthernet",
                    "1g": "GigabitEthernet"}
 
+# How Junos names a port of each speed class.
+_JUNOS_PREFIX = {"100g": "et", "40g": "et", "25g": "et", "10g": "xe", "5g": "mge", "2.5g": "mge", "1g": "ge",
+                 "100m": "ge"}
+
 # How IOS names a port of each speed class.
 _IOS_PREFIX = {"100g": "HundredGigE", "40g": "FortyGigabitEthernet", "25g": "TwentyFiveGigE",
                "10g": "TenGigabitEthernet", "5g": "FiveGigabitEthernet", "2.5g": "TwoGigabitEthernet",
@@ -136,7 +140,8 @@ class PortMapper:
     def _kept_number(self, iface: Interface) -> Optional[str]:
         """member/slot/port of the port on the target, if it can keep its numbers."""
         parts = iface.name[len("Ethernet"):].split("/")
-        if len(parts) != 3 or not all(p.isdigit() for p in parts) or self.target == "eos":
+        if (len(parts) != 3 or not all(p.isdigit() for p in parts) or self.target == "eos"
+                or "junos" in (self.target, self.device.platform)):
             return None
         member, slot, port = (int(p) for p in parts)
         if self.target == "aoss":
@@ -158,6 +163,8 @@ class PortMapper:
             return kept or str(index)
         if self.target == "comware":
             return f"{_COMWARE_PREFIX.get(iface.media, 'GigabitEthernet')}{kept or f'1/0/{index}'}"
+        if self.target == "junos":
+            return f"{_JUNOS_PREFIX.get(iface.media, 'ge')}-0/0/{index - 1}"
         # eos: front-panel ports are numbered 1..n
         return f"Ethernet{index}"
 
@@ -169,6 +176,8 @@ class PortMapper:
             return self._aoss_logical(iface)
         if self.target == "comware":
             return self._comware_logical(iface)
+        if self.target == "junos":
+            return self._junos_logical(iface)
         if iface.kind == InterfaceKind.LAG:
             number = name[len("Port-channel"):]
             return f"Port-Channel{number}" if self.target == "eos" else f"Port-channel{number}"
@@ -213,6 +222,21 @@ class PortMapper:
                 return f"{word} {name[len(prefix):]}"
         if iface.kind == InterfaceKind.MANAGEMENT:
             return "mgmt"
+        if iface.kind == InterfaceKind.SUBINTERFACE and iface.parent:
+            return f"{self(iface.parent)}.{name.rsplit('.', 1)[1]}"
+        return name
+
+    def _junos_logical(self, iface: Interface) -> str:
+        """Junos names: aeN (numbered from 0), irb.N, lo0.N, me0; a unit of its port for a subinterface."""
+        name = iface.name
+        if iface.kind == InterfaceKind.LAG:
+            return f"ae{max(int(name[len('Port-channel'):]) - 1, 0)}"
+        if iface.kind == InterfaceKind.VLAN:
+            return f"irb.{name[len('Vlan'):]}"
+        if iface.kind == InterfaceKind.LOOPBACK:
+            return f"lo0.{name[len('Loopback'):]}"
+        if iface.kind == InterfaceKind.MANAGEMENT:
+            return "me0"
         if iface.kind == InterfaceKind.SUBINTERFACE and iface.parent:
             return f"{self(iface.parent)}.{name.rsplit('.', 1)[1]}"
         return name
