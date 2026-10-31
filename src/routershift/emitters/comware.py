@@ -18,6 +18,7 @@ from .. import vpn as vpn_text
 from .. import ospf as ospf_text
 from .. import snmp as snmp_text
 from .. import stp as stp_text
+from .. import l2sec as l2sec_text
 from .. import mgmt as mgmt_text
 from .. import mpls as mpls_text
 from .. import qos as qos_text
@@ -468,12 +469,30 @@ class Writer:
             self.report.item("system", f"vrf {name}")
 
     def vlans(self) -> None:
+        d = self.device
+        rep = self.report
+        snooped = l2sec_text.snooping_vlans(d)
+        if d.dhcp_snooping or snooped:
+            rep.item("vlan", "DHCP snooping")
+            self.out.append(f"{_IND}dhcp snooping enable")
+            self.block_end()
+            if snooped and set(snooped) != set(d.vlans):
+                rep.add("vlan", "DHCP snooping", Severity.APPROX, "dhcp-snooping",
+                        f"Comware snoops every VLAN, not only {l2sec_text.vlan_text(snooped)}; the untrusted ports "
+                        "decide where server replies are dropped")
+        if any(i.port_security for i in d.interfaces.values()):
+            self.out.append(f"{_IND}port-security enable")
+            self.block_end()
+        if l2sec_text.inspection_vlans(d):
+            rep.item("vlan", "ARP inspection")
         for vlan in sorted(self.device.vlans.values(), key=lambda v: v.vlan_id):
             self.out.append(f"vlan {vlan.vlan_id}")
             if vlan.name:
                 self.out.append(f"{_IND}name {vlan.name}")
             if vlan.shutdown:
                 self.out.append(f"{_IND}shutdown")
+            if vlan.arp_inspection:
+                self.out.append(f"{_IND}arp detection enable")
             self.block_end()
             self.report.item("vlan", str(vlan.vlan_id))
 
@@ -696,6 +715,27 @@ class Writer:
             lines.append(f"qos trust {'dot1p' if iface.qos_trust == 'cos' else 'dscp'}")
         if iface.mpls:
             lines += ["mpls enable", "mpls ldp enable"]
+        if iface.dhcp_trust:
+            lines.append("dhcp snooping trust")
+        if iface.arp_trust:
+            lines.append("arp detection trust")
+        if iface.source_guard:
+            lines.append("ip verify source ip-address mac-address")
+        if iface.port_security:
+            lines.append("port-security port-mode autolearn")
+            if iface.port_security_max is not None:
+                lines.append(f"port-security max-mac-count {iface.port_security_max}")
+            violation = iface.port_security_violation
+            if violation and violation != "protect":  # protect: no intrusion mode, the Comware default
+                lines.append(f"port-security intrusion-mode {'disableport' if violation == 'shutdown' else 'blockmac'}")
+        levels = l2sec_text.storm(iface, "unknown-unicast", ["broadcast", "multicast", "unknown-unicast"], self.report,
+                                  label, "Comware")
+        for kind, level in levels.items():
+            if level != int(level):
+                add(Severity.APPROX, "storm-control",
+                    f"Comware takes whole percents: {kind} limit {level:g}% written as {round(level)}%")
+            word = "unicast" if kind == "unknown-unicast" else kind
+            lines.append(f"{word}-suppression {round(level)}")
         if not (iface.lldp_tx and iface.lldp_rx):
             status = "tx" if iface.lldp_tx else "rx" if iface.lldp_rx else "disable"
             lines.append(f"lldp admin-status {status}")

@@ -7,6 +7,7 @@ from routershift import bgp as bgp_text
 from routershift import nat as nat_text
 from routershift import aaa as aaa_text
 from routershift import snmp as snmp_text
+from routershift import l2sec as l2sec_text
 from routershift import mgmt as mgmt_text
 from routershift import mpls as mpls_text
 from routershift import qos as qos_text
@@ -16,7 +17,7 @@ from routershift import vpn as vpn_text
 from routershift import ospf as ospf_text
 from routershift.acl import safe_name
 from routershift.convert import PLATFORMS, convert, parse
-from routershift.model import AclAction, Device, InterfaceKind, StpMode
+from routershift.model import AclAction, Device, Interface, InterfaceKind, StpMode
 
 SAMPLES = {"ios": "ios_access.cfg", "eos": "eos_leaf.cfg", "aoscx": "aoscx_access.cfg", "aoss": "aoss_edge.cfg",
            "comware": "comware_access.cfg"}
@@ -196,6 +197,36 @@ def test_converts_and_reads_back(source: str, target: str) -> None:
     lldp_ports = lambda dev: sorted((i.lldp_tx, i.lldp_rx) for i in dev.interfaces.values()  # noqa: E731
                                     if not (i.lldp_tx and i.lldp_rx))
     assert lldp_ports(first) == lldp_ports(back)
+    # L2 security keeps DHCP snooping (Comware snoops every VLAN), ARP inspection per VLAN, and per port the trust
+    # (EOS snooping has no trusted ports), IP source guard, port security (AOS-CX writes no violation mode, EOS
+    # protects for restrict) and storm control where the target has it (in whole percents on AOS-S and Comware)
+    def snooped(dev: Device) -> set:
+        return set(l2sec_text.snooping_vlans(dev)) or (set(dev.vlans) if dev.dhcp_snooping else set())
+
+    assert bool(snooped(first)) == bool(snooped(back))
+    if target != "comware":
+        assert snooped(first) <= snooped(back)
+    assert l2sec_text.inspection_vlans(first) == l2sec_text.inspection_vlans(back)
+    storm_kinds = {"ios": ("broadcast", "multicast", "unicast"), "eos": ("broadcast", "multicast", "unknown-unicast"),
+                   "aoscx": (), "aoss": ("broadcast",), "comware": ("broadcast", "multicast", "unknown-unicast")}
+
+    def violation(v: str) -> str:
+        # (AOS-CX states no violation mode, so the target's default is read back)
+        return "" if "aoscx" in (source, target) else "protect" if target == "eos" and v == "restrict" else v
+
+    def l2_ports(dev: Device, written: bool) -> list:
+        def storm(i: Interface) -> list:
+            levels = {("unicast" if k.endswith("unicast") else k): v for k, v in i.storm_control.items()}
+            return sorted((k, round(v)) for k, v in levels.items()
+                          if any(k == o or o.endswith("unicast") and k == "unicast" for o in storm_kinds[target]))
+
+        return sorted((i.dhcp_trust and target != "eos", i.arp_trust, i.source_guard, i.port_security,
+                       i.port_security_max, violation(i.port_security_violation) if written else
+                       "" if source == "aoscx" else i.port_security_violation, storm(i)) for i in dev.interfaces.values()
+                      if l2sec_text.has_port_settings(i))
+
+    kept = lambda ports: [p for p in ports if any(p[:5]) or p[6]]  # noqa: E731
+    assert kept(l2_ports(first, True)) == kept(l2_ports(back, False))
     # QoS keeps every applied policy with its classes (DSCP values, or an ACL with as many rules), markings and
     # police rates, and the trust of every port (AOS-CX has no default class; EOS takes no output policy)
     def qos(dev: Device) -> list:

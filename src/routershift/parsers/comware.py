@@ -192,6 +192,7 @@ class _Reader:
             "telnet": self.server,
             "lldp": self.server,
             "undo": self.undo,
+            "port-security": lambda node: node.words == ["port-security", "enable"],
         }
         for node in roots:
             if node.text.startswith(_NOISE):
@@ -783,6 +784,8 @@ class _Reader:
                     vlan.name = child.text.split(None, 1)[1]
                 elif child.text == "shutdown":
                     vlan.shutdown = True
+                elif child.text == "arp detection enable":
+                    vlan.arp_inspection = True
                 elif vid == ids[0]:
                     self.unparsed(child, node.text)
         return True
@@ -969,9 +972,12 @@ class _Reader:
     # interfaces ------------------------------------------------------------------------------------------------------
 
     def dhcp(self, node: Node) -> bool:
-        """dhcp enable, dhcp server forbidden-ip, dhcp server ip-pool NAME."""
+        """dhcp enable, dhcp snooping enable, dhcp server forbidden-ip, dhcp server ip-pool NAME."""
         w = node.words
         if w[1:] == ["enable"]:
+            return True
+        if w[1:] == ["snooping", "enable"]:
+            self.device.dhcp_snooping = True
             return True
         if w[1:3] == ["server", "forbidden-ip"] and len(w) >= 4:
             args = w[3:]
@@ -1465,6 +1471,20 @@ class _Reader:
             iface.qos_trust = "cos" if w[2] == "dot1p" else "dscp"
         elif w[:2] == ["lldp", "admin-status"] and n == 3 and w[2] in ("tx", "rx", "disable", "txrx"):
             iface.lldp_tx, iface.lldp_rx = w[2] in ("tx", "txrx"), w[2] in ("rx", "txrx")
+        elif w in (["dhcp", "snooping", "trust"], ["arp", "detection", "trust"]):
+            setattr(iface, "dhcp_trust" if w[0] == "dhcp" else "arp_trust", True)
+        elif w == ["ip", "verify", "source", "ip-address", "mac-address"]:
+            iface.source_guard = True
+        elif w == ["port-security", "port-mode", "autolearn"]:
+            iface.port_security = True
+            iface.port_security_violation = iface.port_security_violation or "protect"  # no intrusion mode: drop
+        elif w[:2] == ["port-security", "max-mac-count"] and n == 3:
+            iface.port_security_max = int(w[2])
+        elif w[:2] == ["port-security", "intrusion-mode"] and n == 3 and w[2] in ("disableport", "blockmac"):
+            iface.port_security_violation = "shutdown" if w[2] == "disableport" else "restrict"
+        elif w[0] in ("broadcast-suppression", "multicast-suppression", "unicast-suppression") and n == 2:
+            kind = w[0].split("-")[0]
+            iface.storm_control["unknown-unicast" if kind == "unicast" else kind] = float(w[1])
         elif w == ["undo", "lldp", "enable"]:
             iface.lldp_tx = iface.lldp_rx = False
         elif w in (["mpls", "enable"], ["mpls", "ldp", "enable"]):

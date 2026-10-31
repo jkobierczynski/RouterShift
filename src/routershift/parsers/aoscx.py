@@ -111,6 +111,7 @@ class _Reader:
             "aaa": self.aaa,
             "class": self.qos_class,
             "policy": self.qos_policy,
+            "dhcpv4-snooping": lambda node: node.words == ["dhcpv4-snooping"] and self._snooping(),
             "ssh": self.server,
             "https-server": self.server,
             "cli-session": self.cli_session,
@@ -401,6 +402,10 @@ class _Reader:
                 self.unparsed(child, node.text)
         return True
 
+    def _snooping(self) -> bool:
+        self.device.dhcp_snooping = True
+        return True
+
     def _set_lldp(self, on: bool) -> bool:
         self.device.management.lldp = on
         return True
@@ -438,6 +443,10 @@ class _Reader:
                     vlan.shutdown = True
                 elif child.text == "voice":
                     self._voice_vlans.append(vid)
+                elif child.text == "dhcpv4-snooping":
+                    vlan.dhcp_snooping = True
+                elif child.text == "arp inspection":
+                    vlan.arp_inspection = True
                 elif child.text == "no shutdown":
                     pass
                 elif vid == ids[0]:
@@ -723,6 +732,14 @@ class _Reader:
                 continue
             if child.words[:3] == ["aaa", "authentication", "port-access"] and self._port_access(iface, child):
                 continue
+            if child.words == ["port-access", "port-security"]:
+                iface.port_security = True
+                for c in child.children:
+                    if c.words[0] == "client-limit" and len(c.words) == 2 and c.words[1].isdigit():
+                        iface.port_security_max = int(c.words[1])
+                    elif c.words != ["enable"]:
+                        self.unparsed(c, child.text)
+                continue
             try:
                 understood = self.interface_line(iface, child.words)
             except (ValueError, IndexError):
@@ -864,6 +881,10 @@ class _Reader:
             setattr(iface, f"qos_policy_{w[3].replace('routed-', '')}", w[2])
         elif w[:2] == ["qos", "trust"] and n == 3 and w[2] in ("dscp", "cos", "none"):
             iface.qos_trust = w[2]
+        elif w in (["dhcpv4-snooping", "trust"], ["arp", "inspection", "trust"]):
+            setattr(iface, "dhcp_trust" if w[0] == "dhcpv4-snooping" else "arp_trust", True)
+        elif w == ["ipv4", "source-lockdown"]:
+            iface.source_guard = True
         elif w in (["no", "lldp", "transmit"], ["no", "lldp", "receive"]):
             setattr(iface, "lldp_tx" if w[2] == "transmit" else "lldp_rx", False)
         elif w[:2] == ["ip", "helper-address"] and n >= 3:

@@ -44,6 +44,9 @@ def unquote(text: str) -> str:
     return text[1:-1] if len(text) >= 2 and text[0] == text[-1] == '"' else text
 
 
+_AOSS_ACTIONS = {"send-disable": "shutdown", "send-alarm": "restrict", "none": "protect"}
+
+
 def ports(text: str) -> List[str]:
     """The ports of a port list: ``1-3,5,A1-A4,Trk1,1/1-1/4``."""
     result: List[str] = []
@@ -144,6 +147,9 @@ class _Reader:
             "lldp": self.lldp,
             "cdp": lambda node: node.words == ["cdp", "run"] and self._set("cdp", True),
             "no": self.no_global,
+            "dhcp-snooping": self.snooping,
+            "arp-protect": self.snooping,
+            "port-security": self.port_security,
         }
         for node in roots:
             if node.text.startswith(_NOISE):
@@ -389,6 +395,46 @@ class _Reader:
             return True
         return False
 
+    def snooping(self, node: Node) -> bool:
+        """dhcp-snooping | arp-protect [vlan V V | trust PORTS]"""
+        w = node.words
+        dhcp = w[0] == "dhcp-snooping"
+        if len(w) == 1:
+            if dhcp:
+                self.device.dhcp_snooping = True
+            return True
+        if w[1] == "vlan" and len(w) >= 3:
+            for vid in [v for word in w[2:] for v in _vlan_ids(word)]:
+                vlan = self.device.vlans.setdefault(vid, Vlan(vid))
+                setattr(vlan, "dhcp_snooping" if dhcp else "arp_inspection", True)
+            return True
+        if w[1] == "trust" and len(w) == 3:
+            for name in ports(w[2]):
+                setattr(self.port(name), "dhcp_trust" if dhcp else "arp_trust", True)
+            return True
+        return False
+
+    def port_security(self, node: Node) -> bool:
+        """port-security PORTS learn-mode static [address-limit N] [action none|send-alarm|send-disable]"""
+        w = node.words
+        if len(w) < 4 or w[2:4] != ["learn-mode", "static"]:
+            return False
+        args = w[4:]
+        limit: Optional[int] = None
+        violation = "protect"  # action none: the AOS-S default drops without telling
+        while args:
+            if args[0] == "address-limit" and len(args) >= 2:
+                limit = int(args[1])
+            elif args[0] == "action" and len(args) >= 2 and args[1] in _AOSS_ACTIONS:
+                violation = _AOSS_ACTIONS[args[1]]
+            else:
+                return False
+            args = args[2:]
+        for name in ports(w[1]):
+            iface = self.port(name)
+            iface.port_security, iface.port_security_max, iface.port_security_violation = True, limit, violation
+        return True
+
     def lldp(self, node: Node) -> bool:
         """lldp run, lldp admin-status PORTS txonly|rxonly|disable."""
         w = node.words
@@ -422,6 +468,10 @@ class _Reader:
 
     def ip(self, node: Node) -> bool:
         w = node.words
+        if w[1] == "source-lockdown" and len(w) == 3:
+            for name in ports(w[2]):
+                self.port(name).source_guard = True
+            return True
         if w[1:] == ["ssh"]:
             return self._set("ssh", True)
         if w[1] == "source-interface" and len(w) == 5 and w[2] in ("radius", "tacacs", "tftp", "syslog") \
@@ -631,6 +681,8 @@ class _Reader:
             setattr(iface, f"qos_policy_{w[2]}", unquote(w[1]))
         elif w[:2] == ["qos", "trust"] and len(w) == 3 and w[2] in ("dscp", "dot1p", "none"):
             iface.qos_trust = "cos" if w[2] == "dot1p" else w[2]
+        elif w[0] == "broadcast-limit" and len(w) == 2:
+            iface.storm_control["broadcast"] = float(w[1])
         elif w[0] == "name" and len(w) >= 2:
             iface.description = unquote(" ".join(w[1:]))
         elif w[0] == "speed-duplex" and len(w) == 2:

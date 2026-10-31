@@ -15,6 +15,7 @@ from .. import dhcp as dhcp_text
 from .. import fhrp
 from .. import nat as nat_text
 from .. import ospf as ospf_text
+from .. import l2sec as l2sec_text
 from .. import mgmt as mgmt_text
 from .. import mpls as mpls_text
 from .. import qos as qos_text
@@ -78,6 +79,7 @@ class Writer:
         self.vlans()
         self.vpn()
         self.qos()
+        self.l2sec()
         self.mpls()
         for iface in self.device.interfaces.values():
             self.interface(iface)
@@ -231,6 +233,7 @@ class Writer:
         if iface.mpls:
             lines.append("mpls ip" if self.ios else "mpls ldp interface")
         lines += [f"no lldp {name}" for name, on in (("transmit", iface.lldp_tx), ("receive", iface.lldp_rx)) if not on]
+        lines += self._l2sec_interface(iface, add, label)
         if iface.cdp is not None and self.ios:
             lines.append("cdp enable" if iface.cdp else "no cdp enable")
         if iface.stp_portfast:
@@ -1111,6 +1114,51 @@ class Writer:
         self.out.append("!")
         rep.add("wlan", "policy tag RS-POLICY-TAG", Severity.REVIEW, "wlan-tag",
                 "the WLANs are mapped in policy tag RS-POLICY-TAG; assign it to the access points")
+
+    def l2sec(self) -> None:
+        """DHCP snooping and ARP inspection per VLAN (EOS snooping only adds option 82 and has no trusted ports)."""
+        d = self.device
+        rep = self.report
+        vlans = l2sec_text.snooping_vlans_written(d, rep)
+        if d.dhcp_snooping or vlans:
+            rep.item("vlan", "DHCP snooping")
+            self.out.append("ip dhcp snooping")
+            if vlans:
+                self.out.append(f"ip dhcp snooping vlan {l2sec_text.vlan_text(vlans)}")
+            if not self.ios:
+                rep.add("vlan", "DHCP snooping", Severity.REVIEW, "dhcp-snooping",
+                        "EOS DHCP snooping adds relay option 82 only; it does not drop server replies on untrusted "
+                        "ports, so the trusted ports are not written")
+        vlans = l2sec_text.inspection_vlans(d)
+        if vlans:
+            rep.item("vlan", "ARP inspection")
+            self.out.append(f"ip arp inspection vlan {l2sec_text.vlan_text(vlans)}")
+        if d.dhcp_snooping or vlans:
+            self.out.append("!")
+
+    def _l2sec_interface(self, iface: Interface, add: _Add, label: str) -> List[str]:
+        lines = []
+        if iface.dhcp_trust and self.ios:
+            lines.append("ip dhcp snooping trust")
+        if iface.arp_trust:
+            lines.append("ip arp inspection trust")
+        if iface.source_guard:
+            lines.append("ip verify source")
+        if iface.port_security:
+            lines.append("switchport port-security")
+            if iface.port_security_max is not None:
+                lines.append(f"switchport port-security {'' if self.ios else 'mac-address '}maximum "
+                             f"{iface.port_security_max}")
+            violation = iface.port_security_violation
+            if violation == "restrict" and not self.ios:
+                add(Severity.APPROX, "port-security", "EOS has no restrict mode; protect drops without reporting")
+                violation = "protect"
+            if violation and violation != "shutdown":  # shutdown is the default
+                lines.append(f"switchport port-security violation {violation}")
+        offered = ["broadcast", "multicast", "unicast" if self.ios else "unknown-unicast"]
+        levels = l2sec_text.storm(iface, offered[2], offered, self.report, label, "EOS")
+        lines += [f"storm-control {kind} level {l2sec_text.level_text(level)}" for kind, level in levels.items()]
+        return lines
 
     def mpls(self) -> None:
         """IOS: mpls label protocol ldp and mpls ldp router-id IFACE force; EOS: mpls ip and an mpls ldp block that

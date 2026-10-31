@@ -18,6 +18,7 @@ from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from .. import acl as acl_text
 from .. import dhcp as dhcp_text
+from .. import l2sec as l2sec_text
 from .. import mgmt as mgmt_text
 from .. import mpls as mpls_text
 from .. import nat as nat_text
@@ -38,6 +39,9 @@ from ..timezones import offset_minutes
 _IND = "   "
 _PORT = re.compile(r"^(.*?)(\d+)$")
 _TRANSIT_VLANS = range(3999, 3000, -1)  # where a routed port's VLAN is taken from
+
+
+_AOSS_ACTIONS = {"send-disable": "shutdown", "send-alarm": "restrict", "none": "protect"}
 
 
 def port_list(names: List[str]) -> str:
@@ -99,6 +103,7 @@ class Writer:
         self.acls()
         self.qos()
         self.interfaces()
+        self.l2sec()
         self.routes()
         self.vlan_blocks()
         self.spanning_tree()
@@ -568,6 +573,12 @@ class Writer:
             if iface.mode != SwitchportMode.ROUTED:  # a routed port's lists go to its VLAN
                 lines += self._acl_bindings(iface)
                 lines += self._qos_bindings(iface)
+                levels = l2sec_text.storm(iface, "unknown-unicast", ["broadcast"], self.report, label, "AOS-S")
+                for level in levels.values():
+                    if level != int(level):
+                        self.add(iface, Severity.APPROX, "storm-control",
+                                 f"AOS-S takes whole percents: broadcast limit {level:g}% written as {round(level)}%")
+                    lines.append(f"broadcast-limit {round(level)}")
             if iface.shutdown:
                 lines.append("disable")
             if iface.speed is not None:
@@ -826,6 +837,41 @@ class Writer:
                 self.out.append(_IND + " ".join(words))
                 seq += 10
             self.out.append(_IND + "exit")
+
+    def l2sec(self) -> None:
+        """DHCP snooping and ARP protection with their VLANs and trusted ports, IP lockdown and port security."""
+        d = self.device
+        rep = self.report
+        ifaces = list(d.interfaces.values())
+
+        def names(test: Callable[[Interface], bool]) -> str:
+            return port_list([self.port(i.name) for i in ifaces if test(i)])
+
+        vlans = l2sec_text.snooping_vlans_written(d, rep)
+        if d.dhcp_snooping or vlans:
+            rep.item("vlan", "DHCP snooping")
+            self.out.append("dhcp-snooping")
+            if vlans:
+                self.out.append(f"dhcp-snooping vlan {l2sec_text.vlan_text(vlans, ' ')}")
+        vlans = l2sec_text.inspection_vlans(d)
+        if vlans:
+            rep.item("vlan", "ARP inspection")
+            self.out += ["arp-protect", f"arp-protect vlan {l2sec_text.vlan_text(vlans, ' ')}"]
+        for word, test in (("dhcp-snooping trust", lambda i: i.dhcp_trust), ("arp-protect trust", lambda i: i.arp_trust),
+                           ("ip source-lockdown", lambda i: i.source_guard)):
+            text = names(test)
+            if text:
+                self.out.append(f"{word} {text}")
+        for i in ifaces:
+            if not i.port_security:
+                continue
+            words = [f"port-security {self.port(i.name)} learn-mode static"]
+            if i.port_security_max is not None:
+                words.append(f"address-limit {i.port_security_max}")
+            if i.port_security_violation not in ("", "protect"):
+                action = {v: k for k, v in _AOSS_ACTIONS.items()}[i.port_security_violation]
+                words.append(f"action {action}")
+            self.out.append(" ".join(words))
 
     def _qos_bindings(self, iface: Interface) -> List[str]:
         lines = []
