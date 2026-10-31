@@ -69,6 +69,8 @@ class _Reader:
         self._ospf_areas: List[Tuple[str, str, str]] = []
         self._ospf_passive: Dict[str, bool] = {}
         self._voice_vlans: List[int] = []
+        self._client_limit: Dict[str, int] = {}  # port access, per port
+        self._auth_mode: Dict[str, str] = {}
 
     def unparsed(self, node: Node, section: str = "") -> None:
         self.device.unparsed.append(Unparsed(node.line, node.text, section))
@@ -139,6 +141,11 @@ class _Reader:
 
     def ip(self, node: Node) -> bool:
         w = node.words
+        if w[1] == "source-interface" and len(w) >= 5 and w[2] == "tftp" and w[3] == "interface":
+            end = w.index("vrf") if "vrf" in w else len(w)
+            name = re.sub(r"^(vlan|loopback)(\d)", r"\1 \2", " ".join(w[4:end]))
+            self.device.system.transfer_source["tftp"] = canonical(name)[0]
+            return end in (5, 6) and len(w) in (end, end + 2)
         if w[1] == "source-interface" and len(w) >= 5 and w[2] in ("radius", "tacacs", "all") and w[3] == "interface":
             # ip source-interface radius|tacacs|all interface X [vrf V]
             # X is 1/1/1, vlan10 or loopback0 (or "vlan 10")
@@ -298,6 +305,18 @@ class _Reader:
                         rest = rest[2:]
                     if rest:
                         self.unparsed(child, node.text)
+                else:
+                    self.unparsed(child, node.text)
+            return True
+        if w[1:4] == ["authentication", "port-access", "dot1x"] and w[4:] == ["authenticator"] or \
+                w[1:] == ["authentication", "port-access", "mac-auth"]:
+            for child in node.children:
+                c = child.words
+                if c == ["enable"]:
+                    a.dot1x = a.dot1x or w[3] == "dot1x"
+                elif c[:2] == ["radius", "server-group"] and len(c) == 3:
+                    if not any(m.service == "dot1x" for m in a.methods):
+                        a.methods.append(AaaMethod("authentication", "dot1x", [f"group:{c[2]}"], origin=origin))
                 else:
                     self.unparsed(child, node.text)
             return True
@@ -598,11 +617,39 @@ class _Reader:
             if child.words[0] == "vrrp" and child.words[2:] == ["address-family", "ipv4"]:
                 self._vrrp(iface, child)
                 continue
+            if child.words[:3] == ["aaa", "authentication", "port-access"] and self._port_access(iface, child):
+                continue
             try:
                 understood = self.interface_line(iface, child.words)
             except (ValueError, IndexError):
                 understood = False
             if not understood:
+                self.unparsed(child, node.text)
+        return True
+
+    def _port_access(self, iface: Interface, node: Node) -> bool:
+        """aaa authentication port-access client-limit N | auth-mode M | dot1x authenticator {...} | mac-auth {...}"""
+        w = node.words[3:]
+        if w[:1] == ["client-limit"] and len(w) == 2:
+            self._client_limit[iface.name] = int(w[1])
+            return True
+        if w[:1] == ["auth-mode"] and len(w) == 2 and w[1] in ("client-mode", "device-mode", "multi-domain"):
+            self._auth_mode[iface.name] = w[1]
+            return True
+        if w not in (["dot1x", "authenticator"], ["mac-auth"]):
+            return False
+        for child in node.children:
+            c = child.words
+            if c == ["enable"]:
+                if w == ["mac-auth"]:
+                    iface.mab = True
+                else:
+                    iface.dot1x = True
+            elif c == ["reauth"] and w != ["mac-auth"]:
+                iface.dot1x_reauth = True
+            elif c[0] == "reauth-period" and len(c) == 2 and w != ["mac-auth"]:
+                iface.dot1x_reauth_period = int(c[1])
+            else:
                 self.unparsed(child, node.text)
         return True
 
@@ -753,6 +800,12 @@ class _Reader:
     def _finish(self) -> None:
         for iface in self.device.interfaces.values():
             self._voice_port(iface)
+            if iface.dot1x or iface.mab:
+                # client mode (the default) with one client is single-host; device mode opens the port to all
+                mode = self._auth_mode.get(iface.name, "client-mode")
+                limit = self._client_limit.get(iface.name, 1)
+                iface.dot1x_host_mode = {"device-mode": "multi-host", "multi-domain": "multi-domain"}.get(
+                    mode, "single-host" if limit == 1 else "multi-auth")
         for iface in self.device.interfaces.values():
             if iface.kind not in (InterfaceKind.ETHERNET, InterfaceKind.LAG):
                 continue

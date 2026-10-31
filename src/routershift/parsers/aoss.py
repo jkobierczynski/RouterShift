@@ -86,6 +86,7 @@ class _Reader:
         self.ospf_passive: Dict[str, bool] = {}
         self._snmp_groups: List[Tuple[str, str]] = []  # (user, group)
         self._aaa_keys: Dict[str, str] = {}  # protocol -> the key of servers that have none of their own
+        self._client_limit: Dict[Tuple[str, str], int] = {}  # (port, authenticator|mac-based) -> client limit
 
     def unparsed(self, node: Node, section: str = "") -> None:
         self.device.unparsed.append(Unparsed(node.line, node.text, section))
@@ -284,6 +285,32 @@ class _Reader:
             a.methods.append(AaaMethod("accounting", w[2], methods, level=15 if w[2] == "commands" else None,
                                        record="start-stop" if w[3] != "stop-only" else "stop-only", origin=origin))
             return True
+        if w[1:3] == ["port-access", "authenticator"] and w[3:] == ["active"]:
+            a.dot1x = True
+            return True
+        if w[1:3] in (["port-access", "authenticator"], ["port-access", "mac-based"]) and len(w) >= 4:
+            # aaa port-access authenticator|mac-based PORTS [client-limit|addr-limit N | reauth-period N]
+            for name in ports(w[3]):
+                iface = self.port(name)
+                if w[4:] == []:
+                    if w[2] == "authenticator":
+                        iface.dot1x = True
+                    else:
+                        iface.mab = True
+                elif w[4] in ("client-limit", "addr-limit") and len(w) == 6:
+                    self._client_limit[(iface.name, w[2])] = int(w[5])
+                elif w[4] == "reauth-period" and len(w) == 6 and w[2] == "authenticator":
+                    iface.dot1x_reauth = int(w[5]) > 0
+                    iface.dot1x_reauth_period = int(w[5]) or None
+                else:
+                    return False
+            return True
+        if w[1:4] == ["authentication", "port-access", "eap-radius"]:
+            server_group = w[5] if w[4:5] == ["server-group"] and len(w) == 6 else "radius"
+            a.methods.append(AaaMethod("authentication", "dot1x", [f"group:{server_group}"], origin=origin))
+            return len(w) in (4, 6)
+        if w[1:4] == ["authentication", "mac-based", "chap-radius"]:
+            return True  # MAC authentication against the same servers
         if w[1:3] == ["authorization", "commands"] and len(w) >= 4:
             methods = self._methods(w[3:])
             if methods is None:
@@ -338,8 +365,13 @@ class _Reader:
 
     def ip(self, node: Node) -> bool:
         w = node.words
-        if w[1] == "source-interface" and len(w) == 5 and w[2] in ("radius", "tacacs") and w[3] in ("vlan", "loopback"):
-            self.device.aaa.source[w[2]] = f"{'Vlan' if w[3] == 'vlan' else 'Loopback'}{w[4]}"
+        if w[1] == "source-interface" and len(w) == 5 and w[2] in ("radius", "tacacs", "tftp") \
+                and w[3] in ("vlan", "loopback"):
+            source = f"{'Vlan' if w[3] == 'vlan' else 'Loopback'}{w[4]}"
+            if w[2] == "tftp":
+                self.device.system.transfer_source["tftp"] = source
+            else:
+                self.device.aaa.source[w[2]] = source
             return True
         if w[1:] == ["routing"]:
             self.routing = True
@@ -686,6 +718,13 @@ class _Reader:
     # VLAN membership to ports ----------------------------------------------------------------------------------------
 
     def _finish(self) -> None:
+        for iface in self.device.interfaces.values():
+            if iface.dot1x or iface.mab:
+                # an authenticator without a client limit opens the port for all once one client logs in; MAC
+                # authentication takes one address unless told otherwise
+                limit = self._client_limit.get((iface.name, "authenticator" if iface.dot1x else "mac-based"),
+                                               None if iface.dot1x else 1)
+                iface.dot1x_host_mode = "multi-host" if limit is None else "single-host" if limit == 1 else "multi-auth"
         for server in self.device.aaa.servers:
             server.key = server.key or self._aaa_keys.get(server.protocol, "")
         snmp = self.device.snmp

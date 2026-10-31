@@ -126,6 +126,17 @@ def test_converts_and_reads_back(source: str, target: str) -> None:
     assert aaa(first) == aaa(back)
     users = lambda dev: sorted(u.name for u in dev.users if u.password)  # noqa: E731
     assert users(first) == users(back)
+    # 802.1X keeps the ports with 802.1X and MAB, their host mode and reauthentication, and the RADIUS servers they
+    # use; TFTP and FTP keep their source interface (the AOS switches have no FTP client setting, and AOS-S takes a
+    # VLAN or loopback only)
+    dot1x = lambda dev: (  # noqa: E731
+        dev.aaa.dot1x,
+        sorted((i.dot1x, i.mab, i.dot1x_host_mode, i.dot1x_reauth, (i.dot1x_reauth_period or 3600) if i.dot1x_reauth
+                else 0) for i in dev.interfaces.values() if i.dot1x or i.mab),
+        [aaa_text.protocol_of(dev, m.methods[0]) for m in dev.aaa.methods if m.service == "dot1x"],
+        sorted(k for k, source in dev.system.transfer_source.items() if not (aos and k == "ftp") and not (
+            target == "aoss" and not source.startswith(("Vlan", "Loopback")))))
+    assert dot1x(first) == dot1x(back)
     # BGP keeps every neighbor with its settings (peer groups may be written out on their members), networks and
     # redistribution; AOS-S leaves it to a person
     if first.bgp is not None and target == "aoss":

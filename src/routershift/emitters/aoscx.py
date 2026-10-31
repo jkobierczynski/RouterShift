@@ -188,8 +188,18 @@ class Writer:
             vrfs = {s.vrf for s in a.servers if s.protocol == protocol}
             vrf = f" vrf {self.vrf(vrfs.pop())}" if len(vrfs) == 1 and "" not in vrfs else ""
             self.out.append(f"ip source-interface {protocol} interface {self.port(source).replace(' ', '')}{vrf}")
+        for protocol, source in self.device.system.transfer_source.items():
+            if protocol == "tftp":
+                rep.item("system", "tftp source")
+                self.out.append(f"ip source-interface tftp interface {self.port(source).replace(' ', '')}")
+            else:
+                rep.skip("system", f"{protocol} source", "transfer-source",
+                         "AOS-CX has no FTP client source setting; it copies files with SFTP, SCP, TFTP or HTTP")
         accounting_written = False
+        self._port_access()
         for m in a.methods:
+            if m.service == "dot1x":
+                continue  # written with the port access settings
             label = aaa_text.method_label(m)
             groups = [x[len("group:"):] for x in m.methods if x.startswith("group:")]
             rest = [x for x in m.methods if x in ("local", "none")]
@@ -218,6 +228,51 @@ class Writer:
             else:
                 words += rest
             self.out.append(" ".join(words))
+
+    def _port_access(self) -> None:
+        """802.1X and MAC authentication: switched on globally, with the RADIUS group they use."""
+        a = self.device.aaa
+        rep = self.report
+        method = next((m for m in a.methods if m.service == "dot1x"), None)
+        group_lines: List[str] = []
+        if method is not None:
+            label = aaa_text.method_label(method)
+            groups = [x[len("group:"):] for x in method.methods if x.startswith("group:")]
+            rep.item("management", label)
+            if groups:
+                group_lines = [f"{_IND}radius server-group {groups[0]}"]
+            if len(groups) != 1 or len(method.methods) != 1:
+                rep.add("management", label, Severity.APPROX, "aaa-method",
+                        f"AOS-CX authenticates ports against one RADIUS group; written as "
+                        f"{groups[0] if groups else 'the default group'}")
+        if a.dot1x:
+            rep.item("management", "802.1X")
+            self.out += ["aaa authentication port-access dot1x authenticator"] + group_lines + [f"{_IND}enable"]
+        if any(i.mab for i in self.device.interfaces.values()):
+            self.out += ["aaa authentication port-access mac-auth"] + group_lines + [f"{_IND}enable"]
+
+    def _port_access_interface(self, iface: Interface, add: Callable[[Severity, str, str], None]) -> List[str]:
+        if not (iface.dot1x or iface.mab):
+            return []
+        mode = iface.dot1x_host_mode or "single-host"
+        prefix = "aaa authentication port-access"
+        lines = []
+        if mode == "multi-auth":
+            lines.append(f"{prefix} client-limit 32")
+            add(Severity.APPROX, "dot1x-clients", "multi-auth written as client mode with up to 32 clients; "
+                                                 "change the client limit if the port needs more")
+        else:
+            lines.append(f"{prefix} client-limit 1" if mode == "single-host" else f"{prefix} client-limit 32")
+        if mode in ("multi-host", "multi-domain"):
+            lines.append(f"{prefix} auth-mode {'device-mode' if mode == 'multi-host' else 'multi-domain'}")
+        if iface.dot1x:
+            lines.append(f"{prefix} dot1x authenticator")
+            lines += [f"{_IND}reauth"] if iface.dot1x_reauth else []
+            lines += [f"{_IND}reauth-period {iface.dot1x_reauth_period}"] if iface.dot1x_reauth_period else []
+            lines.append(f"{_IND}enable")
+        if iface.mab:
+            lines += [f"{prefix} mac-auth", f"{_IND}enable"]
+        return lines
 
     _SNMP_AUTH = ["md5", "sha"]
     _SNMP_PRIV = ["des", "aes128"]
@@ -372,6 +427,7 @@ class Writer:
                 add(Severity.REVIEW, "acl-missing", f"ACL {acl_name} is applied but not defined; left out")
         lines += self._fhrp(iface, name)
         lines += self._ospf_interface(iface)
+        lines += self._port_access_interface(iface, add)
         if iface.stp_portfast:
             lines.append("spanning-tree port-type admin-edge")
         if iface.stp_bpduguard:

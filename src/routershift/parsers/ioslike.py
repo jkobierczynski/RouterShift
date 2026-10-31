@@ -126,6 +126,7 @@ class _Reader:
             "tacacs": self.aaa_server,
             "radius-server": self.aaa_host,
             "tacacs-server": self.aaa_host,
+            "dot1x": self.dot1x,
         }
         for node in roots:
             if node.text.startswith(_NOISE) or node.text == "end":
@@ -333,6 +334,10 @@ class _Reader:
             # IOS: ip radius source-interface X; EOS: ip radius [vrf V] source-interface X
             self.device.aaa.source["radius" if w[1] == "radius" else "tacacs"] = names.canonical(w[-1])[0]
             return len(w) == 4 or w[2] == "vrf"
+        if w[1] in ("tftp", "ftp") and w[-2] == "source-interface" and len(w) in (4, 5):
+            # IOS: ip tftp source-interface X; EOS: ip tftp client source-interface X
+            self.device.system.transfer_source[w[1]] = names.canonical(w[-1])[0]
+            return len(w) == 4 or w[2] == "client"
         if w[1:3] == ["nat", "pool"] and len(w) == 8 and w[6] in ("netmask", "prefix-length"):
             length = w[7] if w[6] == "prefix-length" else str(ipaddress.ip_network(f"0.0.0.0/{w[7]}").prefixlen)
             first, last = str(ipaddress.IPv4Address(w[4])), str(ipaddress.IPv4Address(w[5]))
@@ -509,7 +514,7 @@ class _Reader:
                 level = args[0]
                 method.level = 15 if level == "all" else int(level)
                 args = args[1:]
-            if method.service not in ("login", "enable", "exec", "commands") or not args:
+            if method.service not in ("login", "enable", "exec", "commands", "dot1x") or not args:
                 return False
             method.name, args = args[0], args[1:]
             if method.kind == "accounting":
@@ -529,6 +534,38 @@ class _Reader:
             a.methods.append(method)
             return True
         return False
+
+    def dot1x(self, node: Node) -> bool:
+        if node.words[1:] == ["system-auth-control"]:
+            self.device.aaa.dot1x = True
+            return True
+        return False
+
+    def dot1x_line(self, iface: Interface, w: List[str]) -> bool:
+        """IOS: authentication|access-session ..., dot1x pae authenticator, mab; EOS: dot1x ..."""
+        n = len(w)
+        if w in (["dot1x", "pae", "authenticator"],):
+            iface.dot1x = True
+        elif w in (["authentication", "port-control", "auto"], ["access-session", "port-control", "auto"],
+                   ["dot1x", "port-control", "auto"]):
+            pass  # the port authenticates: what with is said by the dot1x and mab lines
+        elif w == ["mab"] or w == ["dot1x", "mac", "based", "authentication"]:
+            iface.mab = True
+        elif w[0] in ("authentication", "access-session") and w[1:2] == ["host-mode"] and n == 3 and \
+                w[2] in ("single-host", "multi-host", "multi-auth", "multi-domain"):
+            iface.dot1x_host_mode = w[2]
+        elif w[:2] == ["dot1x", "host-mode"] and n in (3, 4) and w[2] in ("single-host", "multi-host"):
+            # EOS: multi-host authenticated = every host logs in
+            iface.dot1x_host_mode = "multi-auth" if w[3:] == ["authenticated"] else w[2]
+        elif w in (["authentication", "periodic"], ["dot1x", "reauthentication"]):
+            iface.dot1x_reauth = True
+        elif w[:3] == ["authentication", "timer", "reauthenticate"] and n == 4:
+            iface.dot1x_reauth_period = int(w[3])
+        elif w[:3] == ["dot1x", "timeout", "reauth-period"] and n == 4:
+            iface.dot1x_reauth_period = int(w[3])
+        else:
+            return False
+        return True
 
     def aaa_server(self, node: Node) -> bool:
         """IOS: radius server NAME / tacacs server NAME, with address, ports, key and timeout inside."""
@@ -1476,6 +1513,8 @@ class _Reader:
             iface.stp_portfast = True
         elif w[:2] == ["spanning-tree", "bpduguard"] and n == 3:
             iface.stp_bpduguard = w[2] == "enable"
+        elif w[0] in ("authentication", "access-session", "dot1x", "mab") and n >= 1:
+            return self.dot1x_line(iface, w)
         else:
             return False
         return True
@@ -1516,6 +1555,9 @@ class _Reader:
     def _finish(self) -> None:
         self._finish_vpn()
         self._finish_aaa()
+        for iface in self.device.interfaces.values():
+            if (iface.dot1x or iface.mab) and not iface.dot1x_host_mode:
+                iface.dot1x_host_mode = "single-host"  # the IOS and EOS default
         for pool in self.device.dhcp_pools:
             if pool.network:
                 pool.ranges = dhcp_text.subtract(pool.network, pool.ranges, self._dhcp_excluded.get(pool.vrf, []))
