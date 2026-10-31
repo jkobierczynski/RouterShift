@@ -29,6 +29,7 @@ from .. import dhcp as dhcp_text
 from .. import ospf as ospf_text
 from .. import mgmt as mgmt_text
 from .. import vrfs as vrfs_text
+from .. import bfd as bfd_text
 from .. import routemap as routemap_text
 from .. import qos as qos_text
 from .. import vpn as vpn_text
@@ -165,6 +166,7 @@ class _Reader:
             "ip": self.ip,
             "ipv6": self.ipv6,
             "route-policy": self.route_policy,
+            "policy-based-route": self.policy_based_route,
             "vlan": self.vlan,
             "stp": self.stp,
             "interface": self.interface,
@@ -740,6 +742,23 @@ class _Reader:
                 self.unparsed(child, node.text)
         return True
 
+    def policy_based_route(self, node: Node) -> bool:
+        """policy-based-route NAME permit|deny node N with if-match acl and apply next-hop, read as a route map."""
+        w = node.words
+        if len(w) != 5 or w[2] not in ("permit", "deny") or w[3] != "node" or not w[4].isdigit():
+            return False
+        rm = routemap_text.route_map(self.device, w[1])
+        e = routemap_text.entry(rm, int(w[4]), w[2])
+        for child in node.children:
+            c = child.words
+            if c[:2] == ["if-match", "acl"] and len(c) in (3, 4) and (len(c) == 3 or c[2] == "name"):
+                e.match_acls.append(c[-1])
+            elif c[:2] == ["apply", "next-hop"] and len(c) == 3:
+                e.sets["next-hop"] = str(ipaddress.ip_address(c[2]))
+            else:
+                self.unparsed(child, node.text)
+        return True
+
     def ip(self, node: Node) -> bool:
         w = node.words
         if w[1:2] == ["prefix-list"]:
@@ -1311,6 +1330,8 @@ class _Reader:
                 peer.next_hop_self = True
             elif args == ["advertise-community"]:
                 peer.send_community = True
+            elif args == ["bfd"]:
+                peer.bfd = True
             elif routemap_text.neighbor_policy(peer, args):
                 pass
             else:
@@ -1545,6 +1566,12 @@ class _Reader:
             iface.ospf_cost = int(w[2])
         elif w[:2] == ["ospf", "network-type"] and n == 3 and w[2] in ("p2p", "broadcast"):
             iface.ospf_network = "point-to-point" if w[2] == "p2p" else "broadcast"
+        elif w == ["ospf", "bfd", "enable"]:
+            iface.ospf_bfd = True
+        elif bfd_text.separate_line(iface, w):
+            pass
+        elif w[:2] == ["ip", "policy-based-route"] and n == 3:
+            iface.pbr = w[2]
         elif w[0] == "nat" and n >= 2:
             return self.nat_interface(iface, w)
         elif w[:3] == ["ipsec", "apply", "policy"] and n == 4:

@@ -22,6 +22,7 @@ import re
 from typing import Callable, Dict, List, Optional, Tuple
 
 from .. import acl as acl_text
+from .. import bfd as bfd_text
 from .. import routemap as routemap_text
 from .. import bgp as bgp_text
 from .. import dhcp as dhcp_text
@@ -98,6 +99,7 @@ class _Reader:
             "ip": self.ip,
             "ipv6": self.ipv6,
             "route-map": self.route_map,
+            "bfd": lambda node: node.words == ["bfd"],  # BFD switched on
             "ntp": self.ntp,
             "logging": self.logging,
             "vrf": self.vrf,
@@ -725,6 +727,8 @@ class _Reader:
             peer.next_hop_self = True
         elif args[0] == "send-community" and args[1:] in ([], ["standard"], ["both"]):
             peer.send_community = True
+        elif args == ["fall-over", "bfd"]:
+            peer.bfd = True
         elif routemap_text.neighbor_policy(peer, args):
             pass
         else:
@@ -738,6 +742,8 @@ class _Reader:
             p.router_id = str(ipaddress.IPv4Address(w[1]))
         elif w == ["passive-interface", "default"]:
             p.passive_default = True
+        elif w == ["bfd", "all-interfaces"]:
+            p.bfd_all = True
         elif w[0] == "area" and n == 2:
             ospf_text.area(w[1])  # declared; its interfaces say they are in it
         elif w[0] == "area" and n in (3, 4) and w[2] in ("stub", "nssa") and w[3:] in ([], ["no-summary"]):
@@ -969,6 +975,10 @@ class _Reader:
             iface.ospf_cost = int(w[3])
         elif w[:3] == ["ip", "ospf", "network"] and n == 4 and w[3] in ("point-to-point", "broadcast"):
             iface.ospf_network = w[3]
+        elif w == ["ip", "ospf", "bfd"]:
+            iface.ospf_bfd = True
+        elif bfd_text.separate_line(iface, w):
+            pass
         elif w[:2] == ["active-gateway", "ip"] and n >= 3:
             return self._active_gateway(iface, w[2:])
         elif w[:2] == ["spanning-tree", "port-type"] and n == 3 and w[2] in ("admin-edge", "admin-network"):

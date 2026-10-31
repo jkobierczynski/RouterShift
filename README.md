@@ -35,8 +35,8 @@ control.
 VRF route leaking (route distinguisher, import and export route targets) and multi-chassis LAG pairs
 (EOS MLAG and AOS-CX VSX, flagged on IOS, AOS-S and Comware) convert too.
 Prefix lists and route maps (Comware route policies) convert with the BGP neighbors and
-redistribution that apply them.
-Everything else (PBR, LDAP, ...) is listed in the report under "Not understood", line by
+redistribution that apply them, and so do policy-based routing and BFD (timers, BGP neighbors, OSPF).
+Everything else (IS-IS, LDAP, ...) is listed in the report under "Not understood", line by
 line, with secrets masked.
 
 ## Usage

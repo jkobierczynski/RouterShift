@@ -24,6 +24,7 @@ from .. import stp as stp_text
 from .. import aaa as aaa_text
 from .. import vpn as vpn_text
 from .. import vrfs as vrfs_text
+from .. import bfd as bfd_text
 from .. import routemap as routemap_text
 from .. import wlan as wlan_text
 from ..model import (AaaMethod, AaaServer, LocalUser, AclAction, Bgp, BgpNeighbor, Device, DhcpPool, IkePolicy, IpsecPeer, NatRule, SnmpGroup, FhrpGroup, Interface, InterfaceKind, LacpMode, Ospf,
@@ -233,6 +234,9 @@ class Writer:
         lines += self._nat_interface(iface)
         lines += self._tunnel(iface, add)
         lines += self._ospf_interface(iface)
+        lines += bfd_text.joined_line(iface, "ios" if self.ios else "eos", self.report, label)
+        if iface.pbr:
+            lines.append(f"ip policy route-map {iface.pbr}" if self.ios else f"service-policy type pbr input {iface.pbr}")
         if not self.ios and any(self._serves(pool, iface) for pool in self.device.dhcp_pools):
             lines.append("dhcp server ipv4")
         if iface.mtu is not None:
@@ -903,6 +907,8 @@ class Writer:
             lines.append(f"ip ospf cost {iface.ospf_cost}")
         if iface.ospf_network:
             lines.append(f"ip ospf network {iface.ospf_network}")
+        if iface.ospf_bfd and not any(p.bfd_all for p in self.device.ospf if iface.name in p.interface_areas):
+            lines.append("ip ospf bfd" if self.ios else "ip ospf neighbor bfd")
         return lines
 
     def ospf(self, p: Ospf) -> None:
@@ -938,6 +944,8 @@ class Writer:
                          (f" route-map {rm}" if rm else ""))
         if p.default_originate:
             lines.append("default-information originate" + (" always" if p.default_originate == "always" else ""))
+        if p.bfd_all:
+            lines.append("bfd all-interfaces" if self.ios else "bfd default")
         self.out.append(header)
         self.out += [self.ind + line for line in lines]
         self.out.append("!")
@@ -1016,6 +1024,8 @@ class Writer:
             lines.append(f"{pre} ebgp-multihop {peer.ebgp_multihop}")
         if peer.shutdown:
             lines.append(f"{pre} shutdown")
+        if peer.bfd:
+            lines.append(f"{pre} fall-over bfd" if self.ios else f"{pre} bfd")
         return lines
 
     @staticmethod
@@ -1040,8 +1050,31 @@ class Writer:
             self.out += routemap_text.ios_prefix_lines(pl, platform)
         if self.device.prefix_lists and self.ios:
             self.out.append("!")
+        skip = [] if self.ios else bfd_text.pbr_only(self.device)
         for rm in self.device.route_maps.values():
-            self.out += routemap_text.ios_route_map_lines(rm, platform, self.report, self.ind)
+            if rm.name not in skip:
+                self.out += routemap_text.ios_route_map_lines(rm, platform, self.report, self.ind)
+        if not self.ios:
+            self._eos_pbr()
+
+    def _eos_pbr(self) -> None:
+        """EOS: a route map applied for policy-based routing becomes a class (match its ACLs) per entry and a pbr
+        policy that sets each class's next hop."""
+        ind = self.ind
+        for name in bfd_text.pbr_maps(self.device):
+            entries = bfd_text.pbr_entries(self.device, name, self.report, "EOS")
+            if not entries:
+                continue
+            policy = [f"policy-map type pbr {name}"]
+            for seq, acls, next_hop in entries:
+                cls = f"{name}-{seq}"
+                self.out.append(f"class-map type pbr match-any {cls}")
+                self.out += [f"{ind}match ip access-group {acl_text.safe_name(a)}" for a in acls]
+                self.out.append("!")
+                policy.append(f"{ind}class {cls}")
+                if next_hop:
+                    policy.append(f"{ind * 2}set nexthop {next_hop}")
+            self.out += policy + ["!"]
 
     def _bgp_redistribute(self, source: str) -> str:
         if source == "ospf" and self.ios:
