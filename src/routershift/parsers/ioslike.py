@@ -23,6 +23,7 @@ from .. import l2sec as l2sec_text
 from .. import mgmt as mgmt_text
 from .. import vrfs as vrfs_text
 from .. import multicast as multicast_text
+from .. import monitor as monitor_text
 from .. import igp as igp_text
 from .. import routemap as routemap_text
 from .. import qos as qos_text
@@ -32,7 +33,7 @@ from .. import vpn as vpn_text
 from .. import aaa as aaa_text
 from ..confparse import Node
 from ..errors import ParseError
-from ..model import (AaaGroup, AaaMethod, AaaServer, Acl, Device, LocalUser, DhcpPool, FhrpGroup, IkePolicy, IpsecPeer, IpsecTransform, NtpKey, PreSharedKey,
+from ..model import (Netflow, Sflow, AaaGroup, AaaMethod, AaaServer, Acl, Device, LocalUser, DhcpPool, FhrpGroup, IkePolicy, IpsecPeer, IpsecTransform, NtpKey, PreSharedKey,
                      SnmpCommunity, SnmpGroup, SnmpHost, SnmpUser, NatPool, NatRule, Interface, InterfaceKind, LacpMode, Origin, Ospf, OspfNetwork, Wlan, Mlag, Rip, Isis,
                      QosAction, QosClass, QosPolicy, StaticRoute, StpMode, SwitchportMode, Unparsed, Vlan)
 
@@ -89,6 +90,10 @@ class _Reader:
         self._eos_keys: Dict[str, str] = {}  # EOS profile -> shared key
         self._wlan_profiles: Dict[str, Optional[int]] = {}  # IOS XE wireless policy profile -> VLAN
         self._wlan_tags: Dict[str, str] = {}  # WLAN -> policy profile, from the policy tags
+        self._flow_exporters: Dict[str, Netflow] = {}  # IOS flow exporter -> its collector, version and source
+        self._flow_monitors: Dict[str, Tuple[List[str], str]] = {}  # IOS flow monitor -> exporters, record
+        self._sflow_run = False  # EOS: sflow run
+        self._sflow_off: List[str] = []  # EOS: ports with no sflow enable
 
     def unparsed(self, node: Node, section: str = "") -> None:
         self.device.unparsed.append(Unparsed(node.line, node.text, section))
@@ -150,6 +155,9 @@ class _Reader:
             "management": self.management,
             "mlag": self.mlag,
             "route-map": self.route_map,
+            "monitor": self.monitor_session,
+            "sflow": self.sflow,
+            "flow": self.flow,
         }
         for node in roots:
             if node.text.startswith(_NOISE) or node.text == "end":
@@ -356,6 +364,8 @@ class _Reader:
         m = self.device.management
         if w[1:3] == ["igmp", "snooping"]:
             return self.igmp_snooping(w[3:], True)
+        if w[1:2] == ["flow-export"]:
+            return self.flow_export(w[2:])
         if w[1:2] == ["multicast-routing"] and w[2:] in ([], ["distributed"]):
             self.device.multicast_routing = True
             return True
@@ -1111,6 +1121,155 @@ class _Reader:
         for iface in self.device.interfaces.values():
             if iface.kind == InterfaceKind.TUNNEL and iface.tunnel_destination and not iface.tunnel_mode:
                 iface.tunnel_mode = "gre"
+
+    # port mirroring, sFlow, NetFlow -----------------------------------------------------------------------------------
+
+    def monitor_session(self, node: Node) -> bool:
+        """monitor session N source interface PORTS [both|rx|tx] / destination interface PORT (IOS); EOS names the
+        session and leaves out the word interface."""
+        w = node.words
+        eos = self.device.platform == "eos"
+        if w[1:2] != ["session"] or len(w) < 5 or node.children:
+            return False
+        if (w[4] == "interface") == eos:  # IOS says source interface, EOS source
+            return False
+        rest = w[4:] if eos else w[5:]
+        if not rest:
+            return False
+        if w[3] == "source":
+            way = monitor_text.direction(rest[-1]) if len(rest) > 1 else None
+            ports = monitor_text.ios_ports(rest[:-1] if way else rest)
+            s = monitor_text.session(self.device, w[2], node.line, node.text)
+            for port in ports:
+                s.sources[port] = way or "both"
+            return True
+        if w[3] == "destination" and len(rest) in (1, 2):
+            ports = monitor_text.ios_ports(rest)
+            if len(ports) != 1:
+                return False
+            monitor_text.session(self.device, w[2], node.line, node.text).destination = ports[0]
+            return True
+        return False
+
+    def _sflow(self, node: Node) -> Sflow:
+        if self.device.sflow is None:
+            self.device.sflow = Sflow(origin=Origin(node.line, node.text))
+        return self.device.sflow
+
+    def sflow(self, node: Node) -> bool:
+        """EOS sflow: sample, polling-interval, [vrf V] destination A [PORT], source A, source-interface X, run."""
+        w = node.words[1:]
+        if self.device.platform != "eos" or node.children or not w:
+            return False
+        vrf = ""
+        if w[0] == "vrf" and len(w) >= 3:
+            vrf, w = w[1], w[2:]
+        n = len(w)
+        if w[0] == "destination" and n in (2, 3):
+            port = int(w[2]) if n == 3 else None
+            self._sflow(node).collectors.append(monitor_text.collector(str(ipaddress.ip_address(w[1])), port, vrf))
+        elif vrf:
+            return False
+        elif w[0] == "sample" and n == 2:
+            self._sflow(node).sample_rate = int(w[1])
+        elif w[0] == "polling-interval" and n == 2:
+            self._sflow(node).polling_interval = int(w[1])
+        elif w[0] == "source" and n == 2:
+            self._sflow(node).agent = str(ipaddress.ip_address(w[1]))
+        elif w[0] == "source-interface" and n >= 2:
+            self._sflow(node).source_interface = names.canonical(" ".join(w[1:]))[0]
+        elif w == ["run"]:
+            self._sflow(node)
+            self._sflow_run = True
+        else:
+            return False
+        return True
+
+    def flow(self, node: Node) -> bool:
+        """IOS Flexible NetFlow: flow exporter and flow monitor (a flow record of its own is left for the report)."""
+        w = node.words
+        if self.device.platform != "ios" or len(w) != 3:
+            return False
+        if w[1] == "exporter":
+            exp = self._flow_exporters[w[2]] = Netflow(origin=Origin(node.line, node.text))
+            for child in node.children:
+                if not self._flow_exporter_line(exp, child.words):
+                    self.unparsed(child, node.text)
+            return True
+        if w[1] == "monitor":
+            exporters: List[str] = []
+            record = ""
+            for child in node.children:
+                c = child.words
+                if c[0] == "exporter" and len(c) == 2:
+                    exporters.append(c[1])
+                elif c[0] == "record" and len(c) >= 2:
+                    record = " ".join(c[1:])
+                elif c[0] == "description":
+                    pass
+                else:
+                    self.unparsed(child, node.text)
+            self._flow_monitors[w[2]] = (exporters, record)
+            if self.device.netflow is None:
+                self.device.netflow = Netflow(origin=Origin(node.line, node.text))
+            return True
+        return False
+
+    @staticmethod
+    def _flow_exporter_line(exp: Netflow, c: List[str]) -> bool:
+        versions = {"netflow-v5": 5, "netflow-v9": 9, "ipfix": 10}
+        if c[0] == "destination" and len(c) in (2, 4) and c[2:3] in ([], ["vrf"]):
+            exp.collectors.append(monitor_text.collector(str(ipaddress.ip_address(c[1])), None,
+                                                         c[3] if len(c) == 4 else ""))
+        elif c[:2] == ["transport", "udp"] and len(c) == 3 and exp.collectors:
+            exp.collectors[-1].port = int(c[2])
+        elif c[0] == "source" and len(c) >= 2:
+            exp.source_interface = names.canonical(" ".join(c[1:]))[0]
+        elif c[0] == "export-protocol" and len(c) == 2 and c[1] in versions:
+            exp.version = versions[c[1]]
+        elif c[0] == "description":
+            pass
+        else:
+            return False
+        return True
+
+    def flow_export(self, w: List[str]) -> bool:
+        """IOS traditional NetFlow: ip flow-export destination A PORT, version N, source X."""
+        nf = self.device.netflow
+        if nf is None:
+            nf = self.device.netflow = Netflow()
+        if w[:1] == ["destination"] and len(w) in (3, 5) and w[3:4] in ([], ["vrf"]):
+            nf.collectors.append(monitor_text.collector(str(ipaddress.ip_address(w[1])), int(w[2]),
+                                                        w[4] if len(w) == 5 else ""))
+        elif w[:1] == ["version"] and len(w) == 2 and w[1] in ("5", "9"):
+            nf.version = int(w[1])
+        elif w[:1] == ["source"] and len(w) >= 2:
+            nf.source_interface = names.canonical(" ".join(w[1:]))[0]
+        else:
+            return False
+        return True
+
+    def _finish_monitor(self) -> None:
+        d = self.device
+        if self._sflow_run:
+            for iface in monitor_text.physical(d):
+                iface.sflow = iface.name not in self._sflow_off
+        monitor_text.finish(d)
+        if not self._flow_monitors and not self._flow_exporters:
+            return
+        nf = d.netflow
+        if nf is None:
+            nf = d.netflow = Netflow()
+        used = [e for exps, _ in self._flow_monitors.values() for e in exps] or list(self._flow_exporters)
+        for name in dict.fromkeys(used):
+            exp = self._flow_exporters.get(name)
+            if exp is None:
+                continue
+            nf.collectors += exp.collectors
+            nf.version = nf.version or exp.version
+            nf.source_interface = nf.source_interface or exp.source_interface
+        records = [r for _, r in self._flow_monitors.values() if r]
+        nf.record = records[0] if records else ""
 
     # DHCP server ------------------------------------------------------------------------------------------------------
 
@@ -2051,6 +2210,15 @@ class _Reader:
             iface.pim = "sparse"
         elif w[:3] == ["ip", "igmp", "version"] and n == 4 and w[3] in ("1", "2", "3"):
             iface.igmp_version = int(w[3])
+        elif w[:3] == ["ip", "flow", "monitor"] and n == 5 and w[4] in ("input", "output"):
+            iface.flow = w[4] if iface.flow in ("", w[4]) else "both"
+        elif w[:2] == ["ip", "flow"] and n == 3 and w[2] in ("ingress", "egress"):
+            way = "input" if w[2] == "ingress" else "output"
+            iface.flow = way if iface.flow in ("", way) else "both"
+        elif w == ["no", "sflow", "enable"] and self.device.platform == "eos":
+            self._sflow_off.append(iface.name)
+        elif w == ["sflow", "enable"] and self.device.platform == "eos":
+            pass
         elif w == ["isis", "passive"]:
             iface.isis = iface.isis_passive = True
         elif w[:2] == ["isis", "metric"] and n in (3, 4) and w[3:] in ([], ["level-1"], ["level-2"]):
@@ -2135,6 +2303,7 @@ class _Reader:
     def _finish(self) -> None:
         self._finish_vpn()
         multicast_text.finish(self.device)
+        self._finish_monitor()
         for wl in self.device.wlans:
             wl.vlan = self._wlan_profiles.get(self._wlan_tags.get(wl.name, ""))
         self._finish_aaa()

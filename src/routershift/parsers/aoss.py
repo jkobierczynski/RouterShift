@@ -21,6 +21,7 @@ import ipaddress
 import re
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
+from .. import monitor as monitor_text
 from .. import acl as acl_text
 from .. import confparse
 from .. import dhcp as dhcp_text
@@ -29,7 +30,7 @@ from .. import mgmt as mgmt_text
 from .. import qos as qos_text
 from ..confparse import Node
 from ..errors import ParseError
-from ..model import (AaaGroup, AaaMethod, AaaServer, Acl, Device, LocalUser, DhcpPool, FhrpGroup, NtpKey, SnmpCommunity, SnmpGroup, SnmpHost, SnmpUser, Interface, InterfaceKind, LacpMode, Origin, QosAction, QosClass, QosPolicy,
+from ..model import (Sflow, AaaGroup, AaaMethod, AaaServer, Acl, Device, LocalUser, DhcpPool, FhrpGroup, NtpKey, SnmpCommunity, SnmpGroup, SnmpHost, SnmpUser, Interface, InterfaceKind, LacpMode, Origin, QosAction, QosClass, QosPolicy,
                      StaticRoute, StpMode, SwitchportMode, Unparsed, Vlan)
 from ..timezones import utc
 from .ioslike import _cidr, _is_address, _vlan_ids
@@ -150,6 +151,8 @@ class _Reader:
             "dhcp-snooping": self.snooping,
             "arp-protect": self.snooping,
             "port-security": self.port_security,
+            "mirror": self.mirror,
+            "sflow": self.sflow,
         }
         for node in roots:
             if node.text.startswith(_NOISE):
@@ -681,6 +684,11 @@ class _Reader:
             setattr(iface, f"qos_policy_{w[2]}", unquote(w[1]))
         elif w[:2] == ["qos", "trust"] and len(w) == 3 and w[2] in ("dscp", "dot1p", "none"):
             iface.qos_trust = "cos" if w[2] == "dot1p" else w[2]
+        elif w[:2] == ["monitor", "all"] and len(w) == 5 and w[3] == "mirror" and \
+                monitor_text.direction(w[2]) is not None:
+            monitor_text.session(self.device, w[4]).sources[iface.name] = monitor_text.direction(w[2]) or "both"
+        elif w[0] == "sflow" and len(w) == 4 and w[2] in ("sampling", "polling"):
+            return self._sflow_rate(w[2], int(w[3]), [iface])
         elif w[0] == "broadcast-limit" and len(w) == 2:
             iface.storm_control["broadcast"] = float(w[1])
         elif w[0] == "name" and len(w) >= 2:
@@ -695,6 +703,49 @@ class _Reader:
         else:
             return False
         return True
+
+    def mirror(self, node: Node) -> bool:
+        """mirror N [name "X"] port P: the destination port of a session."""
+        w = node.words
+        if len(w) == 6 and w[2] == "name":
+            w = w[:2] + w[4:]
+        if len(w) != 4 or w[2] != "port" or not w[1].isdigit():
+            return False
+        s = monitor_text.session(self.device, w[1], node.line, node.text)
+        s.destination = self.port(w[3]).name
+        return True
+
+    def _sflow(self) -> Sflow:
+        if self.device.sflow is None:
+            self.device.sflow = Sflow()
+        return self.device.sflow
+
+    def _sflow_rate(self, what: str, value: int, ifaces: List[Interface]) -> bool:
+        """A sampling rate or polling interval of some ports; one value for the device, as the model keeps it."""
+        sf = self._sflow()
+        attr = "sample_rate" if what == "sampling" else "polling_interval"
+        if getattr(sf, attr) not in (None, value):
+            return False
+        setattr(sf, attr, value)
+        for iface in ifaces:
+            iface.sflow = True
+        return True
+
+    def sflow(self, node: Node) -> bool:
+        """sflow N destination A [PORT]; sflow N sampling PORTS RATE; sflow N polling PORTS SECONDS."""
+        w = node.words
+        n = len(w)
+        if n < 4 or not w[1].isdigit():
+            return False
+        if w[2] == "destination" and n in (4, 5):
+            sf = self._sflow()
+            if not sf.collectors:
+                sf.origin = Origin(node.line, node.text)
+            sf.collectors.append(monitor_text.collector(str(ipaddress.ip_address(w[3])), int(w[4]) if n == 5 else None))
+            return True
+        if w[2] in ("sampling", "polling") and n == 5:
+            return self._sflow_rate(w[2], int(w[4]), [self.port(p) for p in ports(w[3])])
+        return False
 
     def vlan(self, node: Node) -> bool:
         w = node.words

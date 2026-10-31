@@ -25,6 +25,7 @@ from .. import aaa as aaa_text
 from .. import vpn as vpn_text
 from .. import vrfs as vrfs_text
 from .. import multicast as multicast_text
+from .. import monitor as monitor_text
 from .. import igp as igp_text
 from .. import bfd as bfd_text
 from .. import routemap as routemap_text
@@ -86,10 +87,12 @@ class Writer:
         self.qos()
         self.l2sec()
         self.multicast()
+        self.flows()
         self.mlag()
         self.mpls()
         for iface in self.device.interfaces.values():
             self.interface(iface)
+        self.mirrors()
         self.policies()
         self.routing()
         self.acls()
@@ -239,6 +242,7 @@ class Writer:
         lines += self._ospf_interface(iface)
         lines += self._isis_interface(iface)
         lines += self._multicast_interface(iface, add)
+        lines += self._flow_interface(iface)
         lines += bfd_text.joined_line(iface, "ios" if self.ios else "eos", self.report, label)
         if iface.pbr:
             lines.append(f"ip policy route-map {iface.pbr}" if self.ios else f"service-policy type pbr input {iface.pbr}")
@@ -1005,6 +1009,90 @@ class Writer:
                 [f"{self.ind * 2}rp address {rp}" for rp in d.pim_rps] + ["!"]
         if lines:
             self.out += lines + (["!"] if lines[-1] != "!" else [])
+
+    def flows(self) -> None:
+        """sFlow (EOS; IOS has none) and Flexible NetFlow (IOS; not written for EOS)."""
+        d = self.device
+        rep = self.report
+        lines: List[str] = []
+        if d.sflow is not None and self.ios:
+            monitor_text.sflow_unsupported(d, rep, "IOS")
+        elif d.sflow is not None:
+            sf = d.sflow
+            rep.item(monitor_text.KIND, monitor_text.SFLOW)
+            if sf.sample_rate is not None:
+                lines.append(f"sflow sample {sf.sample_rate}")
+            if sf.polling_interval is not None:
+                lines.append(f"sflow polling-interval {sf.polling_interval}")
+            for c in sf.collectors:
+                vrf = f"vrf {self.vrf(c.vrf)} " if c.vrf else ""
+                port = f" {c.port}" if c.port is not None else ""
+                lines.append(f"sflow {vrf}destination {c.address}{port}")
+            if sf.agent:
+                lines.append(f"sflow source {sf.agent}")
+            elif sf.source_interface:
+                lines.append(f"sflow source-interface {self.port(sf.source_interface)}")
+            if monitor_text.sflow_ports(d):
+                lines.append("sflow run")
+        if d.netflow is not None and not self.ios:
+            monitor_text.netflow_unsupported(d, rep, "EOS")
+        elif d.netflow is not None:
+            nf = d.netflow
+            monitor_text.netflow_item(nf, rep)
+            exporters = []
+            for n, c in enumerate(nf.collectors, 1):
+                name = f"RS-EXPORT-{n}"
+                exporters.append(name)
+                lines += [f"flow exporter {name}", f"{self.ind}destination {c.address}" +
+                          (f" vrf {self.vrf(c.vrf)}" if c.vrf else "")]
+                if nf.source_interface:
+                    lines.append(f"{self.ind}source {self.port(nf.source_interface)}")
+                if c.port is not None:
+                    lines.append(f"{self.ind}transport udp {c.port}")
+                if nf.version is not None:
+                    protocol = {5: "netflow-v5", 9: "netflow-v9", 10: "ipfix"}.get(nf.version, "netflow-v9")
+                    lines.append(f"{self.ind}export-protocol {protocol}")
+                lines.append("!")
+            record = nf.record if nf.record.startswith("netflow ") else monitor_text.IOS_RECORD
+            if nf.record and record != nf.record:
+                rep.add(monitor_text.KIND, monitor_text.NETFLOW, Severity.APPROX, "netflow-record",
+                        f"flow record {nf.record} written as {record}")
+            lines += ["flow monitor RS-MONITOR"] + [f"{self.ind}exporter {e}" for e in exporters] + \
+                [f"{self.ind}record {record}", "!"]
+        if lines:
+            self.out += lines + (["!"] if lines[-1] != "!" else [])
+
+    def _flow_interface(self, iface: Interface) -> List[str]:
+        d = self.device
+        lines = []
+        if self.ios and d.netflow is not None and iface.flow:
+            lines += [f"ip flow monitor RS-MONITOR {way}" for way in ("input", "output") if iface.flow in (way, "both")]
+        if not self.ios and d.sflow is not None and monitor_text.sflow_ports(d) and not iface.sflow and \
+                iface in monitor_text.physical(d):
+            lines.append("no sflow enable")
+        return lines
+
+    def mirrors(self) -> None:
+        """monitor session: IOS numbers them, EOS names them."""
+        d = self.device
+        rep = self.report
+        numbers = monitor_text.numbers(d, rep, "IOS", 66) if self.ios else {}
+        lines: List[str] = []
+        for s in d.mirror_sessions:
+            if not self.ios:
+                rep.item(monitor_text.KIND, monitor_text.label(s))
+            elif s.name not in numbers:
+                continue
+            sources = monitor_text.sources(s, rep, "IOS" if self.ios else "EOS")
+            if sources is None:
+                continue
+            head = f"monitor session {numbers.get(s.name, s.name)}"
+            word = " interface" if self.ios else ""
+            for port, way in sources.items():
+                lines.append(f"{head} source{word} {self.port(port)}" + ("" if way == "both" else f" {way}"))
+            lines.append(f"{head} destination{word} {self.port(s.destination)}")
+        if lines:
+            self.out += lines + ["!"]
 
     def _multicast_interface(self, iface: Interface, add: _Add) -> List[str]:
         lines = []

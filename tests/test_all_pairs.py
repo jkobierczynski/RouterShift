@@ -18,6 +18,7 @@ from routershift import vrfs as vrfs_text
 from routershift import bfd as bfd_text
 from routershift import igp as igp_text
 from routershift import multicast as multicast_text
+from routershift import monitor as monitor_text
 from routershift import routemap as routemap_text
 from routershift import ospf as ospf_text
 from routershift.acl import safe_name
@@ -361,4 +362,23 @@ def test_converts_and_reads_back(source: str, target: str) -> None:
         pim = lambda dev: sorted(("sparse" if target == "eos" and i.pim else i.pim, i.igmp_version or 0)  # noqa: E731
                                  for i in dev.interfaces.values() if i.pim or i.igmp_version)
         assert pim(back) == pim(first)
+    # mirror sessions keep their sources (by direction) and destination; sFlow its collectors, rates and sampled ports
+    # (IOS has none); NetFlow its collectors and the ports that record flows (written for IOS and Comware only)
+    mirrors = lambda dev: sorted((sorted(s.sources.values()), bool(s.destination))  # noqa: E731
+                                 for s in dev.mirror_sessions)
+    assert mirrors(back) == mirrors(first)
+    if first.sflow is None or target == "ios":
+        assert back.sflow is None
+    else:
+        assert back.sflow is not None
+        sflow = lambda sf: ([c.address for c in sf.collectors], sf.sample_rate, sf.polling_interval)  # noqa: E731
+        assert sflow(back.sflow) == sflow(first.sflow)
+        assert len(monitor_text.sflow_ports(back)) == len(monitor_text.sflow_ports(first))
+    if first.netflow is None or target not in ("ios", "comware"):
+        assert back.netflow is None
+    else:
+        assert back.netflow is not None
+        flows = lambda dev: (sorted(i.flow for i in monitor_text.flow_ports(dev)),  # noqa: E731
+                             [(c.address, c.port) for c in dev.netflow.collectors], dev.netflow.version)
+        assert flows(back) == flows(first)
     assert report.counts()

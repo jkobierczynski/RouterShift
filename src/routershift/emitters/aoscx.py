@@ -11,6 +11,7 @@ from typing import Callable, Dict, List, Tuple
 
 from .. import acl as acl_text
 from .. import multicast as multicast_text
+from .. import monitor as monitor_text
 from .. import bfd as bfd_text
 from .. import igp as igp_text
 from .. import routemap as routemap_text
@@ -80,6 +81,7 @@ class Writer:
         for iface in sorted(self.device.interfaces.values(), key=lambda i: order.get(i.kind, 2)):
             self.interface(iface)
         self.vsx()
+        self.monitor()
         self.routes()
         self.dhcp()
         nat_text.skip_all(self.device, self.report, "AOS-CX")
@@ -584,6 +586,36 @@ class Writer:
             self.report.item("system", "multicast routing")
             self.out += ["router pim", f"{_IND}enable"] + [f"{_IND}rp-address {rp}" for rp in d.pim_rps]
 
+    def monitor(self) -> None:
+        """Mirror sessions and sFlow; AOS-CX NetFlow (IPFIX) is not written."""
+        d = self.device
+        rep = self.report
+        numbers = monitor_text.numbers(d, rep, "AOS-CX", 4)
+        for s in d.mirror_sessions:
+            sources = monitor_text.sources(s, rep, "AOS-CX") if s.name in numbers else None
+            if sources is None:
+                continue
+            self.out.append(f"mirror session {numbers[s.name]}")
+            self.out += [f"{_IND}source interface {self.port(p)} {way}" for p, way in sources.items()]
+            self.out += [f"{_IND}destination interface {self.port(s.destination)}", f"{_IND}enable"]
+        sf = d.sflow
+        if sf is not None:
+            rep.item(monitor_text.KIND, monitor_text.SFLOW)
+            if monitor_text.sflow_ports(d):
+                self.out.append("sflow")
+            for c in sf.collectors:
+                port = f" port {c.port}" if c.port is not None else ""
+                vrf = f" vrf {self.vrf(c.vrf)}" if c.vrf else ""
+                self.out.append(f"sflow collector {c.address}{port}{vrf}")
+            agent = monitor_text.agent(d, sf, rep, "AOS-CX")
+            if agent:
+                self.out.append(f"sflow agent-ip {agent}")
+            if sf.sample_rate is not None:
+                self.out.append(f"sflow sampling {sf.sample_rate}")
+            if sf.polling_interval is not None:
+                self.out.append(f"sflow polling {sf.polling_interval}")
+        monitor_text.netflow_unsupported(d, rep, "AOS-CX")
+
     # interfaces ------------------------------------------------------------------------------------------------------
 
     def interface(self, iface: Interface) -> None:
@@ -641,6 +673,8 @@ class Writer:
                 add(Severity.APPROX, "pim-mode", "PIM sparse-dense mode written as sparse mode")
         if iface.igmp_version is not None:
             lines.append(f"ip igmp version {iface.igmp_version}")
+        if iface.sflow and self.device.sflow is not None and not monitor_text.all_ports(self.device):
+            lines.append("sflow")
         lines += self._port_access_interface(iface, add)
         lines += self._qos_interface(iface, add)
         lines += [f"no lldp {name}" for name, on in (("transmit", iface.lldp_tx), ("receive", iface.lldp_rx)) if not on]

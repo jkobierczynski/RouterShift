@@ -30,13 +30,14 @@ from .. import ospf as ospf_text
 from .. import mgmt as mgmt_text
 from .. import vrfs as vrfs_text
 from .. import igp as igp_text
+from .. import monitor as monitor_text
 from .. import bfd as bfd_text
 from .. import routemap as routemap_text
 from .. import qos as qos_text
 from .. import vpn as vpn_text
 from ..confparse import Node
 from ..errors import ParseError
-from ..model import (AaaGroup, AaaMethod, AaaServer, Acl, AclAction, AclEntry, Device, DhcpPool, FhrpGroup, IkePolicy, IpsecPeer, IpsecTransform,
+from ..model import (Netflow, Sflow, AaaGroup, AaaMethod, AaaServer, Acl, AclAction, AclEntry, Device, DhcpPool, FhrpGroup, IkePolicy, IpsecPeer, IpsecTransform,
                      NtpKey, PreSharedKey, SnmpCommunity, SnmpGroup, SnmpHost, SnmpUser, Interface, InterfaceKind, LacpMode, LocalUser,
                      NatPool, NatRule, Origin, QosAction, QosClass, QosPolicy, Ospf, Rip, Isis, Wlan, OspfNetwork, StaticRoute, StpMode, SwitchportMode, Unparsed, Vlan)
 from .ioslike import _cidr, _is_address
@@ -204,6 +205,8 @@ class _Reader:
             "lldp": self.server,
             "undo": self.undo,
             "port-security": lambda node: node.words == ["port-security", "enable"],
+            "mirroring-group": self.mirroring_group,
+            "sflow": self.sflow,
         }
         for node in roots:
             if node.text.startswith(_NOISE):
@@ -824,6 +827,8 @@ class _Reader:
 
     def ip(self, node: Node) -> bool:
         w = node.words
+        if w[1:3] == ["netstream", "export"] and not node.children:
+            return self.netstream_export(node, w[3:])
         if w[1:2] == ["prefix-list"]:
             return routemap_text.comware_prefix_entry(self.device, w)
         if w[1:] in (["http", "enable"], ["https", "enable"]):
@@ -1532,6 +1537,8 @@ class _Reader:
     def interface_line(self, iface: Interface, w: List[str]) -> bool:
         n = len(w)
         name = iface.name
+        if w[0] in ("mirroring-group", "sflow") or w[:2] == ["ip", "netstream"]:
+            return self.monitor_line(iface, w)
         if w[0] in ("dot1x", "mac-authentication"):
             return self.dot1x_line(iface, w)
         if w[0] == "description":
@@ -1693,8 +1700,104 @@ class _Reader:
             return False
         return True
 
+    # port mirroring, sFlow, NetStream ---------------------------------------------------------------------------------
+
+    def mirroring_group(self, node: Node) -> bool:
+        """mirroring-group N local; mirroring-group N mirroring-port P.. both|inbound|outbound; ... monitor-port P."""
+        w = node.words
+        n = len(w)
+        if n < 3 or not w[1].isdigit() or node.children:
+            return False
+        if w[2:] == ["local"]:
+            monitor_text.session(self.device, w[1], node.line, node.text)
+            return True
+        if w[2] == "mirroring-port" and n >= 5 and monitor_text.direction(w[-1]) is not None and "to" not in w:
+            s = monitor_text.session(self.device, w[1], node.line, node.text)
+            for port in w[3:-1]:
+                s.sources[canonical(port)[0]] = monitor_text.direction(w[-1]) or "both"
+            return True
+        if w[2] == "monitor-port" and n == 4:
+            monitor_text.session(self.device, w[1], node.line, node.text).destination = canonical(w[3])[0]
+            return True
+        return False
+
+    def _sflow(self, node: Optional[Node] = None) -> Sflow:
+        if self.device.sflow is None:
+            self.device.sflow = Sflow(origin=Origin(node.line, node.text) if node else Origin())
+        return self.device.sflow
+
+    def sflow(self, node: Node) -> bool:
+        """sflow agent ip A; sflow collector N [vpn-instance V] ip A [port P] [description TEXT]."""
+        w = node.words
+        if w[1:3] == ["agent", "ip"] and len(w) == 4:
+            self._sflow(node).agent = str(ipaddress.ip_address(w[3]))
+            return True
+        if w[1:2] == ["collector"] and len(w) >= 5 and w[2].isdigit():
+            rest = w[3:]
+            if rest[:1] == ["description"]:
+                return False
+            vrf = ""
+            if rest[:1] == ["vpn-instance"]:
+                vrf, rest = rest[1], rest[2:]
+            if rest[:1] != ["ip"] or len(rest) < 2:
+                return False
+            address, rest = str(ipaddress.ip_address(rest[1])), rest[2:]
+            port = None
+            if rest[:1] == ["port"]:
+                port, rest = int(rest[1]), rest[2:]
+            if rest and rest[0] != "description":
+                return False
+            self._sflow(node).collectors.append(monitor_text.collector(address, port, vrf))
+            return True
+        return False
+
+    def netstream_export(self, node: Node, w: List[str]) -> bool:
+        """ip netstream export host A PORT [vpn-instance V]; version N; source interface X."""
+        nf = self.device.netflow
+        if nf is None:
+            nf = self.device.netflow = Netflow(origin=Origin(node.line, node.text))
+        if w[:1] == ["host"] and len(w) in (3, 5) and w[3:4] in ([], ["vpn-instance"]):
+            nf.collectors.append(monitor_text.collector(str(ipaddress.ip_address(w[1])), int(w[2]),
+                                                        w[4] if len(w) == 5 else ""))
+        elif w[:1] == ["version"] and len(w) == 2 and w[1] in ("5", "9", "10"):
+            nf.version = int(w[1])
+        elif w[:2] == ["source", "interface"] and len(w) == 3:
+            nf.source_interface = canonical(w[2])[0]
+        else:
+            return False
+        return True
+
+    def monitor_line(self, iface: Interface, w: List[str]) -> bool:
+        n = len(w)
+        if w[0] == "mirroring-group" and n == 4 and w[1].isdigit() and w[2] == "mirroring-port" and \
+                monitor_text.direction(w[3]) is not None:
+            monitor_text.session(self.device, w[1]).sources[iface.name] = monitor_text.direction(w[3]) or "both"
+        elif w[0] == "mirroring-group" and n == 3 and w[1].isdigit() and w[2] == "monitor-port":
+            monitor_text.session(self.device, w[1]).destination = iface.name
+        elif w[:2] == ["sflow", "sampling-rate"] and n == 3:
+            sf = self._sflow()
+            if sf.sample_rate not in (None, int(w[2])):
+                return False
+            sf.sample_rate = int(w[2])
+            iface.sflow = True
+        elif w[:3] == ["sflow", "counter", "interval"] and n == 4:
+            sf = self._sflow()
+            if sf.polling_interval not in (None, int(w[3])):
+                return False
+            sf.polling_interval = int(w[3])
+            iface.sflow = True
+        elif w[:3] in (["sflow", "flow", "collector"], ["sflow", "counter", "collector"]) and n == 4:
+            iface.sflow = True
+        elif w[:2] == ["ip", "netstream"] and n == 3 and w[2] in ("inbound", "outbound"):
+            way = "input" if w[2] == "inbound" else "output"
+            iface.flow = way if iface.flow in ("", way) else "both"
+        else:
+            return False
+        return True
+
     def _finish(self) -> None:
         ospf_text.attach(self.device, self._ospf_areas, {})
+        monitor_text.finish(self.device)
         self._finish_aaa()
         self._finish_qos()
         for peer, profile in self._peer_profiles:
