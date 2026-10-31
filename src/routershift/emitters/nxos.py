@@ -347,6 +347,10 @@ class Writer:
                              "tunnel interfaces are not written for NX-OS yet; configure it by hand")
             return
         self.report.item("interface", label)
+        if (iface.source_name or iface.name, self.port(iface.name)) in self.port.renumbered:
+            self.report.add("interface", label, Severity.APPROX, "port-renamed",
+                            f"named {self.port(iface.name)} without a port map; check it against the cabling of the new "
+                            "device")
         name = self.port(iface.name)
         lines: List[str] = []
         if iface.description:

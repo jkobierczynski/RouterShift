@@ -290,6 +290,10 @@ class Writer:
                                  "tunnel interfaces are not written for Junos yet; configure it by hand")
                 continue
             self.report.item("interface", self.label(iface))
+            if (iface.source_name or iface.name, self.port(iface.name)) in self.port.renumbered:
+                self.report.add("interface", self.label(iface), Severity.APPROX, "port-renamed",
+                                f"named {self.port(iface.name)} without a port map; check it against the cabling of the new "
+                                "device")
             ifd, unit = self.split(iface)
             top = ("interfaces", ifd)
             physical = iface.kind in (InterfaceKind.ETHERNET, InterfaceKind.LAG)

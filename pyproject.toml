@@ -12,12 +12,17 @@ license-files = ["LICENSE"]
 authors = [{ name = "Jurgen Kobierczynski" }]
 keywords = ["network", "migration", "switch", "router", "cisco", "ios", "nx-os", "arista", "eos", "juniper", "junos", "hpe", "aruba", "aos-cx", "procurve", "comware"]
 classifiers = [
-    "Development Status :: 2 - Pre-Alpha",
+    "Development Status :: 3 - Alpha",
     "Environment :: Console",
     "Intended Audience :: System Administrators",
     "Intended Audience :: Telecommunications Industry",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: System :: Networking",
 ]
 dependencies = []
@@ -27,6 +32,8 @@ dynamic = ["version"]
 Homepage = "https://github.com/jkobierczynski/RouterShift"
 Source = "https://github.com/jkobierczynski/RouterShift"
 Issues = "https://github.com/jkobierczynski/RouterShift/issues"
+Documentation = "https://github.com/jkobierczynski/RouterShift/blob/main/docs/MANUAL.md"
+Changelog = "https://github.com/jkobierczynski/RouterShift/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 dev = ["pytest>=7", "mypy>=1.8"]

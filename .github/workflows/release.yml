@@ -1,0 +1,42 @@
+name: release
+
+# Publishes to PyPI when a version tag (v0.1.0, ...) is pushed. PyPI trusts this workflow through trusted
+# publishing: no token is stored in the repository. One-time setup on pypi.org: add a (pending) trusted publisher
+# for the project "routershift" with owner jkobierczynski, repository RouterShift, workflow release.yml and
+# environment pypi.
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install -e ".[dev]" build
+      - run: pytest -q
+      - run: mypy
+      - name: The tag matches the package version
+        run: test "${GITHUB_REF_NAME#v}" = "$(python -c 'import routershift; print(routershift.__version__)')"
+      - run: python -m build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
