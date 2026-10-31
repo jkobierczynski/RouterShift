@@ -20,6 +20,7 @@ from .. import snmp as snmp_text
 from .. import stp as stp_text
 from .. import mpls as mpls_text
 from .. import qos as qos_text
+from .. import wlan as wlan_text
 from ..model import (AaaMethod, AaaServer, AclAction, AclEntry, BgpNeighbor, Device, FhrpGroup, IpsecPeer, SnmpGroup, Interface, InterfaceKind, LacpMode, NatRule,
                      Ospf, StaticRoute, StpMode, SwitchportMode)
 from ..names import PortMapper
@@ -63,6 +64,7 @@ class Writer:
         self.acls()
         self.qos()
         self.mpls()
+        self.wlans()
         for p in self.device.ospf:
             self.ospf(p)
         self.dhcp()
@@ -475,6 +477,27 @@ class Writer:
         self.block_end()
 
     # access lists ----------------------------------------------------------------------------------------------------
+
+    def wlans(self) -> None:
+        """A wlan service-template per network; binding it to the AP radios is left to a person."""
+        rep = self.report
+        for w in self.device.wlans:
+            rep.item("wlan", wlan_text.label(w))
+            self.out += [f"wlan service-template {w.name}", f"{_IND}ssid {w.ssid or w.name}"]
+            if w.vlan is not None:
+                self.out.append(f"{_IND}vlan {w.vlan}")
+            if w.security == "psk":
+                self.out += [f"{_IND}akm mode psk", f"{_IND}preshared-key pass-phrase simple {wlan_text.psk(w, rep)}"]
+            elif w.security == "dot1x":
+                self.out += [f"{_IND}akm mode dot1x", f"{_IND}client-security authentication-mode dot1x"]
+            if w.security != "open":
+                self.out += [f"{_IND}cipher-suite ccmp", f"{_IND}security-ie rsn"]
+            if w.enabled:
+                self.out.append(f"{_IND}service-template enable")
+            self.block_end()
+        if self.device.wlans:
+            rep.add("wlan", "AP radios", Severity.REVIEW, "wlan-radio",
+                    "bind the service templates to the AP radios (service-template under each radio)")
 
     def mpls(self) -> None:
         """mpls lsr-id (an address: taken from the router ID interface when given as one) and the mpls ldp view."""
