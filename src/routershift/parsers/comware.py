@@ -29,6 +29,7 @@ from .. import dhcp as dhcp_text
 from .. import ospf as ospf_text
 from .. import mgmt as mgmt_text
 from .. import vrfs as vrfs_text
+from .. import igp as igp_text
 from .. import bfd as bfd_text
 from .. import routemap as routemap_text
 from .. import qos as qos_text
@@ -37,7 +38,7 @@ from ..confparse import Node
 from ..errors import ParseError
 from ..model import (AaaGroup, AaaMethod, AaaServer, Acl, AclAction, AclEntry, Device, DhcpPool, FhrpGroup, IkePolicy, IpsecPeer, IpsecTransform,
                      NtpKey, PreSharedKey, SnmpCommunity, SnmpGroup, SnmpHost, SnmpUser, Interface, InterfaceKind, LacpMode, LocalUser,
-                     NatPool, NatRule, Origin, QosAction, QosClass, QosPolicy, Ospf, Wlan, OspfNetwork, StaticRoute, StpMode, SwitchportMode, Unparsed, Vlan)
+                     NatPool, NatRule, Origin, QosAction, QosClass, QosPolicy, Ospf, Rip, Isis, Wlan, OspfNetwork, StaticRoute, StpMode, SwitchportMode, Unparsed, Vlan)
 from .ioslike import _cidr, _is_address
 
 _PREFIXES: List[Tuple[str, InterfaceKind, str]] = [
@@ -167,6 +168,8 @@ class _Reader:
             "ipv6": self.ipv6,
             "route-policy": self.route_policy,
             "policy-based-route": self.policy_based_route,
+            "rip": self.rip,
+            "isis": self.isis,
             "vlan": self.vlan,
             "stp": self.stp,
             "interface": self.interface,
@@ -737,6 +740,35 @@ class _Reader:
             try:
                 ok = routemap_text.comware_route_policy_line(e, child.words)
             except ValueError:
+                ok = False
+            if not ok:
+                self.unparsed(child, node.text)
+        return True
+
+    def rip(self, node: Node) -> bool:
+        """rip [N] with version, network, silent-interface, import-route, ..."""
+        if len(node.words) > 2 or self.device.rip is not None:
+            return False
+        rip = self.device.rip = Rip(origin=Origin(node.line, node.text))
+        return self._igp_children(node, lambda c: igp_text.comware_rip_line(rip, c, lambda n: canonical(n)[0]))
+
+    def isis(self, node: Node) -> bool:
+        """isis [N] with network-entity, is-level, cost-style, import-route."""
+        if len(node.words) > 2 or self.device.isis is not None:
+            return False
+        isis = self.device.isis = Isis(node.words[1] if len(node.words) == 2 else "",
+                                       origin=Origin(node.line, node.text))
+        return self._igp_children(node, lambda c: igp_text.comware_isis_line(isis, c))
+
+    def _igp_children(self, node: Node, read: Callable[[List[str]], bool]) -> bool:
+        for child in node.children:
+            if child.words[:2] == ["address-family", "ipv4"] and len(child.words) <= 3:
+                for line in child.children:  # (nothing inside is converted yet)
+                    self.unparsed(line, f"{node.text} / {child.text}")
+                continue
+            try:
+                ok = read(child.words)
+            except (ValueError, IndexError):
                 ok = False
             if not ok:
                 self.unparsed(child, node.text)
@@ -1568,6 +1600,14 @@ class _Reader:
             iface.ospf_network = "point-to-point" if w[2] == "p2p" else "broadcast"
         elif w == ["ospf", "bfd", "enable"]:
             iface.ospf_bfd = True
+        elif w[:2] == ["isis", "enable"] and n in (2, 3):
+            iface.isis = True
+        elif w == ["isis", "silent"]:
+            iface.isis = iface.isis_passive = True
+        elif w[:2] == ["isis", "cost"] and n in (3, 4) and w[3:] in ([], ["level-1"], ["level-2"]):
+            iface.isis_metric = int(w[2])
+        elif w == ["isis", "circuit-type", "p2p"]:
+            iface.isis_network = "point-to-point"
         elif bfd_text.separate_line(iface, w):
             pass
         elif w[:2] == ["ip", "policy-based-route"] and n == 3:

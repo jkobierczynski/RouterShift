@@ -36,7 +36,8 @@ VRF route leaking (route distinguisher, import and export route targets) and mul
 (EOS MLAG and AOS-CX VSX, flagged on IOS, AOS-S and Comware) convert too.
 Prefix lists and route maps (Comware route policies) convert with the BGP neighbors and
 redistribution that apply them, and so do policy-based routing and BFD (timers, BGP neighbors, OSPF).
-Everything else (IS-IS, LDAP, ...) is listed in the report under "Not understood", line by
+RIP and IS-IS convert between IOS, EOS and Comware (flagged on the Aruba switches).
+Everything else (multicast, LDAP, ...) is listed in the report under "Not understood", line by
 line, with secrets masked.
 
 ## Usage

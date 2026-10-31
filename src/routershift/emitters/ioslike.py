@@ -24,6 +24,7 @@ from .. import stp as stp_text
 from .. import aaa as aaa_text
 from .. import vpn as vpn_text
 from .. import vrfs as vrfs_text
+from .. import igp as igp_text
 from .. import bfd as bfd_text
 from .. import routemap as routemap_text
 from .. import wlan as wlan_text
@@ -234,6 +235,7 @@ class Writer:
         lines += self._nat_interface(iface)
         lines += self._tunnel(iface, add)
         lines += self._ospf_interface(iface)
+        lines += self._isis_interface(iface)
         lines += bfd_text.joined_line(iface, "ios" if self.ios else "eos", self.report, label)
         if iface.pbr:
             lines.append(f"ip policy route-map {iface.pbr}" if self.ios else f"service-policy type pbr input {iface.pbr}")
@@ -891,8 +893,102 @@ class Writer:
         self.out.append("!")
         for p in self.device.ospf:
             self.ospf(p)
+        self.rip()
+        self.isis()
         if self.device.bgp is not None:
             self.bgp(self.device.bgp)
+
+    def rip(self) -> None:
+        rip = self.device.rip
+        if rip is None:
+            return
+        rep = self.report
+        label = igp_text.RIP_LABEL
+        rep.item("rip", label)
+        platform = "ios" if self.ios else "eos"
+        lines: List[str] = []
+        if rip.version is not None and self.ios:
+            lines.append(f"version {rip.version}")
+        elif rip.version == 1:
+            rep.add("rip", label, Severity.APPROX, "rip-version", "EOS runs RIP version 2 only")
+        lines += igp_text.rip_networks(rip, rep, platform)
+        if self.ios:
+            if rip.passive_default:
+                lines.append("passive-interface default")
+                lines += [f"no passive-interface {self.port(n)}" for n in rip.active_interfaces]
+            else:
+                lines += [f"passive-interface {self.port(n)}" for n in rip.passive_interfaces]
+        elif rip.passive_default or rip.passive_interfaces:
+            rep.add("rip", label, Severity.REVIEW, "rip-passive",
+                    "passive interfaces are not written for EOS RIP; RIP sends updates on every interface in its networks")
+        for source in rip.redistribute:
+            written = source
+            if source == "ospf":
+                written = f"ospf {self.device.ospf[0].process if self.device.ospf else 1}" if self.ios else "ospf"
+            rm = rip.redistribute_maps.get(source)
+            lines.append(f"redistribute {written}" + (f" route-map {rm}" if rm else ""))
+        if rip.default_metric is not None:
+            lines.append(f"default-metric {rip.default_metric}")
+        if rip.default_originate:
+            lines.append("default-information originate")
+        if rip.auto_summary is not None and self.ios:
+            lines.append("auto-summary" if rip.auto_summary else "no auto-summary")
+        elif rip.auto_summary:
+            rep.add("rip", label, Severity.APPROX, "rip-summary", "EOS does not summarise RIP routes at class borders")
+        if not self.ios:
+            lines.append("no shutdown")
+        self.out.append("router rip")
+        self.out += [self.ind + line for line in lines]
+        self.out.append("!")
+
+    def isis(self) -> None:
+        isis = self.device.isis
+        if isis is None:
+            return
+        rep = self.report
+        label = igp_text.isis_label(isis)
+        rep.item("isis", label)
+        platform = "ios" if self.ios else "eos"
+        lines = [f"net {net}" for net in isis.nets]
+        level = igp_text.isis_level(isis, platform)
+        if level:
+            lines.append(f"is-type {level}")
+        if self.ios and isis.wide_metrics:
+            lines.append("metric-style wide")
+        elif not self.ios and not isis.wide_metrics:
+            rep.add("isis", label, Severity.APPROX, "isis-metric-style",
+                    "EOS sends wide metrics; neighbours that only take narrow ones must change too")
+        if self.ios:
+            lines += [f"passive-interface {self.port(i.name)}" for i in self.device.interfaces.values()
+                      if i.isis_passive]
+        for source in isis.redistribute:
+            rm = isis.redistribute_maps.get(source)
+            lines.append(f"redistribute {source}" + (" ip" if self.ios and source == "static" else "") + (f" route-map {rm}" if rm else ""))
+        if not self.ios:
+            lines.append("address-family ipv4 unicast")
+        tag = igp_text.isis_tag(isis, platform, rep)
+        self.out.append(f"router isis {tag}".strip())
+        self.out += [self.ind + line for line in lines]
+        self.out.append("!")
+
+    def _isis_interface(self, iface: Interface) -> List[str]:
+        isis = self.device.isis
+        if isis is None or not iface.isis:
+            return []
+        lines = []
+        tag = igp_text.isis_tag(isis, "ios" if self.ios else "eos", Report())
+        if self.ios:
+            if not iface.isis_passive:  # a passive interface is named in router isis
+                lines.append(f"ip router isis {tag}".strip())
+        else:
+            lines.append(f"isis enable {tag}")
+            if iface.isis_passive:
+                lines.append("isis passive")
+        if iface.isis_metric is not None:
+            lines.append(f"isis metric {iface.isis_metric}")
+        if iface.isis_network:
+            lines.append(f"isis network {iface.isis_network}")
+        return lines
 
     def _area(self, dotted: str) -> str:
         return ospf_text.area_number(dotted) if self.ios else dotted

@@ -22,6 +22,7 @@ from .. import ospf as ospf_text
 from .. import l2sec as l2sec_text
 from .. import mgmt as mgmt_text
 from .. import vrfs as vrfs_text
+from .. import igp as igp_text
 from .. import routemap as routemap_text
 from .. import qos as qos_text
 from .. import confparse, names
@@ -31,7 +32,7 @@ from .. import aaa as aaa_text
 from ..confparse import Node
 from ..errors import ParseError
 from ..model import (AaaGroup, AaaMethod, AaaServer, Acl, Device, LocalUser, DhcpPool, FhrpGroup, IkePolicy, IpsecPeer, IpsecTransform, NtpKey, PreSharedKey,
-                     SnmpCommunity, SnmpGroup, SnmpHost, SnmpUser, NatPool, NatRule, Interface, InterfaceKind, LacpMode, Origin, Ospf, OspfNetwork, Wlan, Mlag,
+                     SnmpCommunity, SnmpGroup, SnmpHost, SnmpUser, NatPool, NatRule, Interface, InterfaceKind, LacpMode, Origin, Ospf, OspfNetwork, Wlan, Mlag, Rip, Isis,
                      QosAction, QosClass, QosPolicy, StaticRoute, StpMode, SwitchportMode, Unparsed, Vlan)
 
 # Lines that only describe the file or the software, not the device's behaviour.
@@ -1207,7 +1208,29 @@ class _Reader:
             return self.ospf(node, w[2], w[4] if len(w) == 5 else "")
         if w[1:2] == ["bgp"] and len(w) == 3 and self.device.bgp is None:
             return self.bgp(node, w[2])
+        if w[1:] == ["rip"] and self.device.rip is None:
+            rip = self.device.rip = Rip(origin=Origin(node.line, node.text))
+            return self._igp_children(node, lambda c: igp_text.ios_rip_line(rip, c))
+        if w[1:2] == ["isis"] and len(w) in (2, 3) and self.device.isis is None:
+            isis = self.device.isis = Isis(w[2] if len(w) == 3 else "", origin=Origin(node.line, node.text))
+            if self.device.platform == "eos":
+                isis.wide_metrics = True  # EOS sends wide metrics
+            return self._igp_children(node, lambda c: igp_text.ios_isis_line(self.device, isis, c))
         return False
+
+    def _igp_children(self, node: Node, read: Callable[[List[str]], bool]) -> bool:
+        for child in node.children:
+            if child.words[:3] == ["address-family", "ipv4", "unicast"] and self.device.platform == "eos":
+                for line in child.children:  # (nothing inside is converted yet)
+                    self.unparsed(line, f"{node.text} / {child.text}")
+                continue
+            try:
+                ok = read(child.words)
+            except (ValueError, IndexError):
+                ok = False
+            if not ok:
+                self.unparsed(child, node.text)
+        return True
 
     def bgp(self, node: Node, local_as: str) -> bool:
         b = bgp_text.Builder(local_as)
@@ -1961,6 +1984,14 @@ class _Reader:
             iface.bfd_interval, iface.bfd_min_rx, iface.bfd_multiplier = int(w[2]), int(w[4]), int(w[6])
         elif w in (["ip", "ospf", "bfd"], ["ip", "ospf", "neighbor", "bfd"]):
             iface.ospf_bfd = True
+        elif w[:3] == ["ip", "router", "isis"] and n in (3, 4) or w[:2] == ["isis", "enable"] and n == 3:
+            iface.isis = True
+        elif w == ["isis", "passive"]:
+            iface.isis = iface.isis_passive = True
+        elif w[:2] == ["isis", "metric"] and n in (3, 4) and w[3:] in ([], ["level-1"], ["level-2"]):
+            iface.isis_metric = int(w[2])
+        elif w == ["isis", "network", "point-to-point"]:
+            iface.isis_network = "point-to-point"
         elif w[0] == "service-policy" and n in (3, 5):
             # IOS: service-policy input|output P; EOS: service-policy type qos input P
             args = w[3:] if w[1:3] == ["type", "qos"] else w[1:]
