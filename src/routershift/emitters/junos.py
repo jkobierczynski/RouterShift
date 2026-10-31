@@ -18,16 +18,11 @@ from typing import Dict, List, Tuple
 
 from .. import aaa as aaa_text
 from .. import bgp as bgp_text
-from .. import dhcp as dhcp_text
 from .. import hosts as hosts_text
-from .. import igp as igp_text
-from .. import multicast as multicast_text
 from .. import ospf as ospf_text
-from .. import routemap as routemap_text
+from .. import partial
 from .. import snmp as snmp_text
-from .. import vpn as vpn_text
 from .. import vrfs as vrfs_text
-from .. import wlan as wlan_text
 from ..junostext import Tree, quote
 from ..model import BgpNeighbor, Device, Interface, InterfaceKind, LacpMode, StpMode, SwitchportMode
 from ..names import PortMapper
@@ -357,32 +352,7 @@ class Writer:
 
     def leftovers(self, iface: Interface) -> None:
         """What a port carries that this writer does not write yet."""
-        missing = [what for what, stated in (
-            ("ACLs (firewall filters)", bool(iface.acl_in or iface.acl_out or iface.acl6_in or iface.acl6_out)),
-            ("DHCP relay", bool(iface.helper_addresses)),
-            ("VRRP", bool(iface.fhrp)),
-            ("the voice VLAN", iface.voice_vlan is not None),
-            ("speed and duplex", bool(iface.speed or iface.duplex not in ("", "auto"))),
-            ("QoS", bool(iface.qos_trust or iface.qos_policy_in or iface.qos_policy_out)),
-            ("MPLS", iface.mpls),
-            ("DHCP snooping, ARP inspection, source guard and port security",
-             iface.dhcp_trust or iface.arp_trust or iface.source_guard or iface.port_security),
-            ("storm control", bool(iface.storm_control)),
-            ("MC-LAG", iface.mlag_id is not None),
-            ("NAT", bool(iface.nat)),
-            ("BFD", bool(iface.ospf_bfd or iface.bfd_interval or iface.bfd_min_rx or iface.bfd_multiplier)),
-            ("IS-IS", iface.isis),
-            ("PIM and IGMP", bool(iface.pim or iface.igmp_version)),
-            ("sFlow and flow monitoring", bool(iface.sflow or iface.flow)),
-            ("PoE", hosts_text.poe_stated(iface)),
-            ("policy-based routing", bool(iface.pbr)),
-            ("IPsec", bool(iface.crypto_map)),
-            ("802.1X and MAC authentication", iface.dot1x or iface.mab),
-            ("loop guard and BPDU filter", iface.stp_guard == "loop" or iface.stp_bpdufilter),
-        ) if stated]
-        if missing:
-            self.report.add("interface", self.label(iface), Severity.REVIEW, "junos-not-yet",
-                            f"not written for Junos yet: {', '.join(missing)}; configure by hand")
+        partial.port(iface, self.report, self.label(iface), PLATFORM)
         if iface.cdp:
             self.report.add("interface", self.label(iface), Severity.APPROX, "cdp", "Junos has no CDP")
 
@@ -676,53 +646,7 @@ class Writer:
     # the rest ----------------------------------------------------------------------------------------------------
 
     def not_yet(self) -> None:
-        dev, report = self.device, self.report
-
-        def skip(kind: str, label: str, what: str) -> None:
-            report.skip(kind, label, "junos-not-yet", f"{what} not written for Junos yet; configure by hand")
-
-        for name in dev.acls:
-            skip("acl", name, "firewall filters are")
-        routemap_text.unsupported(dev, report, PLATFORM)
-        for pool in dev.dhcp_pools:
-            skip("dhcp", dhcp_text.label(pool), "the DHCP server is")
-        for n, rule in enumerate(dev.nat_rules, 1):
-            skip("nat", f"rule {n} ({rule.kind})", "NAT is")
-        if vpn_text.has_vpn(dev):
-            for p in dev.ipsec_peers:
-                skip("vpn", vpn_text.peer_label(p), "IPsec is")
-        for policy in dev.qos_policies:
-            skip("qos", f"policy {policy}", "class of service is")
-        for session in dev.mirror_sessions:
-            skip("monitor", f"mirror session {session.name}", "port mirroring (analyzer) is")
-        if dev.sflow is not None:
-            skip("monitor", "sFlow", "sFlow is")
-        if dev.netflow is not None:
-            skip("monitor", "NetFlow", "flow monitoring is")
-        wlan_text.unsupported(dev, report, PLATFORM)
-        if dev.mpls.ldp or any(i.mpls for i in dev.interfaces.values()):
-            skip("mpls", "MPLS and LDP", "MPLS and LDP are")
-        if dev.rip is not None:
-            skip("rip", igp_text.RIP_LABEL, "RIP is")
-        if dev.isis is not None:
-            skip("isis", igp_text.isis_label(dev.isis), "IS-IS is")
-        if dev.mlag is not None:
-            skip("interface", "multi-chassis LAG", "MC-LAG is")
-        if dev.vxlan is not None:
-            skip("interface", "VXLAN", "VXLAN is")
-        for sla in dev.ip_slas:
-            skip("track", f"ip sla {sla}", "real-time performance monitoring (RPM) is")
-        for track in dev.tracks:
-            skip("track", f"track {track}", "object tracking is")
-        if multicast_text.stated(dev) or dev.multicast_routing or dev.pim_rps:
-            skip("vlan", multicast_text.LABEL, "IGMP snooping and PIM are")
-        if dev.dhcp_snooping:
-            skip("vlan", "DHCP snooping", "DHCP snooping is")
-        aaa = dev.aaa
-        for server in aaa.servers:
-            skip("management", aaa_text.server_label(server), "RADIUS and TACACS+ servers are")
-        for method in aaa.methods:
-            skip("management", aaa_text.method_label(method), "authentication order and 802.1X are")
+        partial.device(self.device, self.report, PLATFORM)
 
 
 def emit(device: Device, ports: PortMapper, report: Report) -> str:

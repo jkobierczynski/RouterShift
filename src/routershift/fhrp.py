@@ -21,6 +21,7 @@ SUPPORTED: Dict[str, Set[str]] = {
     "aoscx": {"vrrp", "anycast"},
     "aoss": {"vrrp"},
     "comware": {"vrrp"},
+    "nxos": {"hsrp", "vrrp"},
 }
 
 Add = Callable[[Severity, str, str], None]

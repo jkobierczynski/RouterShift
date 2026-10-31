@@ -53,6 +53,12 @@ local users), SNMP communities, VLANs, ports and aggregates with LACP, access an
 management interfaces, subinterfaces, IPv4/IPv6 addresses, VRFs (routing instances with RD and route targets),
 static routes, OSPF, BGP (groups, EVPN family), LLDP and spanning tree (RSTP, MSTP, VSTP). Every other feature
 read from another platform is listed in the report as "not written for Junos yet".
+Cisco NX-OS reads through the IOS reader (with its own blocks: features, vrf context, neighbor blocks, hsrp and
+vrrp blocks, use-vrf) and writes the system settings, users, SNMP communities, VLANs, ports, port-channels, SVIs,
+the management port in VRF management, VRFs and their static routes, ACLs, prefix lists and route maps, HSRP and
+VRRP, DHCP relay, storm control, OSPF (interface-based, VRFs in the process), BGP (neighbor blocks, EVPN family),
+spanning tree (rapid PVST+, MST), LLDP and the vty settings. Everything else is reported as "not written for
+NX-OS yet".
 Everything else (LDAP, ...) is listed in the report under "Not understood", line by
 line, with secrets masked.
 
