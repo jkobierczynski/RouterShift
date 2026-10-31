@@ -530,6 +530,19 @@ class QosPolicy:
 
 
 @dataclass
+class Wlan:
+    """A wireless network (SSID) on a controller: its VLAN and security."""
+    name: str
+    ssid: str = ""
+    wlan_id: Optional[int] = None
+    vlan: Optional[int] = None
+    security: str = "dot1x"  # open, psk (WPA2-PSK) or dot1x (WPA2-Enterprise)
+    psk: str = ""  # "" when the source holds it encrypted
+    enabled: bool = True
+    origin: Origin = field(default_factory=Origin)
+
+
+@dataclass
 class Mpls:
     """MPLS label switching with LDP. The router ID is an address or an interface (canonical name)."""
     ldp: bool = False
@@ -580,6 +593,7 @@ class Device:
     stp_mode: Optional[StpMode] = None
     stp: Stp = field(default_factory=Stp)
     mpls: Mpls = field(default_factory=Mpls)
+    wlans: List[Wlan] = field(default_factory=list)
     qos_classes: Dict[str, QosClass] = field(default_factory=dict)
     qos_policies: Dict[str, QosPolicy] = field(default_factory=dict)
     snmp: Snmp = field(default_factory=Snmp)

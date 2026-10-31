@@ -33,7 +33,7 @@ from ..confparse import Node
 from ..errors import ParseError
 from ..model import (AaaGroup, AaaMethod, AaaServer, Acl, AclAction, AclEntry, Device, DhcpPool, FhrpGroup, IkePolicy, IpsecPeer, IpsecTransform,
                      NtpKey, PreSharedKey, SnmpCommunity, SnmpGroup, SnmpHost, SnmpUser, Interface, InterfaceKind, LacpMode, LocalUser,
-                     NatPool, NatRule, Origin, QosAction, QosClass, QosPolicy, Ospf, OspfNetwork, StaticRoute, StpMode, SwitchportMode, Unparsed, Vlan)
+                     NatPool, NatRule, Origin, QosAction, QosClass, QosPolicy, Ospf, Wlan, OspfNetwork, StaticRoute, StpMode, SwitchportMode, Unparsed, Vlan)
 from .ioslike import _cidr, _is_address
 
 _PREFIXES: List[Tuple[str, InterfaceKind, str]] = [
@@ -185,6 +185,7 @@ class _Reader:
             "traffic": self.traffic,
             "qos": self.qos_policy,
             "mpls": self.mpls,
+            "wlan": self.wlan,
             "ftp": self.transfer,
         }
         for node in roots:
@@ -737,6 +738,33 @@ class _Reader:
                     vlan.shutdown = True
                 elif vid == ids[0]:
                     self.unparsed(child, node.text)
+        return True
+
+    def wlan(self, node: Node) -> bool:
+        """wlan service-template NAME: ssid, vlan, akm mode psk|dot1x, preshared-key, service-template enable."""
+        w = node.words
+        if w[1] != "service-template" or len(w) != 3:
+            return False
+        wl = Wlan(w[2], ssid=w[2], security="open", enabled=False, origin=Origin(node.line, node.text))
+        for child in node.children:
+            c = child.words
+            if c[0] == "ssid" and len(c) == 2:
+                wl.ssid = c[1]
+            elif c[0] == "vlan" and len(c) == 2 and c[1].isdigit():
+                wl.vlan = int(c[1])
+            elif c[:2] == ["akm", "mode"] and len(c) == 3 and c[2] in ("psk", "dot1x"):
+                wl.security = c[2]
+            elif c[0] == "preshared-key" and len(c) == 4 and c[1] in ("pass-phrase", "raw-key") \
+                    and c[2] in ("simple", "cipher"):
+                wl.psk = c[3] if c[2] == "simple" else ""
+            elif c in (["cipher-suite", "ccmp"], ["security-ie", "rsn"],
+                       ["client-security", "authentication-mode", "dot1x"]):
+                pass
+            elif c in (["service-template", "enable"], ["undo", "service-template", "enable"]):
+                wl.enabled = c[0] != "undo"
+            else:
+                self.unparsed(child, node.text)
+        self.device.wlans.append(wl)
         return True
 
     def mpls(self, node: Node) -> bool:
