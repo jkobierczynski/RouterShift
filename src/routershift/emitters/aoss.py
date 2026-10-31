@@ -23,6 +23,7 @@ from .. import vpn as vpn_text
 from .. import fhrp
 from .. import ospf as ospf_text
 from .. import stp as stp_text
+from .. import qos as qos_text
 from .. import snmp as snmp_text
 from .. import aaa as aaa_text
 from ..model import Device, FhrpGroup, Interface, InterfaceKind, LacpMode, StaticRoute, StpMode, SwitchportMode, Vlan
@@ -93,6 +94,7 @@ class Writer:
         self.trunks()
         self.oobm()
         self.acls()
+        self.qos()
         self.interfaces()
         self.routes()
         self.vlan_blocks()
@@ -518,6 +520,7 @@ class Writer:
                 lines.append(f"name {_quote(iface.description)}")
             if iface.mode != SwitchportMode.ROUTED:  # a routed port's lists go to its VLAN
                 lines += self._acl_bindings(iface)
+                lines += self._qos_bindings(iface)
             if iface.shutdown:
                 lines.append("disable")
             if iface.speed is not None:
@@ -616,6 +619,7 @@ class Writer:
         for helper in svi.helper_addresses:
             lines.append(f"ip helper-address {helper}")
         lines += self._acl_bindings(svi)
+        lines += self._qos_bindings(svi)
         vid = int(svi.name[len("Vlan"):])
         lines += self._svi_ospf(vid, svi)
         for g in self.groups.get(vid, []):
@@ -738,6 +742,55 @@ class Writer:
             body.append("enable")
         body.append("exit")
         return [f"vrrp vrid {g.group}"] + [_IND + line for line in body]
+
+    def qos(self) -> None:
+        """Classes hold their own entries (match/ignore): DSCP values, and the entries of the ACL a class used."""
+        rep = self.report
+        for c in self.device.qos_classes.values():
+            label = f"class {c.name}"
+            rep.item("qos", label)
+            lines: List[str] = []
+            acl = self.device.acls.get(c.acl) if c.acl else None
+            if acl is not None:
+                lines = qos_text.class_lines(acl, rep, label, style="wildcard", any_protocol="ip", icmp6="icmp",
+                                             icmp_names=False, quote_remark=True)
+            elif c.acl:
+                rep.add("qos", label, Severity.REVIEW, "acl-missing", f"ACL {c.acl} is not defined; left out")
+            last = max([int(line.split()[0]) for line in lines], default=0)
+            lines += [f"{last + 10 * (n + 1)} match ip any any ip-dscp {d}" for n, d in enumerate(c.dscp)]
+            if c.match_all and c.dscp and acl is not None:
+                rep.add("qos", label, Severity.APPROX, "qos-match",
+                        "AOS-S class entries are alternatives: DSCP and ACL now match either, not both")
+            self.out.append(f"class ipv4 {_quote(c.name)}")
+            self.out += [_IND + line for line in lines] + [_IND + "exit"]
+        for p in self.device.qos_policies.values():
+            rep.item("qos", f"policy {p.name}")
+            self.out.append(f"policy qos {_quote(p.name)}")
+            seq = 10
+            for a in p.actions:
+                label = qos_text.action_label(p, a)
+                if a.qos_class != qos_text.DEFAULT_CLASS and a.qos_class not in self.device.qos_classes:
+                    rep.skip("qos", label, "qos-class", f"class {a.qos_class} is not defined; left out")
+                    continue
+                words = ["default-class"] if a.qos_class == qos_text.DEFAULT_CLASS else \
+                    [f"{seq} class ipv4 {_quote(a.qos_class)}"]
+                words += [f"action dscp {a.set_dscp}"] if a.set_dscp is not None else []
+                words += [f"action rate-limit kbps {a.police_kbps}"] if a.police_kbps is not None else []
+                self.out.append(_IND + " ".join(words))
+                seq += 10
+            self.out.append(_IND + "exit")
+
+    def _qos_bindings(self, iface: Interface) -> List[str]:
+        lines = []
+        for direction, name in (("in", iface.qos_policy_in), ("out", iface.qos_policy_out)):
+            if name and name in self.device.qos_policies:
+                lines.append(f"service-policy {_quote(name)} {direction}")
+            elif name:
+                self.report.add("interface", self.label(iface), Severity.REVIEW, "qos-policy",
+                                f"policy {name} is applied but not defined; left out")
+        if iface.qos_trust:
+            lines.append(f"qos trust {'dot1p' if iface.qos_trust == 'cos' else iface.qos_trust}")
+        return lines
 
     def _acl_bindings(self, iface: Interface) -> List[str]:
         lines = []

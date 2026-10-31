@@ -71,6 +71,7 @@ _KIND_TITLES = [
     ("dhcp", "DHCP server"),
     ("nat", "NAT"),
     ("vpn", "Site-to-site VPN (IPsec)"),
+    ("qos", "QoS"),
     ("management", "Management"),
     ("unparsed", "Not understood"),
 ]

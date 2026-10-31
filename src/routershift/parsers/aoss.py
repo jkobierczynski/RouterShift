@@ -25,10 +25,11 @@ from .. import acl as acl_text
 from .. import confparse
 from .. import dhcp as dhcp_text
 from .. import ospf as ospf_text
+from .. import qos as qos_text
 from ..confparse import Node
 from ..errors import ParseError
-from ..model import (AaaGroup, AaaMethod, AaaServer, Acl, Device, LocalUser, DhcpPool, FhrpGroup, NtpKey, SnmpCommunity, SnmpGroup, SnmpHost, SnmpUser, Interface, InterfaceKind, LacpMode, Origin, StaticRoute, StpMode,
-                     SwitchportMode, Unparsed, Vlan)
+from ..model import (AaaGroup, AaaMethod, AaaServer, Acl, Device, LocalUser, DhcpPool, FhrpGroup, NtpKey, SnmpCommunity, SnmpGroup, SnmpHost, SnmpUser, Interface, InterfaceKind, LacpMode, Origin, QosAction, QosClass, QosPolicy,
+                     StaticRoute, StpMode, SwitchportMode, Unparsed, Vlan)
 from ..timezones import utc
 from .ioslike import _cidr, _is_address, _vlan_ids
 
@@ -86,6 +87,7 @@ class _Reader:
         self.ospf_passive: Dict[str, bool] = {}
         self._snmp_groups: List[Tuple[str, str]] = []  # (user, group)
         self._aaa_keys: Dict[str, str] = {}  # protocol -> the key of servers that have none of their own
+        self._class_acls: List[Tuple[QosClass, Acl]] = []
         self._client_limit: Dict[Tuple[str, str], int] = {}  # (port, authenticator|mac-based) -> client limit
 
     def unparsed(self, node: Node, section: str = "") -> None:
@@ -131,6 +133,8 @@ class _Reader:
             "access-list": self.numbered_acl,
             "vlan": self.vlan,
             "spanning-tree": self.spanning_tree,
+            "class": self.qos_class,
+            "policy": self.qos_policy,
             "router": self.router,
             "dhcp-server": self.dhcp_server,
         }
@@ -435,6 +439,48 @@ class _Reader:
         acl_text.read_block(acl, node.children, wildcards=True, standard=standard)
         return True
 
+    def qos_class(self, node: Node) -> bool:
+        """class ipv4 "NAME", entries '10 match ip any any ip-dscp 46' or ACL-like '20 match udp any any range 5000 5100'"""
+        w = [unquote(word) for word in node.words]
+        if len(w) != 3 or w[1] != "ipv4":
+            return False
+        qos_class = QosClass(w[2], origin=Origin(node.line, node.text))
+        self.device.qos_classes[qos_class.name] = qos_class
+        for child in qos_text.read_class(qos_class, node.children, "ip-dscp", True, self._class_acls):
+            self.unparsed(child, node.text)
+        return True
+
+    def qos_policy(self, node: Node) -> bool:
+        """policy qos "NAME", entries '10 class ipv4 "C" action dscp 46 action rate-limit kbps 2000' and
+        'default-class action ...'"""
+        w = [unquote(word) for word in node.words]
+        if len(w) != 3 or w[1] != "qos":
+            return False
+        policy = QosPolicy(w[2], origin=Origin(node.line, node.text))
+        self.device.qos_policies[policy.name] = policy
+        for child in node.children:
+            c = [unquote(word) for word in child.words]
+            if c == ["exit"]:
+                continue
+            action: Optional[QosAction] = None
+            if len(c) >= 4 and c[0].isdigit() and c[1:3] == ["class", "ipv4"]:
+                action, args = QosAction(c[3]), c[4:]
+            elif c[:1] == ["default-class"] or c[1:2] == ["default-class"]:
+                args = c[c.index("default-class") + 1:]
+                action = QosAction(qos_text.DEFAULT_CLASS)
+            while action is not None and args:
+                if args[:2] == ["action", "dscp"] and len(args) >= 3:
+                    action.set_dscp, args = qos_text.dscp(args[2]), args[3:]
+                elif args[:3] == ["action", "rate-limit", "kbps"] and len(args) >= 4:
+                    action.police_kbps, args = int(args[3]), args[4:]
+                else:
+                    action = None
+            if action is None:
+                self.unparsed(child, node.text)
+            else:
+                policy.actions.append(action)
+        return True
+
     def numbered_acl(self, node: Node) -> bool:
         w = node.words
         if len(w) < 3 or not w[1].isdigit():
@@ -524,6 +570,10 @@ class _Reader:
             iface.shutdown = True
         elif w[1:2] == ["access-group"] and w[0] in ("ip", "ipv6"):
             return self._access_group(iface, w)
+        elif w[0] == "service-policy" and len(w) == 3 and w[2] in ("in", "out"):
+            setattr(iface, f"qos_policy_{w[2]}", unquote(w[1]))
+        elif w[:2] == ["qos", "trust"] and len(w) == 3 and w[2] in ("dscp", "dot1p", "none"):
+            iface.qos_trust = "cos" if w[2] == "dot1p" else w[2]
         elif w[0] == "name" and len(w) >= 2:
             iface.description = unquote(" ".join(w[1:]))
         elif w[0] == "speed-duplex" and len(w) == 2:
@@ -753,6 +803,7 @@ class _Reader:
     # VLAN membership to ports ----------------------------------------------------------------------------------------
 
     def _finish(self) -> None:
+        qos_text.adopt(self.device, self._class_acls)
         for iface in self.device.interfaces.values():
             if iface.dot1x or iface.mab:
                 # an authenticator without a client limit opens the port for all once one client logs in; MAC

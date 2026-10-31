@@ -24,8 +24,9 @@ static routes, IPv4/IPv6 access lists with their interface bindings, gateway
 redundancy (HSRP, VRRP, anycast gateways), OSPF, BGP, NAT and site-to-site
 IPsec VPNs (on IOS, EOS and Comware; the AOS switches have neither), local users and
 privilege levels, and AAA (RADIUS and TACACS+ servers and groups, login, enable, command
-and accounting method lists), 802.1X and MAC authentication on ports, and the TFTP/FTP
-source interface. Everything else (route maps, LDAP, QoS, ...) is listed in the report under "Not understood", line by
+and accounting method lists), 802.1X and MAC authentication on ports, the TFTP/FTP
+source interface, and QoS (classes, policies with DSCP marking and policing, port trust).
+Everything else (route maps, LDAP, ...) is listed in the report under "Not understood", line by
 line, with secrets masked.
 
 ## Usage

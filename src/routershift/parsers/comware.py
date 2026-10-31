@@ -27,12 +27,13 @@ from .. import bgp as bgp_text
 from .. import confparse
 from .. import dhcp as dhcp_text
 from .. import ospf as ospf_text
+from .. import qos as qos_text
 from .. import vpn as vpn_text
 from ..confparse import Node
 from ..errors import ParseError
 from ..model import (AaaGroup, AaaMethod, AaaServer, Acl, AclAction, AclEntry, Device, DhcpPool, FhrpGroup, IkePolicy, IpsecPeer, IpsecTransform,
                      NtpKey, PreSharedKey, SnmpCommunity, SnmpGroup, SnmpHost, SnmpUser, Interface, InterfaceKind, LacpMode, LocalUser,
-                     NatPool, NatRule, Origin, Ospf, OspfNetwork, StaticRoute, StpMode, SwitchportMode, Unparsed, Vlan)
+                     NatPool, NatRule, Origin, QosAction, QosClass, QosPolicy, Ospf, OspfNetwork, StaticRoute, StpMode, SwitchportMode, Unparsed, Vlan)
 from .ioslike import _cidr, _is_address
 
 _PREFIXES: List[Tuple[str, InterfaceKind, str]] = [
@@ -135,6 +136,8 @@ class _Reader:
         self._reauth_period: Optional[int] = None
         self._max_users: Dict[Tuple[str, str], int] = {}  # (port, dot1x|mac-authentication) -> max-user
         self._port_based: Set[str] = set()
+        self._behaviors: Dict[str, QosAction] = {}
+        self._policy_pairs: List[Tuple[QosPolicy, str, str, Node]] = []  # policy, classifier, behavior, line
 
     def unparsed(self, node: Node, section: str = "") -> None:
         self.device.unparsed.append(Unparsed(node.line, node.text, section))
@@ -179,6 +182,8 @@ class _Reader:
             "dot1x": self.dot1x,
             "mac-authentication": self.dot1x,
             "tftp": self.transfer,
+            "traffic": self.traffic,
+            "qos": self.qos_policy,
             "ftp": self.transfer,
         }
         for node in roots:
@@ -499,6 +504,75 @@ class _Reader:
             methods.append(m)
         return True
 
+    def traffic(self, node: Node) -> bool:
+        """traffic classifier NAME [operator and|or]: if-match dscp|acl; traffic behavior NAME: remark dscp, car"""
+        w = node.words
+        if w[1] == "classifier" and len(w) in (3, 5):
+            if len(w) == 5 and (w[3] != "operator" or w[4] not in ("and", "or")):
+                return False
+            qos_class = QosClass(w[2], match_all=len(w) == 3 or w[4] == "and", origin=Origin(node.line, node.text))
+            self.device.qos_classes[qos_class.name] = qos_class
+            for child in node.children:
+                c = child.words
+                try:
+                    if c[:2] == ["if-match", "dscp"] and len(c) >= 3:
+                        qos_class.dscp += [qos_text.dscp(x) for x in c[2:]]
+                        continue
+                    if c[:2] == ["if-match", "acl"] and len(c) in (3, 4) and (len(c) == 3 or c[2] == "name"):
+                        qos_class.acl = c[-1]
+                        continue
+                except ValueError:
+                    pass
+                self.unparsed(child, node.text)
+            return True
+        if w[1] == "behavior" and len(w) == 3:
+            action = QosAction("")
+            self._behaviors[w[2]] = action
+            for child in node.children:
+                c = child.words
+                if c[:2] == ["remark", "dscp"] and len(c) == 3:
+                    action.set_dscp = qos_text.dscp(c[2])
+                elif c[:2] == ["car", "cir"] and len(c) >= 3 and self._car(action, c[2:]):
+                    pass
+                else:
+                    self.unparsed(child, node.text)
+            return True
+        return False
+
+    @staticmethod
+    def _car(action: QosAction, w: List[str]) -> bool:
+        """car cir KBPS [cbs N] [ebs N] [green pass] [red discard]"""
+        action.police_kbps = int(w[0])
+        args = w[1:]
+        red = "discard"
+        while args:
+            if args[0] in ("cbs", "ebs") and len(args) >= 2:
+                args = args[2:]
+            elif args[0] in ("green", "yellow", "red") and len(args) >= 2:
+                if args[0] == "red":
+                    red = args[1]
+                elif args[1] != "pass":
+                    return False
+                args = args[2:]
+            else:
+                return False
+        return red == "discard"
+
+    def qos_policy(self, node: Node) -> bool:
+        """qos policy NAME: classifier C behavior B"""
+        w = node.words
+        if w[1] != "policy" or len(w) != 3:
+            return False
+        policy = QosPolicy(w[2], origin=Origin(node.line, node.text))
+        self.device.qos_policies[policy.name] = policy
+        for child in node.children:
+            c = child.words
+            if c[0] == "classifier" and len(c) == 4 and c[2] == "behavior":
+                self._policy_pairs.append((policy, c[1], c[3], child))
+            else:
+                self.unparsed(child, node.text)
+        return True
+
     def dot1x(self, node: Node) -> bool:
         """dot1x; mac-authentication; dot1x timer reauth-period N; dot1x authentication-method eap|chap|pap"""
         w = node.words
@@ -559,6 +633,15 @@ class _Reader:
             else:
                 return None
         return methods
+
+    def _finish_qos(self) -> None:
+        for policy, classifier, behavior, line in self._policy_pairs:
+            template = self._behaviors.get(behavior)
+            if template is None:
+                self.unparsed(line, f"qos policy {policy.name}: behavior {behavior} is not defined")
+                continue
+            name = qos_text.DEFAULT_CLASS if classifier == "default-class" else classifier
+            policy.actions.append(QosAction(name, template.set_dscp, template.police_kbps))
 
     def _finish_aaa(self) -> None:
         a = self.device.aaa
@@ -1282,6 +1365,10 @@ class _Reader:
             pass
         elif w[:3] == ["dhcp", "relay", "server-address"] and n == 4:
             iface.helper_addresses.append(w[3])
+        elif w[:3] == ["qos", "apply", "policy"] and n == 5 and w[4] in ("inbound", "outbound"):
+            setattr(iface, f"qos_policy_{'in' if w[4] == 'inbound' else 'out'}", w[3])
+        elif w[:2] == ["qos", "trust"] and n == 3 and w[2] in ("dscp", "dot1p"):
+            iface.qos_trust = "cos" if w[2] == "dot1p" else "dscp"
         elif w[0] == "packet-filter" and w[-1] in ("inbound", "outbound"):
             v6 = w[1:2] == ["ipv6"]
             args = w[2:-1] if v6 else w[1:-1]
@@ -1339,6 +1426,7 @@ class _Reader:
     def _finish(self) -> None:
         ospf_text.attach(self.device, self._ospf_areas, {})
         self._finish_aaa()
+        self._finish_qos()
         for peer, profile in self._peer_profiles:
             proposals, remotes = self._ike_profiles.get(profile, ([], []))
             peer.ike_policies = list(proposals)
