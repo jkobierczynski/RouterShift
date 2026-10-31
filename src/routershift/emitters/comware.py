@@ -21,6 +21,7 @@ from .. import stp as stp_text
 from .. import l2sec as l2sec_text
 from .. import mgmt as mgmt_text
 from .. import vrfs as vrfs_text
+from .. import igp as igp_text
 from .. import bfd as bfd_text
 from .. import routemap as routemap_text
 from .. import mpls as mpls_text
@@ -73,6 +74,8 @@ class Writer:
         self.wlans()
         for p in self.device.ospf:
             self.ospf(p)
+        self.rip()
+        self.isis()
         self.dhcp()
         self.nat()
         self.vpn()
@@ -767,6 +770,7 @@ class Writer:
             lines.append(f"ospf cost {iface.ospf_cost}")
         if iface.ospf_network:
             lines.append(f"ospf network-type {'p2p' if iface.ospf_network == 'point-to-point' else 'broadcast'}")
+        lines += self._isis_interface(iface)
         if iface.name in bfd_text.ospf_interfaces(self.device):
             lines.append("ospf bfd enable")
         lines += bfd_text.separate_lines(iface)
@@ -796,6 +800,70 @@ class Writer:
         if (iface.source_name or iface.name, name) in self.port.renumbered:
             add(Severity.APPROX, "port-renamed",
                 f"named {name} without a port map; check it against the cabling of the new device")
+
+    def rip(self) -> None:
+        rip = self.device.rip
+        if rip is None:
+            return
+        rep = self.report
+        rep.item("rip", igp_text.RIP_LABEL)
+        lines: List[str] = []
+        if rip.auto_summary is not None:
+            lines.append("summary" if rip.auto_summary else "undo summary")
+        if rip.version is not None:
+            lines.append(f"version {rip.version}")
+        lines += igp_text.rip_networks(rip, rep, "comware")
+        if rip.passive_default:
+            lines.append("silent-interface all")
+            lines += [f"undo silent-interface {self.port(n)}" for n in rip.active_interfaces]
+        else:
+            lines += [f"silent-interface {self.port(n)}" for n in rip.passive_interfaces]
+        for source in rip.redistribute:
+            written = "direct" if source == "connected" else source
+            if source == "ospf":
+                written = f"ospf {self.device.ospf[0].process if self.device.ospf else 1}"
+            rm = rip.redistribute_maps.get(source)
+            lines.append(f"import-route {written}" + (f" route-policy {rm}" if rm else ""))
+        if rip.default_metric is not None:
+            lines.append(f"default cost {rip.default_metric}")
+        if rip.default_originate:
+            lines.append("default-route originate")
+        self.out.append("rip 1")
+        self.out += [_IND + line for line in lines]
+        self.block_end()
+
+    def isis(self) -> None:
+        isis = self.device.isis
+        if isis is None:
+            return
+        rep = self.report
+        rep.item("isis", igp_text.isis_label(isis))
+        lines: List[str] = []
+        if isis.level:
+            lines.append(f"is-level {isis.level}")
+        if isis.wide_metrics:
+            lines.append("cost-style wide")
+        lines += [f"network-entity {net}" for net in isis.nets]
+        for source in isis.redistribute:
+            rm = isis.redistribute_maps.get(source)
+            lines.append(f"import-route {'direct' if source == 'connected' else source}" +
+                         (f" route-policy {rm}" if rm else ""))
+        self.out.append(f"isis {igp_text.isis_tag(isis, 'comware', rep)}")
+        self.out += [_IND + line for line in lines]
+        self.block_end()
+
+    def _isis_interface(self, iface: Interface) -> List[str]:
+        isis = self.device.isis
+        if isis is None or not iface.isis:
+            return []
+        lines = [f"isis enable {igp_text.isis_tag(isis, 'comware', Report())}"]
+        if iface.isis_passive:
+            lines.append("isis silent")
+        if iface.isis_metric is not None:
+            lines.append(f"isis cost {iface.isis_metric}")
+        if iface.isis_network:
+            lines.append("isis circuit-type p2p")
+        return lines
 
     def ospf(self, p: Ospf) -> None:
         self.report.item("ospf", ospf_text.label(p))

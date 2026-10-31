@@ -207,6 +207,10 @@ class Interface:
     bfd_interval: Optional[int] = None  # BFD transmit interval, ms
     bfd_min_rx: Optional[int] = None  # BFD receive interval, ms
     bfd_multiplier: Optional[int] = None  # BFD detection multiplier
+    isis: bool = False  # IS-IS runs on the interface
+    isis_passive: bool = False  # IS-IS advertises the interface's prefixes but forms no adjacency on it
+    isis_metric: Optional[int] = None
+    isis_network: str = ""  # "", "point-to-point"
     pbr: str = ""  # policy-based routing: the route map (Comware policy-based-route, EOS pbr policy) on received packets
     crypto_map: str = ""  # policy-based IPsec applied on the interface
     tunnel_source: str = ""  # tunnel: a canonical interface name or an address
@@ -287,6 +291,36 @@ class Ospf:
         if self.passive_default:
             return interface not in self.active_interfaces
         return interface in self.passive_interfaces
+
+
+@dataclass
+class Rip:
+    """RIP (IPv4). Networks are prefixes (classful on IOS and Comware)."""
+
+    version: Optional[int] = None  # 1 or 2; None = the platform default
+    networks: List[str] = field(default_factory=list)
+    passive_default: bool = False
+    passive_interfaces: List[str] = field(default_factory=list)  # passive although the default is not
+    active_interfaces: List[str] = field(default_factory=list)  # not passive although the default is
+    redistribute: List[str] = field(default_factory=list)  # "connected", "static", "ospf"
+    redistribute_maps: Dict[str, str] = field(default_factory=dict)
+    default_metric: Optional[int] = None
+    default_originate: bool = False
+    auto_summary: Optional[bool] = None  # None = the platform default
+    origin: Origin = field(default_factory=Origin)
+
+
+@dataclass
+class Isis:
+    """IS-IS (IPv4). Interfaces say whether they take part (Interface.isis)."""
+
+    tag: str = ""  # process tag (IOS, EOS) or number (Comware)
+    nets: List[str] = field(default_factory=list)  # network entity titles, 49.0001.0000.0000.0001.00
+    level: str = ""  # "level-1", "level-2", "level-1-2"; "" = the platform default (level-1-2)
+    wide_metrics: bool = False
+    redistribute: List[str] = field(default_factory=list)  # "connected", "static"
+    redistribute_maps: Dict[str, str] = field(default_factory=dict)
+    origin: Origin = field(default_factory=Origin)
 
 
 @dataclass
@@ -685,6 +719,8 @@ class Device:
     static_routes: List[StaticRoute] = field(default_factory=list)
     ospf: List[Ospf] = field(default_factory=list)
     bgp: Optional[Bgp] = None
+    rip: Optional[Rip] = None
+    isis: Optional[Isis] = None
     acls: Dict[str, Acl] = field(default_factory=dict)
     prefix_lists: Dict[str, PrefixList] = field(default_factory=dict)
     route_maps: Dict[str, RouteMap] = field(default_factory=dict)

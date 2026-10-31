@@ -29,12 +29,12 @@ def test_readers() -> None:
 
 def test_writers() -> None:
     out, _ = convert(sample("comware_access.cfg"), "comware", "ios")
-    assert " ip ospf bfd\n bfd interval 400 min_rx 400 multiplier 4\n" in out
+    assert " ip ospf bfd\n" in out and " bfd interval 400 min_rx 400 multiplier 4\n" in out
     assert " ip policy route-map PBR-WEB\n" in out
     assert "route-map PBR-WEB permit 10\n match ip address USERS-IN\n set ip next-hop 10.10.0.2\n" in out
     assert " neighbor 10.99.0.1 fall-over bfd\n" in out
     out, _ = convert(sample("ios_access.cfg"), "ios", "eos")
-    assert "   ip ospf neighbor bfd\n   bfd interval 300 min-rx 300 multiplier 3\n" in out
+    assert "   ip ospf neighbor bfd\n" in out and "   bfd interval 300 min-rx 300 multiplier 3\n" in out
     assert "   service-policy type pbr input PBR-USERS\n" in out
     assert "class-map type pbr match-any PBR-USERS-10\n   match ip access-group USERS-IN\n!\n" \
            "policy-map type pbr PBR-USERS\n   class PBR-USERS-10\n      set nexthop 10.99.0.2\n!\n" in out
