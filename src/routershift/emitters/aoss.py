@@ -26,6 +26,7 @@ from .. import wlan as wlan_text
 from .. import vpn as vpn_text
 from .. import vrfs as vrfs_text
 from .. import bfd as bfd_text
+from .. import igp as igp_text
 from .. import routemap as routemap_text
 from .. import fhrp
 from .. import ospf as ospf_text
@@ -118,6 +119,7 @@ class Writer:
         vrfs_text.no_vrfs(self.device, self.report, "AOS-S")
         routemap_text.unsupported(self.device, self.report, "AOS-S")
         bfd_text.unsupported(self.device, self.report, "AOS-S")
+        igp_text.unsupported(self.device, self.report, "AOS-S")
         routemap_text.ospf_maps_unsupported(self.device, self.report, "AOS-S")
         vrfs_text.mlag_unsupported(self.device, self.report, "AOS-S",
                                    "AOS-S pairs switches with distributed trunking; configure it by hand")

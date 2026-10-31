@@ -16,6 +16,7 @@ from routershift import wlan as wlan_text
 from routershift import vpn as vpn_text
 from routershift import vrfs as vrfs_text
 from routershift import bfd as bfd_text
+from routershift import igp as igp_text
 from routershift import routemap as routemap_text
 from routershift import ospf as ospf_text
 from routershift.acl import safe_name
@@ -323,4 +324,26 @@ def test_converts_and_reads_back(source: str, target: str) -> None:
         assert len(bfd_text.ospf_interfaces(back)) == len(bfd_text.ospf_interfaces(first))
         if target != "aoscx":
             assert bfd_text.pbr_maps(back) == bfd_text.pbr_maps(first)
+    # RIP keeps its networks, redistribution, default route and (but on EOS) version, summary and passive interfaces;
+    # IS-IS its NETs, level, metric style (EOS is wide), redistribution and interfaces. AOS-CX and AOS-S write neither
+    if target not in igp_text.SUPPORTED:
+        assert back.rip is None and back.isis is None
+    if first.rip is not None and target in igp_text.SUPPORTED:
+        r1, r2 = first.rip, back.rip
+        assert r2 is not None
+        assert (sorted(r2.networks), r2.redistribute, r2.redistribute_maps, r2.default_originate) == (
+            sorted(r1.networks), r1.redistribute, r1.redistribute_maps, r1.default_originate)
+        if target != "eos":
+            assert (r2.version, r2.auto_summary, r2.passive_default) == (r1.version, r1.auto_summary, r1.passive_default)
+            assert (len(r2.passive_interfaces), len(r2.active_interfaces)) == (
+                len(r1.passive_interfaces), len(r1.active_interfaces))
+    if first.isis is not None and target in igp_text.SUPPORTED:
+        i1, i2 = first.isis, back.isis
+        assert i2 is not None
+        assert (i2.nets, i2.level, i2.redistribute, i2.redistribute_maps) == (
+            i1.nets, i1.level, i1.redistribute, i1.redistribute_maps)
+        assert i2.wide_metrics == (i1.wide_metrics or target == "eos")
+        ports = lambda dev: sorted((i.isis_passive, i.isis_metric or 0, i.isis_network)  # noqa: E731
+                                   for i in dev.interfaces.values() if i.isis)
+        assert ports(back) == ports(first)
     assert report.counts()

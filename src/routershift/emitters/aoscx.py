@@ -11,6 +11,7 @@ from typing import Callable, Dict, List, Tuple
 
 from .. import acl as acl_text
 from .. import bfd as bfd_text
+from .. import igp as igp_text
 from .. import routemap as routemap_text
 from .. import bgp as bgp_text
 from .. import dhcp as dhcp_text
@@ -63,6 +64,7 @@ class Writer:
         if bfd_text.uses_bfd(self.device):
             self.out.append("bfd")
         bfd_text.pbr_unsupported(self.device, self.report, "AOS-CX")
+        igp_text.unsupported(self.device, self.report, "AOS-CX")
         self.qos()
         self.vlans()
         self.groups = {i.name: fhrp.plan(i, "aoscx", self.report, self.port(i.name))

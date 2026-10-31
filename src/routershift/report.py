@@ -66,6 +66,8 @@ _KIND_TITLES = [
     ("fhrp", "Gateway redundancy (HSRP, VRRP)"),
     ("route", "Static routes"),
     ("ospf", "OSPF"),
+    ("rip", "RIP"),
+    ("isis", "IS-IS"),
     ("mpls", "MPLS"),
     ("bgp", "BGP"),
     ("acl", "Access lists"),

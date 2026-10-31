@@ -56,6 +56,8 @@ platform converts to and from all the others.
 | Prefix lists and route maps (Comware route policies), on BGP neighbors and redistribution | `PrefixList`, `RouteMap`, `BgpNeighbor.route_map_*` | 4 (done) |
 | Policy-based routing (route map on an interface; EOS pbr policy, Comware policy-based-route) | `Interface.pbr` | 4 (done) |
 | BFD: interface timers, BGP neighbors, OSPF interfaces | `Interface.bfd_*`, `BgpNeighbor.bfd`, `Ospf.bfd_all` | 4 (done) |
+| RIP: version, networks, passive interfaces, redistribution, default route, summary (IOS, EOS, Comware) | `Rip` | 4 (done) |
+| IS-IS: NETs, level, wide metrics, redistribution, interfaces (passive, metric, point-to-point) (IOS, EOS, Comware) | `Isis`, `Interface.isis*` | 4 (done) |
 | vPC (NX-OS), VXLAN/EVPN | to come | 3+ |
 
 ### AOS-S specifics
@@ -232,6 +234,21 @@ platform converts to and from all the others.
   route maps match no ACLs (the entry is written without the match); AOS-S writes no prefix lists or route maps, and
   its OSPF redistribution goes without the route map. Other match and set clauses (continue, communities lists, ...)
   are listed under "Not understood".
+
+## RIP and IS-IS
+
+* RIP keeps its version, networks, passive interfaces, redistribution (with route maps), default metric, default
+  route and auto-summary. IOS: `router rip` with classful `network` statements (a narrower prefix is written as its
+  class, reported). EOS: `router rip` with `network A/len` and `no shutdown`; EOS runs version 2 only and passive
+  interfaces are not written (reported). Comware: `rip 1` with `network` (and a wildcard for a narrower prefix),
+  `silent-interface`, `import-route`, `default cost`, `default-route originate`, `[undo] summary`.
+* IS-IS keeps its NETs, level, wide metrics, redistribution of connected and static routes, and per interface
+  whether it takes part, is passive, its metric and point-to-point. IOS: `router isis TAG` (`net`, `is-type`,
+  `metric-style wide`, `passive-interface`), `ip router isis TAG`, `isis metric`, `isis network point-to-point`.
+  EOS: `router isis TAG` with `address-family ipv4 unicast`, `isis enable TAG`, `isis passive`; EOS sends wide
+  metrics. Comware: `isis N` (`network-entity`, `is-level`, `cost-style wide`), `isis enable N`, `isis silent`,
+  `isis cost`, `isis circuit-type p2p`; a named process becomes process 1 (reported).
+* AOS-CX has no IS-IS, and RIP on AOS-CX and AOS-S is left to a person (reported).
 
 ## Policy-based routing and BFD
 
