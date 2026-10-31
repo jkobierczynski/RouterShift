@@ -53,9 +53,9 @@ def test_ios_reader() -> None:
     assert (peers["10.2.0.1"].update_source, peers["10.2.0.1"].next_hop_self) == ("Loopback0", True)
     assert (peers["10.3.0.1"].ebgp_multihop, peers["10.3.0.1"].shutdown) == (2, True)
     assert [n.families for n in bgp.neighbors] == [["ipv4"], ["ipv4"], ["ipv4"], ["ipv6"]]
-    assert (bgp.networks, bgp.redistribute) == (["10.10.0.0/24", "2001:db8:10::/48"], ["connected"])
-    assert [u.text for u in device.unparsed] == ["neighbor 10.2.0.1 password 7 0822455D0A16",
-                                                 "redistribute ospf 1 route-map O2B"]
+    assert (bgp.networks, bgp.redistribute) == (["10.10.0.0/24", "2001:db8:10::/48"], ["connected", "ospf"])
+    assert bgp.redistribute_maps == {"ospf": "O2B"}
+    assert [u.text for u in device.unparsed] == ["neighbor 10.2.0.1 password 7 0822455D0A16"]
 
 
 def test_password_is_masked() -> None:

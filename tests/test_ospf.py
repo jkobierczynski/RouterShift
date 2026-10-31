@@ -31,9 +31,10 @@ def test_ios_interface_areas_and_options() -> None:
     [p] = device.ospf
     assert p.interface_areas == {"Loopback0": "0.0.0.1", "Ethernet0/1": "0.0.0.1"}
     assert (p.reference_bandwidth, p.area_types, p.default_originate, p.redistribute) == (
-        100000, {"0.0.0.1": "nssa no-summary"}, "always", [])
+        100000, {"0.0.0.1": "nssa no-summary"}, "always", ["connected"])
+    assert p.redistribute_maps == {"connected": "RM"}
     assert device.interfaces["Ethernet0/1"].ospf_network == "point-to-point"
-    assert [u.text for u in device.unparsed] == ["redistribute connected route-map RM"]
+    assert device.unparsed == []
     out, _ = convert(text, "ios", "ios")
     assert " ip ospf 2 area 1\n" in out and " area 1 nssa no-summary\n" in out
     out, _ = convert(text, "ios", "eos")

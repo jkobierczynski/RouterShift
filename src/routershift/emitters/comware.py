@@ -21,6 +21,7 @@ from .. import stp as stp_text
 from .. import l2sec as l2sec_text
 from .. import mgmt as mgmt_text
 from .. import vrfs as vrfs_text
+from .. import routemap as routemap_text
 from .. import mpls as mpls_text
 from .. import qos as qos_text
 from .. import wlan as wlan_text
@@ -65,6 +66,7 @@ class Writer:
         self.vlans()
         self.spanning_tree()
         self.acls()
+        self.policies()
         self.qos()
         self.mpls()
         self.wlans()
@@ -800,7 +802,9 @@ class Writer:
         else:
             lines += [f"silent-interface {self.port(n)}" for n in p.passive_interfaces]
         for source in p.redistribute:
-            lines.append(f"import-route {'direct' if source == 'connected' else source}")
+            rm = p.redistribute_maps.get(source)
+            lines.append(f"import-route {'direct' if source == 'connected' else source}" +
+                         (f" route-policy {rm}" if rm else ""))
         if p.default_originate:
             lines.append("default-route-advertise" + (" always" if p.default_originate == "always" else ""))
         if p.reference_bandwidth is not None:
@@ -1040,6 +1044,16 @@ class Writer:
     def _ike_profile(p: IpsecPeer) -> str:
         return f"IKE-{p.name}" + (f"-{p.seq}" if not p.profile else "")
 
+    def policies(self) -> None:
+        """Prefix lists, then the route policies that match them."""
+        routemap_text.items(self.device, self.report)
+        for pl in self.device.prefix_lists.values():
+            self.out += routemap_text.comware_prefix_lines(pl)
+        if self.device.prefix_lists:
+            self.block_end()
+        for rm in self.device.route_maps.values():
+            self.out += routemap_text.comware_route_policy_lines(rm, self.report, _IND)
+
     def bgp(self) -> None:
         bgp = self.device.bgp
         assert bgp is not None
@@ -1064,9 +1078,12 @@ class Writer:
                     mask = str(net.netmask) if net.version == 4 else str(net.prefixlen)
                     body.append(f"network {net.network_address} {mask}")
             for source in bgp.redistribute6 if af == "ipv6" else bgp.redistribute:
+                rm = bgp.redistribute_maps.get(source) if af == "ipv4" else None
+                written = source
                 if source == "ospf":
-                    source = f"ospf {self.device.ospf[0].process if self.device.ospf else 1}"
-                body.append(f"import-route {'direct' if source == 'connected' else source}")
+                    written = f"ospf {self.device.ospf[0].process if self.device.ospf else 1}"
+                body.append(f"import-route {'direct' if written == 'connected' else written}" +
+                            (f" route-policy {rm}" if rm else ""))
             for group in bgp.peer_groups.values():
                 if any(af in n.families for n in bgp.neighbors if n.peer_group == group.address):
                     body += self._bgp_af_options(group)
@@ -1103,6 +1120,11 @@ class Writer:
             lines.append(f"peer {peer.address} next-hop-local")
         if peer.send_community:
             lines.append(f"peer {peer.address} advertise-community")
+        for kind, attr in (("route-policy", "route_map"), ("prefix-list", "prefix_list")):
+            for direction, word in (("in", "import"), ("out", "export")):
+                name = getattr(peer, f"{attr}_{direction}")
+                if name:
+                    lines.append(f"peer {peer.address} {kind} {name} {word}")
         return lines
 
     def _vrrp(self, g: FhrpGroup, add: fhrp.Add) -> List[str]:

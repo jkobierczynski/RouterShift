@@ -15,6 +15,7 @@ from routershift import stp as stp_text
 from routershift import wlan as wlan_text
 from routershift import vpn as vpn_text
 from routershift import vrfs as vrfs_text
+from routershift import routemap as routemap_text
 from routershift import ospf as ospf_text
 from routershift.acl import safe_name
 from routershift.convert import PLATFORMS, convert, parse
@@ -278,4 +279,25 @@ def test_converts_and_reads_back(source: str, target: str) -> None:
             assert back.mlag.peer_address == first.mlag.peer_address
     elif first.mlag is not None:
         assert back.mlag is None and "multi-chassis LAG" in report.to_text()
+    # prefix lists and route maps keep every entry (AOS-CX route maps match no ACL), and BGP neighbors and
+    # redistribution keep the ones they apply; AOS-S writes none
+    if target in routemap_text.SUPPORTED:
+        prefixes = lambda dev: {n: (p.family, p.entries) for n, p in dev.prefix_lists.items()}  # noqa: E731
+        assert prefixes(back) == prefixes(first)
+
+        def entries(dev: Device) -> dict:
+            return {n: [(e.seq, e.action, e.match_prefix_lists, e.match_prefix_lists6,
+                         [] if target == "aoscx" else [safe_name(a) for a in e.match_acls], e.match_tags, e.sets,
+                         e.community_additive) for e in rm.entries] for n, rm in dev.route_maps.items()}
+        assert entries(back) == entries(first)
+        policies = lambda dev: [(n.route_map_in, n.route_map_out, n.prefix_list_in, n.prefix_list_out)  # noqa: E731
+                                for n in bgp_text.flat(dev.bgp)] if dev.bgp else []
+        assert policies(back) == policies(first)
+        if first.bgp is not None:
+            assert back.bgp is not None and back.bgp.redistribute_maps == first.bgp.redistribute_maps
+        assert [p.redistribute_maps for p in back.ospf] == [p.redistribute_maps for p in first.ospf]
+    else:
+        assert not back.route_maps and not back.prefix_lists
+        if first.route_maps:
+            assert "route maps are not written" in report.to_text()
     assert report.counts()

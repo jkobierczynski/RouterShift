@@ -272,6 +272,7 @@ class Ospf:
     active_interfaces: List[str] = field(default_factory=list)  # not passive although the default is
     area_types: Dict[str, str] = field(default_factory=dict)  # area -> "stub", "stub no-summary", "nssa", ...
     redistribute: List[str] = field(default_factory=list)  # "connected", "static", "bgp"
+    redistribute_maps: Dict[str, str] = field(default_factory=dict)  # source -> route map that filters it
     default_originate: str = ""  # "", "on", "always"
     reference_bandwidth: Optional[int] = None  # Mbit/s
     origin: Origin = field(default_factory=Origin)
@@ -296,6 +297,10 @@ class BgpNeighbor:
     next_hop_self: bool = False
     send_community: bool = False
     families: List[str] = field(default_factory=list)  # address families it is active in: "ipv4", "ipv6"
+    route_map_in: str = ""  # route map on received routes, in every address family the neighbor is active in
+    route_map_out: str = ""
+    prefix_list_in: str = ""
+    prefix_list_out: str = ""
 
 
 @dataclass
@@ -307,6 +312,47 @@ class Bgp:
     networks: List[str] = field(default_factory=list)  # IPv4 and IPv6 prefixes
     redistribute: List[str] = field(default_factory=list)  # IPv4: "connected", "static", "ospf"
     redistribute6: List[str] = field(default_factory=list)  # IPv6
+    redistribute_maps: Dict[str, str] = field(default_factory=dict)  # IPv4 source -> route map that filters it
+    origin: Origin = field(default_factory=Origin)
+
+
+@dataclass
+class PrefixEntry:
+    seq: int
+    action: AclAction  # permit or deny
+    prefix: str  # CIDR
+    ge: Optional[int] = None  # prefix lengths from (greater or equal) ...
+    le: Optional[int] = None  # ... up to (less or equal)
+
+
+@dataclass
+class PrefixList:
+    name: str
+    family: str = "ipv4"  # "ipv4" or "ipv6"
+    entries: List[PrefixEntry] = field(default_factory=list)
+    origin: Origin = field(default_factory=Origin)
+
+
+@dataclass
+class RouteMapEntry:
+    """One numbered entry (IOS sequence, Comware node). Sets use neutral keys: local-preference, metric, weight, tag,
+    next-hop, origin (igp, incomplete), as-path-prepend (AS numbers, space separated), community (space separated)."""
+
+    seq: int
+    action: AclAction  # permit or deny
+    match_prefix_lists: List[str] = field(default_factory=list)  # IPv4
+    match_prefix_lists6: List[str] = field(default_factory=list)  # IPv6
+    match_acls: List[str] = field(default_factory=list)
+    match_tags: List[int] = field(default_factory=list)
+    sets: Dict[str, str] = field(default_factory=dict)
+    community_additive: bool = False  # the communities are added to the ones the route has
+    description: str = ""
+
+
+@dataclass
+class RouteMap:
+    name: str
+    entries: List[RouteMapEntry] = field(default_factory=list)
     origin: Origin = field(default_factory=Origin)
 
 
@@ -633,6 +679,8 @@ class Device:
     ospf: List[Ospf] = field(default_factory=list)
     bgp: Optional[Bgp] = None
     acls: Dict[str, Acl] = field(default_factory=dict)
+    prefix_lists: Dict[str, PrefixList] = field(default_factory=dict)
+    route_maps: Dict[str, RouteMap] = field(default_factory=dict)
     dhcp_pools: List[DhcpPool] = field(default_factory=list)
     nat_pools: Dict[str, NatPool] = field(default_factory=dict)
     nat_rules: List[NatRule] = field(default_factory=list)

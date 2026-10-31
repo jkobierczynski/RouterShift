@@ -22,6 +22,7 @@ from .. import ospf as ospf_text
 from .. import l2sec as l2sec_text
 from .. import mgmt as mgmt_text
 from .. import vrfs as vrfs_text
+from .. import routemap as routemap_text
 from .. import qos as qos_text
 from .. import confparse, names
 from .. import dhcp as dhcp_text
@@ -145,6 +146,7 @@ class _Reader:
             "no": self.no_global,
             "management": self.management,
             "mlag": self.mlag,
+            "route-map": self.route_map,
         }
         for node in roots:
             if node.text.startswith(_NOISE) or node.text == "end":
@@ -334,9 +336,24 @@ class _Reader:
             return True
         return False
 
+    def policy_node(self, node: Node, bad: Optional[List[int]]) -> bool:
+        """Report the children a prefix list or route map reader did not understand."""
+        if bad is None:
+            return False
+        for n in bad:
+            self.unparsed(node.children[n], node.text)
+        return True
+
+    def route_map(self, node: Node) -> bool:
+        return self.policy_node(node, routemap_text.ios_route_map_node(
+            self.device, node.words, [c.words for c in node.children]))
+
     def ip(self, node: Node) -> bool:
         w = node.words
         m = self.device.management
+        if w[1:2] == ["prefix-list"]:
+            return self.policy_node(node, routemap_text.ios_prefix_list_node(
+                self.device, w, [c.words for c in node.children]))
         if w[1:] == ["dhcp", "snooping"]:
             self.device.dhcp_snooping = True
             return True
@@ -410,6 +427,9 @@ class _Reader:
 
     def ipv6(self, node: Node) -> bool:
         w = node.words
+        if w[1:2] == ["prefix-list"]:
+            return self.policy_node(node, routemap_text.ios_prefix_list_node(
+                self.device, w, [c.words for c in node.children]))
         if w[1:2] == ["unicast-routing"]:
             return True
         if w[1:2] == ["route"]:
@@ -1209,8 +1229,10 @@ class _Reader:
             bgp.networks.append(prefix)
         elif w[0] == "redistribute" and n >= 2 and w[1] in bgp_text.REDISTRIBUTE:
             rest = w[3:] if w[1] == "ospf" and n >= 3 and w[2].isdigit() else w[2:]
-            if rest:
-                return False  # a route map or metric
+            if rest[:1] == ["route-map"] and len(rest) == 2 and af != "ipv6":
+                bgp.redistribute_maps[w[1]] = rest[1]
+            elif rest:
+                return False  # a metric
             (bgp.redistribute6 if af == "ipv6" else bgp.redistribute).append(w[1])
         elif w[:2] == ["no", "neighbor"] and n == 4 and w[3] == "activate":
             b.activate(w[2], af or "ipv4", on=False)
@@ -1252,9 +1274,11 @@ class _Reader:
         elif w[0] == "area" and n in (3, 4) and w[2] in ("stub", "nssa") and w[3:] in ([], ["no-summary"]):
             p.area_types[ospf_text.area(w[1])] = " ".join(w[2:])
         elif w[0] == "redistribute" and n >= 2 and w[1] in ospf_text.REDISTRIBUTE:
-            rest = w[3:] if w[1] == "bgp" else w[2:]
-            if rest not in ([], ["subnets"]):
-                return False  # a route map or metric
+            rest = [x for x in (w[3:] if w[1] == "bgp" else w[2:]) if x != "subnets"]
+            if rest[:1] == ["route-map"] and len(rest) == 2:
+                p.redistribute_maps[w[1]] = rest[1]
+            elif rest:
+                return False  # a metric
             p.redistribute.append(w[1])
         elif w[:2] == ["default-information", "originate"] and w[2:] in ([], ["always"]):
             p.default_originate = "always" if n == 3 else "on"
@@ -2040,6 +2064,8 @@ def ioslike_neighbor(b: bgp_text.Builder, name: str, w: List[str], af: str) -> b
         peer.send_community = True
     elif w == ["activate"]:
         b.activate(name, af or "ipv4")
+    elif routemap_text.neighbor_policy(peer, w):
+        pass
     else:
         return False
     return True

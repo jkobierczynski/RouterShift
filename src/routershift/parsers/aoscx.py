@@ -22,6 +22,7 @@ import re
 from typing import Callable, Dict, List, Optional, Tuple
 
 from .. import acl as acl_text
+from .. import routemap as routemap_text
 from .. import bgp as bgp_text
 from .. import dhcp as dhcp_text
 from .. import fhrp
@@ -96,6 +97,7 @@ class _Reader:
             "clock": self.clock,
             "ip": self.ip,
             "ipv6": self.ipv6,
+            "route-map": self.route_map,
             "ntp": self.ntp,
             "logging": self.logging,
             "vrf": self.vrf,
@@ -153,8 +155,23 @@ class _Reader:
             return args[:-2]
         return args
 
+    def policy_node(self, node: Node, bad: Optional[List[int]]) -> bool:
+        """Report the children a prefix list or route map reader did not understand."""
+        if bad is None:
+            return False
+        for n in bad:
+            self.unparsed(node.children[n], node.text)
+        return True
+
+    def route_map(self, node: Node) -> bool:
+        return self.policy_node(node, routemap_text.ios_route_map_node(
+            self.device, node.words, [c.words for c in node.children]))
+
     def ip(self, node: Node) -> bool:
         w = node.words
+        if w[1:2] == ["prefix-list"]:
+            return self.policy_node(node, routemap_text.ios_prefix_list_node(
+                self.device, w, [c.words for c in node.children]))
         if w[1] == "source-interface" and len(w) >= 5 and w[2] in ("tftp", "syslog") and w[3] == "interface":
             end = w.index("vrf") if "vrf" in w else len(w)
             name = re.sub(r"^(vlan|loopback)(\d)", r"\1 \2", " ".join(w[4:end]))
@@ -182,6 +199,9 @@ class _Reader:
         return False
 
     def ipv6(self, node: Node) -> bool:
+        if node.words[1:2] == ["prefix-list"]:
+            return self.policy_node(node, routemap_text.ios_prefix_list_node(
+                self.device, node.words, [c.words for c in node.children]))
         if node.words[1:2] == ["route"]:
             return self.route(node, node.words[2:])
         return False
@@ -675,6 +695,10 @@ class _Reader:
         if w[0] == "network" and n == 2 and af:
             b.bgp.networks.append(str(ipaddress.ip_network(w[1])))
             return True
+        if w[0] == "redistribute" and n == 4 and w[1] in bgp_text.REDISTRIBUTE and w[2] == "route-map" and \
+                af == "ipv4":
+            b.bgp.redistribute_maps[w[1]] = w[3]
+            n = 2
         if w[0] == "redistribute" and n == 2 and w[1] in bgp_text.REDISTRIBUTE and af:
             (b.bgp.redistribute6 if af == "ipv6" else b.bgp.redistribute).append(w[1])
             return True
@@ -701,6 +725,8 @@ class _Reader:
             peer.next_hop_self = True
         elif args[0] == "send-community" and args[1:] in ([], ["standard"], ["both"]):
             peer.send_community = True
+        elif routemap_text.neighbor_policy(peer, args):
+            pass
         else:
             return False
         return True
@@ -716,8 +742,10 @@ class _Reader:
             ospf_text.area(w[1])  # declared; its interfaces say they are in it
         elif w[0] == "area" and n in (3, 4) and w[2] in ("stub", "nssa") and w[3:] in ([], ["no-summary"]):
             p.area_types[ospf_text.area(w[1])] = " ".join(w[2:])
-        elif w[0] == "redistribute" and n == 2 and w[1] in ospf_text.REDISTRIBUTE:
+        elif w[0] == "redistribute" and n in (2, 4) and w[1] in ospf_text.REDISTRIBUTE and w[2:3] in ([], ["route-map"]):
             p.redistribute.append(w[1])
+            if n == 4:
+                p.redistribute_maps[w[1]] = w[3]
         elif w[:2] == ["default-information", "originate"] and w[2:] in ([], ["always"]):
             p.default_originate = "always" if n == 3 else "on"
         elif w[0] == "reference-bandwidth" and n == 2:

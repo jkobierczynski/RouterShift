@@ -29,6 +29,7 @@ from .. import dhcp as dhcp_text
 from .. import ospf as ospf_text
 from .. import mgmt as mgmt_text
 from .. import vrfs as vrfs_text
+from .. import routemap as routemap_text
 from .. import qos as qos_text
 from .. import vpn as vpn_text
 from ..confparse import Node
@@ -163,6 +164,7 @@ class _Reader:
             "info-center": self.info_center,
             "ip": self.ip,
             "ipv6": self.ipv6,
+            "route-policy": self.route_policy,
             "vlan": self.vlan,
             "stp": self.stp,
             "interface": self.interface,
@@ -723,8 +725,25 @@ class _Reader:
                 return True
         return w[1:] == ["enable"]
 
+    def route_policy(self, node: Node) -> bool:
+        """route-policy NAME permit|deny node N, with if-match and apply lines."""
+        w = node.words
+        if len(w) != 5 or w[2] not in ("permit", "deny") or w[3] != "node" or not w[4].isdigit():
+            return False
+        e = routemap_text.entry(routemap_text.route_map(self.device, w[1]), int(w[4]), w[2])
+        for child in node.children:
+            try:
+                ok = routemap_text.comware_route_policy_line(e, child.words)
+            except ValueError:
+                ok = False
+            if not ok:
+                self.unparsed(child, node.text)
+        return True
+
     def ip(self, node: Node) -> bool:
         w = node.words
+        if w[1:2] == ["prefix-list"]:
+            return routemap_text.comware_prefix_entry(self.device, w)
         if w[1:] in (["http", "enable"], ["https", "enable"]):
             setattr(self.device.management, w[1], True)
             return True
@@ -750,6 +769,8 @@ class _Reader:
         return False
 
     def ipv6(self, node: Node) -> bool:
+        if node.words[1:2] == ["prefix-list"]:
+            return routemap_text.comware_prefix_entry(self.device, node.words)
         if node.words[1:2] == ["route-static"]:
             return self.route(node, node.words[2:], 6)
         return False
@@ -1256,8 +1277,11 @@ class _Reader:
                 group.remote_as = group.remote_as or bgp.local_as
         elif w[0] == "network" and n in (2, 3) and af:
             bgp.networks.append(str(ipaddress.ip_network(f"{w[1]}/{w[2]}" if n == 3 else w[1])))
-        elif w[0] == "import-route" and n in (2, 3) and w[1] in ("direct", "static", "ospf") and af:
-            if n == 3 and w[1] != "ospf":
+        elif w[0] == "import-route" and n >= 2 and w[1] in ("direct", "static", "ospf") and af:
+            rest = w[3:] if w[1] == "ospf" and n >= 3 and w[2].isdigit() else w[2:]
+            if rest[:1] == ["route-policy"] and len(rest) == 2 and af == "ipv4":
+                bgp.redistribute_maps["connected" if w[1] == "direct" else w[1]] = rest[1]
+            elif rest:
                 return False
             (bgp.redistribute6 if af == "ipv6" else bgp.redistribute).append(
                 "connected" if w[1] == "direct" else w[1])
@@ -1287,6 +1311,8 @@ class _Reader:
                 peer.next_hop_self = True
             elif args == ["advertise-community"]:
                 peer.send_community = True
+            elif routemap_text.neighbor_policy(peer, args):
+                pass
             else:
                 return False
         else:
@@ -1336,8 +1362,11 @@ class _Reader:
             p.passive_interfaces.append(canonical(w[1])[0])
         elif w[:2] == ["undo", "silent-interface"] and n == 3:
             p.active_interfaces.append(canonical(w[2])[0])
-        elif w[0] == "import-route" and n == 2 and w[1] in ("direct", "static", "bgp"):
+        elif w[0] == "import-route" and n in (2, 4) and w[1] in ("direct", "static", "bgp") and \
+                w[2:3] in ([], ["route-policy"]):
             p.redistribute.append("connected" if w[1] == "direct" else w[1])
+            if n == 4:
+                p.redistribute_maps[p.redistribute[-1]] = w[3]
         elif w[0] == "default-route-advertise" and w[1:] in ([], ["always"]):
             p.default_originate = "always" if n == 2 else "on"
         elif w[0] == "bandwidth-reference" and n == 2:

@@ -34,7 +34,9 @@ Layer 2 security converts as well: DHCP snooping, ARP inspection, IP source guar
 control.
 VRF route leaking (route distinguisher, import and export route targets) and multi-chassis LAG pairs
 (EOS MLAG and AOS-CX VSX, flagged on IOS, AOS-S and Comware) convert too.
-Everything else (route maps, LDAP, ...) is listed in the report under "Not understood", line by
+Prefix lists and route maps (Comware route policies) convert with the BGP neighbors and
+redistribution that apply them.
+Everything else (PBR, LDAP, ...) is listed in the report under "Not understood", line by
 line, with secrets masked.
 
 ## Usage

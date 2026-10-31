@@ -10,6 +10,7 @@ import ipaddress
 from typing import Callable, Dict, List, Tuple
 
 from .. import acl as acl_text
+from .. import routemap as routemap_text
 from .. import bgp as bgp_text
 from .. import dhcp as dhcp_text
 from .. import l2sec as l2sec_text
@@ -57,6 +58,7 @@ class Writer:
         self.vrfs()
         self.spanning_tree()
         self.acls()
+        self.policies()
         self.qos()
         self.vlans()
         self.groups = {i.name: fhrp.plan(i, "aoscx", self.report, self.port(i.name))
@@ -683,7 +685,8 @@ class Writer:
         if p.passive_default:
             lines.append("passive-interface default")
         for source in p.redistribute:
-            lines.append(f"redistribute {source}")
+            rm = p.redistribute_maps.get(source)
+            lines.append(f"redistribute {source}" + (f" route-map {rm}" if rm else ""))
         if p.default_originate:
             lines.append("default-information originate" + (" always" if p.default_originate == "always" else ""))
         for dotted in sorted(set(areas.values()) | set(p.area_types), key=ospf_text.area_number):
@@ -717,6 +720,14 @@ class Writer:
                 self.out.append(f"{_IND}pool {pool.name.replace(' ', '_')}")
                 self.out += [_IND * 2 + line for line in lines]
             self.out.append(f"{_IND}enable")
+
+    def policies(self) -> None:
+        """Prefix lists, then the route maps that match them."""
+        routemap_text.items(self.device, self.report)
+        for pl in self.device.prefix_lists.values():
+            self.out += routemap_text.ios_prefix_lines(pl, "aoscx")
+        for rm in self.device.route_maps.values():
+            self.out += routemap_text.ios_route_map_lines(rm, "aoscx", self.report, _IND)
 
     def bgp(self) -> None:
         bgp = self.device.bgp
@@ -752,8 +763,15 @@ class Writer:
                         body.append(f"neighbor {peer.address} next-hop-self")
                     if peer.send_community:
                         body.append(f"neighbor {peer.address} send-community standard")
+                    for kind in ("route-map", "prefix-list"):
+                        for direction in ("in", "out"):
+                            name = getattr(peer, f"{kind.replace('-', '_')}_{direction}")
+                            if name:
+                                body.append(f"neighbor {peer.address} {kind} {name} {direction}")
             body += [f"network {p}" for p in bgp.networks if (":" in p) == (af == "ipv6")]
-            body += [f"redistribute {r}" for r in (bgp.redistribute6 if af == "ipv6" else bgp.redistribute)]
+            for r in bgp.redistribute6 if af == "ipv6" else bgp.redistribute:
+                rm = bgp.redistribute_maps.get(r) if af == "ipv4" else None
+                body.append(f"redistribute {r}" + (f" route-map {rm}" if rm else ""))
             if body:
                 lines.append(f"address-family {af} unicast")
                 lines += [_IND + line for line in body]
