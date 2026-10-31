@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 import ipaddress
-from typing import Callable, Dict, List
+from typing import Callable, Dict, List, Optional
 
 from .. import acl as acl_text
 from .. import bgp as bgp_text
@@ -16,6 +16,7 @@ from .. import fhrp
 from .. import nat as nat_text
 from .. import ospf as ospf_text
 from .. import snmp as snmp_text
+from .. import stp as stp_text
 from .. import aaa as aaa_text
 from .. import vpn as vpn_text
 from ..model import (AaaMethod, AaaServer, LocalUser, AclAction, Bgp, BgpNeighbor, Device, DhcpPool, IkePolicy, IpsecPeer, NatRule, SnmpGroup, FhrpGroup, Interface, InterfaceKind, LacpMode, Ospf,
@@ -115,21 +116,39 @@ class Writer:
 
     def spanning_tree(self) -> None:
         mode = self.device.stp_mode
-        if mode is None:
-            return
+        written: Optional[StpMode] = mode
         table = _STP[self.target]
-        if mode in table:
-            self.out += [f"spanning-tree mode {table[mode]}", "!"]
+        if mode is None:
+            written = StpMode.PVST if self.ios else StpMode.MSTP  # the defaults
+        elif mode in table:
+            self.out.append(f"spanning-tree mode {table[mode]}")
             self.report.item("system", "spanning-tree mode")
-            return
-        if mode == StpMode.NONE:
+        elif mode == StpMode.NONE:
             self.report.add("system", "spanning-tree mode", Severity.REVIEW, "stp-none",
                             "spanning tree is off on the source; IOS cannot switch it off globally, left at its default")
-            return
-        fallback = _STP_FALLBACK[mode]
-        self.out += [f"spanning-tree mode {table[fallback]}", "!"]
-        self.report.add("system", "spanning-tree mode", Severity.APPROX, "stp-mode",
-                        f"{mode.value} is not available, written as {fallback.value}")
+            written = StpMode.PVST
+        else:
+            written = _STP_FALLBACK[mode]
+            self.out.append(f"spanning-tree mode {table[written]}")
+            self.report.add("system", "spanning-tree mode", Severity.APPROX, "stp-mode",
+                            f"{mode.value} is not available, written as {written.value}")
+        instances, vlans = stp_text.priorities(self.device, written, self.report)
+        for instance, priority in sorted(instances.items()):
+            self.out.append(f"spanning-tree priority {priority}" if written == StpMode.RSTP else
+                            f"spanning-tree mst {instance} priority {priority}")
+        for priority in sorted(set(vlans.values())):
+            members = stp_text.vlan_text([v for v, p in vlans.items() if p == priority])
+            self.out.append(f"spanning-tree {'vlan' if self.ios else 'vlan-id'} {members} priority {priority}")
+        if instances or vlans:
+            self.report.item("system", "bridge priority")
+        s = self.device.stp
+        if stp_text.region(self.device, written, self.report):
+            self.out.append("spanning-tree mst configuration")
+            self.out += [f"{self.ind}name {s.region}"] if s.region else []
+            self.out += [f"{self.ind}revision {s.revision}"] if s.revision is not None else []
+            self.out += [f"{self.ind}instance {n} vlan {stp_text.vlan_text(v)}" for n, v in sorted(s.instances.items())]
+        if self.out and self.out[-1] != "!":
+            self.out.append("!")
 
     def vrfs(self) -> None:
         for name in self.device.vrfs:
@@ -206,6 +225,14 @@ class Writer:
             lines.append("spanning-tree portfast trunk" if self.ios and trunk else "spanning-tree portfast")
         if iface.stp_bpduguard is not None:
             lines.append(f"spanning-tree bpduguard {'enable' if iface.stp_bpduguard else 'disable'}")
+        if iface.stp_guard:
+            lines.append(f"spanning-tree guard {iface.stp_guard}")
+        if iface.stp_bpdufilter:
+            lines.append(f"spanning-tree bpdufilter {'enable' if self.ios else 'enabled'}")
+        if iface.stp_cost is not None:
+            lines.append(f"spanning-tree cost {iface.stp_cost}")
+        if iface.stp_port_priority is not None:
+            lines.append(f"spanning-tree port-priority {iface.stp_port_priority}")
         lines.append("shutdown" if iface.shutdown else "no shutdown")
         self.out.append(f"interface {name}")
         self.out += [self.ind + line for line in lines]

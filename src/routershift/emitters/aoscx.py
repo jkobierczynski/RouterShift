@@ -17,6 +17,7 @@ from .. import vpn as vpn_text
 from .. import fhrp
 from .. import ospf as ospf_text
 from .. import snmp as snmp_text
+from .. import stp as stp_text
 from .. import aaa as aaa_text
 from ..parsers.aoscx import AOSCX_ROLES
 from ..model import Device, Interface, Ospf, InterfaceKind, LacpMode, StaticRoute, StpMode, SwitchportMode
@@ -336,24 +337,35 @@ class Writer:
         mode = self.device.stp_mode
         if mode == StpMode.NONE or (mode is None and not self.is_switch):
             return
+        self.out.append("spanning-tree")
+        written = StpMode.RAPID_PVST if mode in (StpMode.RAPID_PVST, StpMode.PVST) else StpMode.MSTP
+        if written == StpMode.RAPID_PVST:
+            self.out.append("spanning-tree mode rpvst")
         if mode is None:
-            self.out.append("spanning-tree")
             self.report.add("system", "spanning-tree mode", Severity.APPROX, "stp-default",
                             "the source runs spanning tree in its default mode; AOS-CX has it off until enabled, "
                             "so MSTP is switched on")
-            return
-        if mode in (StpMode.MSTP, StpMode.RAPID_PVST):
-            self.out.append("spanning-tree")
-            if mode == StpMode.RAPID_PVST:
-                self.out.append("spanning-tree mode rpvst")
+        elif mode in (StpMode.MSTP, StpMode.RAPID_PVST):
             self.report.item("system", "spanning-tree mode")
-            return
-        target = "rpvst" if mode == StpMode.PVST else "mstp"
-        self.out.append("spanning-tree")
-        if target == "rpvst":
-            self.out.append("spanning-tree mode rpvst")
-        self.report.add("system", "spanning-tree mode", Severity.APPROX, "stp-mode",
-                        f"{mode.value} is not available on AOS-CX, written as {target}")
+        else:
+            self.report.add("system", "spanning-tree mode", Severity.APPROX, "stp-mode",
+                            f"{mode.value} is not available on AOS-CX, written as "
+                            f"{'rpvst' if written == StpMode.RAPID_PVST else 'mstp'}")
+        s = self.device.stp
+        if stp_text.region(self.device, written, self.report):
+            self.out += [f"spanning-tree config-name {s.region}"] if s.region else []
+            self.out += [f"spanning-tree config-revision {s.revision}"] if s.revision is not None else []
+            self.out += [f"spanning-tree instance {n} vlan {stp_text.vlan_text(v)}"
+                         for n, v in sorted(s.instances.items())]
+        instances, vlans = stp_text.priorities(self.device, written, self.report)
+        for instance, priority in sorted(instances.items()):  # AOS-CX counts priorities in steps of 4096
+            self.out.append(f"spanning-tree priority {priority // 4096}" if instance == 0 else
+                            f"spanning-tree instance {instance} priority {priority // 4096}")
+        for priority in sorted(set(vlans.values())):
+            members = stp_text.vlan_text([v for v, p in vlans.items() if p == priority])
+            self.out.append(f"spanning-tree vlan {members} priority {priority // 4096}")
+        if instances or vlans:
+            self.report.item("system", "bridge priority")
 
     def acls(self) -> None:
         for acl in self.device.acls.values():
@@ -432,6 +444,14 @@ class Writer:
             lines.append("spanning-tree port-type admin-edge")
         if iface.stp_bpduguard:
             lines.append("spanning-tree bpdu-guard")
+        if iface.stp_guard:
+            lines.append(f"spanning-tree {iface.stp_guard}-guard")
+        if iface.stp_bpdufilter:
+            lines.append("spanning-tree bpdu-filter")
+        if iface.stp_cost is not None:
+            lines.append(f"spanning-tree cost {iface.stp_cost}")
+        if iface.stp_port_priority is not None:
+            lines.append(f"spanning-tree port-priority {iface.stp_port_priority // 16}")
         self.out.append(f"interface {name}")
         self.out += [_IND + line for line in lines]
         if (iface.source_name or iface.name, name) in self.port.renumbered:

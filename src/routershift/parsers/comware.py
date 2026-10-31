@@ -672,6 +672,29 @@ class _Reader:
         if w[1:] == ["global", "disable"] or w[:3] == ["undo", "stp", "global"]:
             self.device.stp_mode = StpMode.NONE
             return True
+        stp = self.device.stp
+        if w[1] == "priority" and len(w) == 3:
+            stp.priority[0] = int(w[2])
+            return True
+        if w[1] == "instance" and len(w) == 5 and w[3] == "priority":
+            stp.priority[int(w[2])] = int(w[4])
+            return True
+        if w[1] == "vlan" and len(w) >= 5 and w[-2] == "priority":  # stp vlan 10 20 to 30 priority N
+            for vlan in vlan_list(w[2:-2]):
+                stp.vlan_priority[vlan] = int(w[-1])
+            return True
+        if w[1:] == ["region-configuration"]:
+            for child in node.children:
+                c = child.words
+                if c[0] == "region-name" and len(c) == 2:
+                    stp.region = c[1]
+                elif c[0] == "revision-level" and len(c) == 2:
+                    stp.revision = int(c[1])
+                elif c[0] == "instance" and len(c) >= 4 and c[2] == "vlan":
+                    stp.instances.setdefault(int(c[1]), []).extend(vlan_list(c[3:]))
+                elif c != ["active", "region-configuration"]:
+                    self.unparsed(child, node.text)
+            return True
         return False
 
     # access lists ----------------------------------------------------------------------------------------------------
@@ -1301,6 +1324,14 @@ class _Reader:
             iface.mtu = int(w[1])
         elif w[:2] == ["stp", "edged-port"] and w[2:] in ([], ["enable"]):
             iface.stp_portfast = True
+        elif w in (["stp", "root-protection"], ["stp", "loop-protection"]):
+            iface.stp_guard = w[1][:-len("-protection")]
+        elif w == ["stp", "port", "bpdu-filter", "enable"]:
+            iface.stp_bpdufilter = True
+        elif w[:2] == ["stp", "cost"] and n == 3:
+            iface.stp_cost = int(w[2])
+        elif w[:3] == ["stp", "port", "priority"] and n == 4:
+            iface.stp_port_priority = int(w[3])
         else:
             return False
         return True

@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import ipaddress
 import re
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from .. import acl as acl_text
 from .. import dhcp as dhcp_text
@@ -22,6 +22,7 @@ from .. import nat as nat_text
 from .. import vpn as vpn_text
 from .. import fhrp
 from .. import ospf as ospf_text
+from .. import stp as stp_text
 from .. import snmp as snmp_text
 from .. import aaa as aaa_text
 from ..model import Device, FhrpGroup, Interface, InterfaceKind, LacpMode, StaticRoute, StpMode, SwitchportMode, Vlan
@@ -768,28 +769,60 @@ class Writer:
         if mode == StpMode.NONE or (mode is None and not is_switch):
             return
         self.out.append("spanning-tree")
+        written = StpMode.MSTP
         if mode is None:
             self.report.add("system", "spanning-tree mode", Severity.APPROX, "stp-default",
                             "the source runs spanning tree in its default mode; AOS-S has it off until enabled, so "
                             "MSTP is switched on")
         elif mode == StpMode.RSTP:
+            written = StpMode.RSTP
             self.out.append("spanning-tree force-version rstp-operation")
             self.report.item("system", "spanning-tree mode")
         elif mode == StpMode.RAPID_PVST:
+            written = StpMode.RAPID_PVST
             self.out.append("spanning-tree mode rapid-pvst")
             self.report.item("system", "spanning-tree mode")
         elif mode == StpMode.MSTP:
             self.report.item("system", "spanning-tree mode")
         else:
+            written = StpMode.RAPID_PVST
             self.out.append("spanning-tree mode rapid-pvst")
             self.report.add("system", "spanning-tree mode", Severity.APPROX, "stp-mode",
                             f"{mode.value} is not available on AOS-S, written as rapid-pvst")
-        edge = [self.port(i.name) for i in self.device.interfaces.values() if i.stp_portfast and not i.lag]
-        guard = [self.port(i.name) for i in self.device.interfaces.values() if i.stp_bpduguard and not i.lag]
-        if edge:
-            self.out.append(f"spanning-tree {port_list(edge)} admin-edge-port")
-        if guard:
-            self.out.append(f"spanning-tree {port_list(guard)} bpdu-protection")
+        s = self.device.stp
+        if stp_text.region(self.device, written, self.report):
+            self.out += [f"spanning-tree config-name {_quote(s.region)}"] if s.region else []
+            self.out += [f"spanning-tree config-revision {s.revision}"] if s.revision is not None else []
+            self.out += [f"spanning-tree instance {n} vlan {stp_text.vlan_text(v).replace(',', ' ')}"
+                         for n, v in sorted(s.instances.items())]
+        instances, vlans = stp_text.priorities(self.device, written, self.report)
+        for instance, priority in sorted(instances.items()):  # AOS-S counts priorities in steps of 4096
+            self.out.append(f"spanning-tree priority {priority // 4096}" if instance == 0 else
+                            f"spanning-tree instance {instance} priority {priority // 4096}")
+        for priority in sorted(set(vlans.values())):
+            members = stp_text.vlan_text([v for v, p in vlans.items() if p == priority])
+            self.out.append(f"spanning-tree vlan {members} priority {priority // 4096}")
+        if instances or vlans:
+            self.report.item("system", "bridge priority")
+        ifaces = [i for i in self.device.interfaces.values() if not i.lag and i.kind != InterfaceKind.VLAN]
+
+        def ports_with(test: Callable[[Interface], bool]) -> str:
+            return port_list([self.port(i.name) for i in ifaces if test(i)])
+
+        for word, test in (("admin-edge-port", lambda i: bool(i.stp_portfast)),
+                           ("bpdu-protection", lambda i: bool(i.stp_bpduguard)),
+                           ("root-guard", lambda i: i.stp_guard == "root"),
+                           ("bpdu-filter", lambda i: i.stp_bpdufilter)):
+            if ports_with(test):
+                self.out.append(f"spanning-tree {ports_with(test)} {word}")
+        for i in ifaces:
+            if i.stp_cost is not None:
+                self.out.append(f"spanning-tree {self.port(i.name)} path-cost {i.stp_cost}")
+            if i.stp_port_priority is not None:
+                self.out.append(f"spanning-tree {self.port(i.name)} priority {i.stp_port_priority // 16}")
+            if i.stp_guard == "loop":
+                self.report.add("interface", f"{i.source_name or i.name} -> {self.port(i.name)}", Severity.REVIEW,
+                                "stp-loop-guard", "AOS-S has no spanning tree loop guard; consider 'loop-protect'")
 
 
 def emit(device: Device, ports: PortMapper, report: Report) -> str:

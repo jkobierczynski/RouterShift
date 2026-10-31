@@ -142,6 +142,10 @@ class Interface:
     acl6_out: str = ""
     stp_portfast: Optional[bool] = None
     stp_bpduguard: Optional[bool] = None
+    stp_guard: str = ""  # "root" or "loop"
+    stp_bpdufilter: bool = False
+    stp_cost: Optional[int] = None
+    stp_port_priority: Optional[int] = None  # 0-240 in steps of 16; None = the default, 128
     fhrp: List["FhrpGroup"] = field(default_factory=list)
     nat: str = ""  # "inside", "outside" or ""
     ospf_cost: Optional[int] = None
@@ -495,6 +499,18 @@ class Aaa:
 
 
 @dataclass
+class Stp:
+    """Spanning tree beyond its mode: bridge priorities and the MST region."""
+
+    priority: Dict[int, int] = field(default_factory=dict)  # MST instance (0: the common tree, or the one tree of
+    # STP/RSTP) -> bridge priority, 0-61440 in steps of 4096
+    vlan_priority: Dict[int, int] = field(default_factory=dict)  # PVST: VLAN -> bridge priority
+    region: str = ""  # MST region name
+    revision: Optional[int] = None
+    instances: Dict[int, List[int]] = field(default_factory=dict)  # MST instance -> VLANs
+
+
+@dataclass
 class Unparsed:
     """A line or block of the source no parser section claimed."""
 
@@ -522,6 +538,7 @@ class Device:
     ipsec_peers: List[IpsecPeer] = field(default_factory=list)
     psks: Dict[str, PreSharedKey] = field(default_factory=dict)  # by peer address
     stp_mode: Optional[StpMode] = None
+    stp: Stp = field(default_factory=Stp)
     snmp: Snmp = field(default_factory=Snmp)
     users: List[LocalUser] = field(default_factory=list)
     aaa: Aaa = field(default_factory=Aaa)

@@ -1181,12 +1181,39 @@ class _Reader:
 
     def spanning_tree(self, node: Node) -> bool:
         w = node.words
+        stp = self.device.stp
         if len(w) == 3 and w[1] == "mode":
             modes = {"pvst": StpMode.PVST, "rapid-pvst": StpMode.RAPID_PVST, "mst": StpMode.MSTP,
                      "mstp": StpMode.MSTP, "rstp": StpMode.RSTP, "none": StpMode.NONE}
             if w[2] in modes:
                 self.device.stp_mode = modes[w[2]]
                 return True
+        if w[1:] == ["extend", "system-id"]:
+            return True  # the IOS default
+        if w[1] in ("vlan", "vlan-id") and len(w) == 5 and w[3] == "priority":
+            # IOS: spanning-tree vlan 10,20 priority N; EOS: spanning-tree vlan-id 10 priority N
+            for vlan in _vlan_ids(w[2]):
+                stp.vlan_priority[vlan] = int(w[4])
+            return True
+        if w[1] == "mst" and len(w) == 5 and w[3] == "priority":
+            for instance in _vlan_ids(w[2]):
+                stp.priority[instance] = int(w[4])
+            return True
+        if w[1] == "priority" and len(w) == 3:  # EOS rstp
+            stp.priority[0] = int(w[2])
+            return True
+        if w[1:] == ["mst", "configuration"]:
+            for child in node.children:
+                c = child.words
+                if c[0] == "name" and len(c) == 2:
+                    stp.region = c[1]
+                elif c[0] == "revision" and len(c) == 2:
+                    stp.revision = int(c[1])
+                elif c[0] == "instance" and len(c) == 4 and c[2] == "vlan":
+                    stp.instances.setdefault(int(c[1]), []).extend(_vlan_ids(c[3]))
+                else:
+                    self.unparsed(child, node.text)
+            return True
         return False
 
     def vlan(self, node: Node) -> bool:
@@ -1513,6 +1540,15 @@ class _Reader:
             iface.stp_portfast = True
         elif w[:2] == ["spanning-tree", "bpduguard"] and n == 3:
             iface.stp_bpduguard = w[2] == "enable"
+        elif w[:2] == ["spanning-tree", "guard"] and n == 3 and w[2] in ("root", "loop", "none"):
+            iface.stp_guard = "" if w[2] == "none" else w[2]
+        elif w[:2] == ["spanning-tree", "bpdufilter"] and n == 3 and w[2] in ("enable", "enabled", "disable",
+                                                                               "disabled"):
+            iface.stp_bpdufilter = w[2].startswith("enable")
+        elif w[:2] == ["spanning-tree", "cost"] and n == 3:
+            iface.stp_cost = int(w[2])
+        elif w[:2] == ["spanning-tree", "port-priority"] and n == 3:
+            iface.stp_port_priority = int(w[2])
         elif w[0] in ("authentication", "access-session", "dot1x", "mab") and n >= 1:
             return self.dot1x_line(iface, w)
         else:

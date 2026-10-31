@@ -30,7 +30,7 @@ from ..errors import ParseError
 from ..model import (AaaGroup, AaaMethod, AaaServer, Acl, Device, LocalUser, DhcpPool, FhrpGroup, NtpKey, SnmpCommunity, SnmpGroup, SnmpHost, SnmpUser, Interface, InterfaceKind, LacpMode, Origin, StaticRoute, StpMode,
                      SwitchportMode, Unparsed, Vlan)
 from ..timezones import utc
-from .ioslike import _cidr, _is_address
+from .ioslike import _cidr, _is_address, _vlan_ids
 
 OOBM_VRF = "oobm"
 
@@ -704,6 +704,41 @@ class _Reader:
             return True
         if w[1:] == ["mode", "mstp"]:
             self.device.stp_mode = StpMode.MSTP
+            return True
+        stp = self.device.stp
+        # priorities are multipliers: of 4096 for the bridge, of 16 for a port
+        if w[1] == "priority" and len(w) == 3:
+            stp.priority[0] = int(w[2]) * 4096
+            return True
+        if w[1] in ("instance", "vlan") and len(w) == 5 and w[3] == "priority":
+            if w[1] == "instance":
+                stp.priority[int(w[2])] = int(w[4]) * 4096
+            else:
+                for vlan in _vlan_ids(w[2]):
+                    stp.vlan_priority[vlan] = int(w[4]) * 4096
+            return True
+        if w[1] == "instance" and len(w) >= 5 and w[3] == "vlan":
+            stp.instances.setdefault(int(w[2]), []).extend(_vlan_ids(",".join(w[4:])))
+            return True
+        if w[1] == "config-name" and len(w) == 3:
+            stp.region = unquote(w[2])
+            return True
+        if w[1] == "config-revision" and len(w) == 3:
+            stp.revision = int(w[2])
+            return True
+        if len(w) == 3 and w[2] in ("root-guard", "bpdu-filter"):
+            for name in ports(w[1]):
+                if w[2] == "root-guard":
+                    self.port(name).stp_guard = "root"
+                else:
+                    self.port(name).stp_bpdufilter = True
+            return True
+        if len(w) == 4 and w[2] in ("path-cost", "priority"):
+            for name in ports(w[1]):
+                if w[2] == "path-cost":
+                    self.port(name).stp_cost = int(w[3])
+                else:
+                    self.port(name).stp_port_priority = int(w[3]) * 16
             return True
         if len(w) == 3 and w[2] in ("admin-edge-port", "bpdu-protection"):
             for name in ports(w[1]):
