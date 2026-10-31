@@ -27,6 +27,7 @@ from .. import vpn as vpn_text
 from .. import vrfs as vrfs_text
 from .. import multicast as multicast_text
 from .. import monitor as monitor_text
+from .. import vxlan as vxlan_text
 from .. import tracking as tracking_text
 from .. import hosts as hosts_text
 from .. import bfd as bfd_text
@@ -112,6 +113,7 @@ class Writer:
         self.acls()
         self.qos()
         self.monitor()
+        vxlan_text.unsupported(self.device, self.report, "AOS-S")
         tracking_text.plan(self.device, self.report, "aoss", "AOS-S")
         self.interfaces()
         self.l2sec()

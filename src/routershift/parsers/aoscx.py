@@ -22,6 +22,7 @@ import re
 from typing import Callable, Dict, List, Optional, Tuple
 
 from .. import monitor as monitor_text
+from .. import vxlan as vxlan_text
 from .. import acl as acl_text
 from .. import bfd as bfd_text
 from .. import routemap as routemap_text
@@ -79,6 +80,7 @@ class _Reader:
         self._class_acls: List[Tuple[QosClass, Acl]] = []
         self._client_limit: Dict[str, int] = {}  # port access, per port
         self._auth_mode: Dict[str, str] = {}
+        self._vxlan_source = ""  # interface vxlan: source ip, resolved to its interface at the end
         self._sflow_global = False  # sflow: every port samples unless ports name themselves
 
     def unparsed(self, node: Node, section: str = "") -> None:
@@ -122,6 +124,7 @@ class _Reader:
             "dhcpv4-snooping": lambda node: node.words == ["dhcpv4-snooping"] and self._snooping(),
             "vsx": self.vsx,
             "mirror": self.mirror,
+            "evpn": self.evpn,
             "sflow": self.sflow,
             "ssh": self.server,
             "https-server": self.server,
@@ -742,6 +745,8 @@ class _Reader:
             af = ""
             if w[0] == "address-family" and w[1:] in (["ipv4", "unicast"], ["ipv6", "unicast"]):
                 af = w[1]
+            elif w == ["address-family", "l2vpn", "evpn"]:
+                af = "evpn"
             elif w[0] == "address-family":
                 self.unparsed(child, node.text)
                 continue
@@ -795,6 +800,8 @@ class _Reader:
             peer.next_hop_self = True
         elif args[0] == "send-community" and args[1:] in ([], ["standard"], ["both"]):
             peer.send_community = True
+        elif args == ["send-community", "extended"]:  # implied for EVPN
+            pass
         elif args == ["fall-over", "bfd"]:
             peer.bfd = True
         elif routemap_text.neighbor_policy(peer, args):
@@ -844,7 +851,55 @@ class _Reader:
                 self.unparsed(child, node.text)
         return True
 
+    def vxlan_interface(self, node: Node) -> bool:
+        """interface vxlan 1 / source ip A / no shutdown / vni N with vlan V or vrf V, and vtep-peer A."""
+        vx = vxlan_text.vtep(self.device)
+        vx.origin = Origin(node.line, node.text)
+        for child in node.children:
+            c = child.words
+            if c[:2] == ["source", "ip"] and len(c) == 3:
+                self._vxlan_source = str(ipaddress.ip_address(c[2]))
+            elif c[0] == "vni" and len(c) == 2:
+                vni = int(c[1])
+                for line in child.children:
+                    g = line.words
+                    if g[0] == "vlan" and len(g) == 2:
+                        vx.vlan_vnis[int(g[1])] = vni
+                    elif g[0] == "vrf" and len(g) == 2:
+                        vx.vrf_vnis[g[1]] = vni
+                    elif g[0] == "vtep-peer" and len(g) == 2:
+                        if g[1] not in vx.flood_vteps:
+                            vx.flood_vteps.append(str(ipaddress.ip_address(g[1])))
+                    else:
+                        self.unparsed(line, f"{node.text} / {child.text}")
+            elif c in (["no", "shutdown"], ["routing"]):
+                pass
+            elif c[0] == "vxlan-counters" or c[0] == "description":
+                pass
+            else:
+                self.unparsed(child, node.text)
+        return True
+
+    def evpn(self, node: Node) -> bool:
+        """evpn / vlan N with rd auto and route-target export|import|both auto."""
+        if node.words != ["evpn"]:
+            return False
+        auto = (["rd", "auto"], ["route-target", "export", "auto"], ["route-target", "import", "auto"],
+                ["route-target", "both", "auto"], ["redistribute", "host-route"])
+        for child in node.children:
+            c = child.words
+            if c[0] == "vlan" and len(c) == 2 and c[1].isdigit():
+                vxlan_text.vtep(self.device).evpn_vlans.append(int(c[1]))
+                for line in child.children:
+                    if line.words not in auto:
+                        self.unparsed(line, f"{node.text} / {child.text}")
+            else:
+                self.unparsed(child, node.text)
+        return True
+
     def interface(self, node: Node) -> bool:
+        if node.words[1:2] == ["vxlan"]:
+            return self.vxlan_interface(node)
         mlag = node.words[-1] == "multi-chassis" and node.words[1] == "lag"
         if mlag:
             node = Node(node.line, node.text.rsplit(None, 1)[0], node.children)
@@ -1092,6 +1147,8 @@ class _Reader:
 
     def _finish(self) -> None:
         qos_text.adopt(self.device, self._class_acls)
+        if self.device.vxlan is not None and self._vxlan_source:
+            self.device.vxlan.source_interface = vxlan_text.interface_of(self.device, self._vxlan_source)
         if self._sflow_global and not monitor_text.sflow_ports(self.device):
             for iface in monitor_text.physical(self.device):
                 iface.sflow = True

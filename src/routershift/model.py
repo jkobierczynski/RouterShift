@@ -352,7 +352,7 @@ class BgpNeighbor:
     next_hop_self: bool = False
     send_community: bool = False
     bfd: bool = False  # BFD watches the session (IOS fall-over bfd)
-    families: List[str] = field(default_factory=list)  # address families it is active in: "ipv4", "ipv6"
+    families: List[str] = field(default_factory=list)  # address families it is active in: "ipv4", "ipv6", "evpn"
     route_map_in: str = ""  # route map on received routes, in every address family the neighbor is active in
     route_map_out: str = ""
     prefix_list_in: str = ""
@@ -756,6 +756,20 @@ class Netflow:
 
 
 @dataclass
+class Vxlan:
+    """The VXLAN tunnel endpoint (VTEP): VLANs and VRFs carried in VNIs, flooded to static peers or learned by EVPN."""
+
+    source_interface: str = ""  # canonical; the loopback whose address the tunnels start from
+    udp_port: Optional[int] = None  # None: 4789
+    vlan_vnis: Dict[int, int] = field(default_factory=dict)  # VLAN -> layer 2 VNI
+    vrf_vnis: Dict[str, int] = field(default_factory=dict)  # VRF -> layer 3 VNI (symmetric routing)
+    flood_vteps: List[str] = field(default_factory=list)  # static head-end replication peers
+    evpn_vlans: List[int] = field(default_factory=list)  # VLANs whose MAC addresses BGP EVPN advertises (rd and
+    # route targets auto)
+    origin: Origin = field(default_factory=Origin)
+
+
+@dataclass
 class IpSla:
     """A probe (IOS IP SLA, Comware NQA): ICMP echoes to a target at a frequency."""
 
@@ -827,6 +841,7 @@ class Device:
     mirror_sessions: List[MirrorSession] = field(default_factory=list)
     sflow: Optional[Sflow] = None
     netflow: Optional[Netflow] = None
+    vxlan: Optional[Vxlan] = None
     ip_slas: Dict[str, IpSla] = field(default_factory=dict)
     tracks: Dict[str, Track] = field(default_factory=dict)
     qos_classes: Dict[str, QosClass] = field(default_factory=dict)

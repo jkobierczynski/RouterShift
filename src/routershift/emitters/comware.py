@@ -23,6 +23,7 @@ from .. import mgmt as mgmt_text
 from .. import vrfs as vrfs_text
 from .. import multicast as multicast_text
 from .. import monitor as monitor_text
+from .. import vxlan as vxlan_text
 from .. import tracking as tracking_text
 from .. import hosts as hosts_text
 from .. import igp as igp_text
@@ -85,6 +86,7 @@ class Writer:
         self.nat()
         self.vpn()
         self.monitor()
+        vxlan_text.unsupported(self.device, self.report, "Comware")
         self.tracking()
         order = {InterfaceKind.LAG: 0}
         for iface in sorted(self.device.interfaces.values(), key=lambda i: order.get(i.kind, 1)):

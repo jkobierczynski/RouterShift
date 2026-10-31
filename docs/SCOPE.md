@@ -65,7 +65,8 @@ platform converts to and from all the others.
 | IP SLA (ICMP echo; Comware NQA), tracked objects (probe reachability, interface line protocol), tracked static routes and gateway groups (IOS, Comware; EOS interface tracks) | `IpSla`, `Track`, `StaticRoute.track`, `FhrpGroup.tracks` | 4 (done) |
 | DNS client: name lookup off, search domains, source interface, static hosts | `System.dns_*` | 4 (done) |
 | PoE per port: on/off, priority, power limit | `Interface.poe*` | 4 (done) |
-| vPC (NX-OS), VXLAN/EVPN | to come | 3+ |
+| VXLAN: source interface, VLAN and VRF VNIs, static flood list; BGP EVPN neighbors and advertised VLANs (IOS, EOS, AOS-CX) | `Vxlan`, `BgpNeighbor.families` | 4 (done) |
+| vPC (NX-OS) | to come | 3+ |
 
 ### AOS-S specifics
 
@@ -314,6 +315,21 @@ platform converts to and from all the others.
   priority`, `poe max-power MW`. A priority the target lacks becomes the nearest (reported); the Aruba limit is
   reported. Only stated settings convert: a port that powers by default on IOS, EOS or the Aruba switches gets no
   `poe enable` on Comware unless the source says so.
+
+## VXLAN and EVPN
+
+* The VTEP keeps its source interface, the VNI of each VLAN and VRF, and the static flood list: EOS `interface
+  Vxlan1` with `vxlan source-interface`, `vxlan vlan N vni V`, `vxlan vrf V vni N`, `vxlan flood vtep`; AOS-CX
+  `interface vxlan 1` with `source ip A` (the source interface's address) and `vni N` / `vlan V`, `vrf V`, `vtep-peer
+  A`; IOS (Catalyst 9000) `vlan configuration N` / `member vni V` and `interface nve1` with `source-interface` and
+  `member vni V` / `ingress-replication A`. IOS carries a layer 3 VNI in a VLAN of its own with an SVI, which is not
+  written (reported). The UDP port is not written (reported when it is not 4789).
+* BGP EVPN keeps the neighbors active in it (EOS `address-family evpn`, IOS and AOS-CX `address-family l2vpn evpn`,
+  with `send-community extended`) and the VLANs it advertises, with route distinguisher and route targets auto: EOS
+  `vlan N` in `router bgp` (`rd auto`, `route-target both auto`, `redistribute learned`), AOS-CX `evpn` / `vlan N`,
+  IOS `l2vpn evpn instance N vlan-based` and `member evpn-instance N vni V`. Explicit route targets are listed under
+  "Not understood".
+* AOS-S and Comware VXLAN and EVPN are reported, not written.
 
 ## RIP and IS-IS
 

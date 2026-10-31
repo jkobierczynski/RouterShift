@@ -27,6 +27,7 @@ from .. import vrfs as vrfs_text
 from .. import multicast as multicast_text
 from .. import monitor as monitor_text
 from .. import tracking as tracking_text
+from .. import vxlan as vxlan_text
 from .. import hosts as hosts_text
 from .. import igp as igp_text
 from .. import bfd as bfd_text
@@ -97,6 +98,7 @@ class Writer:
         for iface in self.device.interfaces.values():
             self.interface(iface)
         self.mirrors()
+        self.vxlan()
         self.policies()
         self.routing()
         self.acls()
@@ -1301,6 +1303,7 @@ class Writer:
             lines += [ind + line for line in body]
             if self.ios:
                 lines.append("exit-address-family")
+        lines += self._bgp_evpn(bgp)
         if not self.ios:
             for name in self.device.vrfs:
                 info = self.device.vrf_info.get(name)
@@ -1332,6 +1335,73 @@ class Writer:
         if peer.bfd:
             lines.append(f"{pre} fall-over bfd" if self.ios else f"{pre} bfd")
         return lines
+
+    def _bgp_evpn(self, bgp: Bgp) -> List[str]:
+        """The EVPN address family, and on EOS the VLANs it advertises."""
+        peers = [p for p in list(bgp.peer_groups.values()) + bgp.neighbors if "evpn" in p.families]
+        vx = self.device.vxlan
+        lines: List[str] = []
+        if not self.ios and vx is not None:
+            for vid in vx.evpn_vlans:
+                lines += [f"vlan {vid}", f"{self.ind}rd auto", f"{self.ind}route-target both auto",
+                          f"{self.ind}redistribute learned"]
+        if not peers:
+            return lines
+        if not self.ios:
+            lines = [f"neighbor {p.address} send-community extended" for p in peers] + lines
+        body = []
+        for p in peers:
+            body.append(f"neighbor {p.address} activate")
+            if self.ios:
+                body.append(f"neighbor {p.address} send-community extended")
+        lines.append("address-family l2vpn evpn" if self.ios else "address-family evpn")
+        lines += [self.ind + line for line in body]
+        if self.ios:
+            lines.append("exit-address-family")
+        return lines
+
+    def vxlan(self) -> None:
+        """EOS interface Vxlan1; IOS EVPN instances, VLAN configurations and interface nve1."""
+        d = self.device
+        vx = d.vxlan
+        if vx is None:
+            return
+        vxlan_text.item(d, self.report)
+        ind = self.ind
+        if not self.ios:
+            lines = ["interface Vxlan1"]
+            if vx.source_interface:
+                lines.append(f"{ind}vxlan source-interface {self.port(vx.source_interface)}")
+            lines += [f"{ind}vxlan vlan {vid} vni {vni}" for vid, vni in vx.vlan_vnis.items()]
+            lines += [f"{ind}vxlan vrf {self.vrf(vrf)} vni {vni}" for vrf, vni in vx.vrf_vnis.items()]
+            if vx.flood_vteps:
+                lines.append(f"{ind}vxlan flood vtep {' '.join(vx.flood_vteps)}")
+            self.out += lines + ["!"]
+            return
+        lines = []
+        if vx.evpn_vlans:
+            lines += ["l2vpn evpn", f"{ind}replication-type ingress", "!"]
+            for vid in vx.evpn_vlans:
+                lines += [f"l2vpn evpn instance {vid} vlan-based", f"{ind}encapsulation vxlan", "!"]
+        for vid, vni in vx.vlan_vnis.items():
+            member = f"member evpn-instance {vid} vni {vni}" if vid in vx.evpn_vlans else f"member vni {vni}"
+            lines += [f"vlan configuration {vid}", f"{ind}{member}", "!"]
+        lines += ["interface nve1", f"{ind}no ip address"]
+        if vx.source_interface:
+            lines.append(f"{ind}source-interface {self.port(vx.source_interface)}")
+        if vx.evpn_vlans:
+            lines.append(f"{ind}host-reachability protocol bgp")
+        for vid, vni in vx.vlan_vnis.items():
+            if vid in vx.evpn_vlans:
+                lines.append(f"{ind}member vni {vni} ingress-replication")
+            else:
+                lines.append(f"{ind}member vni {vni}")
+                lines += [f"{ind * 2}ingress-replication {a}" for a in vx.flood_vteps]
+        if vx.vrf_vnis:
+            self.report.add("interface", vxlan_text.LABEL, Severity.REVIEW, "vxlan-l3vni",
+                            "IOS carries a layer 3 VNI in a VLAN of its own with an SVI in the VRF; the VNIs of "
+                            f"{', '.join(vx.vrf_vnis)} are not written")
+        self.out += lines + ["!"]
 
     @staticmethod
     def _bgp_af_options(peer: BgpNeighbor) -> List[str]:
