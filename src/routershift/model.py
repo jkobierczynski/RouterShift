@@ -249,6 +249,7 @@ class FhrpGroup:
     name: str = ""  # HSRP name, VRRP description
     shutdown: bool = False
     mac: str = ""  # anycast: the shared virtual MAC, "xx:xx:xx:xx:xx:xx"
+    tracks: Dict[str, int] = field(default_factory=dict)  # tracked object -> priority decrement while it is down
     origin: Origin = field(default_factory=Origin)
 
     def preempts(self) -> bool:
@@ -264,6 +265,7 @@ class StaticRoute:
     vrf: str = ""
     name: str = ""
     discard: bool = False  # null route
+    track: str = ""  # the route stays while this tracked object is up
     origin: Origin = field(default_factory=Origin)
 
 
@@ -747,6 +749,32 @@ class Netflow:
 
 
 @dataclass
+class IpSla:
+    """A probe (IOS IP SLA, Comware NQA): ICMP echoes to a target at a frequency."""
+
+    name: str  # the IOS number, the Comware test name
+    target: str = ""
+    source_interface: str = ""  # canonical
+    source_address: str = ""
+    frequency: Optional[int] = None  # seconds between probes
+    timeout_ms: Optional[int] = None
+    vrf: str = ""
+    origin: Origin = field(default_factory=Origin)
+
+
+@dataclass
+class Track:
+    """A tracked object: up while its probe succeeds or its interface is up."""
+
+    name: str  # the IOS and Comware number, the EOS name
+    sla: str = ""  # the IpSla it follows (reachability)
+    interface: str = ""  # or the interface (canonical) whose line protocol it follows
+    delay_up: Optional[int] = None  # seconds a change waits before it counts
+    delay_down: Optional[int] = None
+    origin: Origin = field(default_factory=Origin)
+
+
+@dataclass
 class Unparsed:
     """A line or block of the source no parser section claimed."""
 
@@ -792,6 +820,8 @@ class Device:
     mirror_sessions: List[MirrorSession] = field(default_factory=list)
     sflow: Optional[Sflow] = None
     netflow: Optional[Netflow] = None
+    ip_slas: Dict[str, IpSla] = field(default_factory=dict)
+    tracks: Dict[str, Track] = field(default_factory=dict)
     qos_classes: Dict[str, QosClass] = field(default_factory=dict)
     qos_policies: Dict[str, QosPolicy] = field(default_factory=dict)
     snmp: Snmp = field(default_factory=Snmp)

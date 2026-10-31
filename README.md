@@ -41,7 +41,9 @@ Multicast converts too: IGMP snooping per VLAN with its querier, and multicast r
 IGMP version, static RPs).
 Port mirroring (SPAN) and sFlow convert on every platform; NetFlow between IOS (Flexible NetFlow)
 and Comware (NetStream), and is flagged elsewhere, as is sFlow on IOS.
-Everything else (IP SLA, LDAP, ...) is listed in the report under "Not understood", line by
+IP SLA probes (Comware NQA) and tracked objects convert between IOS and Comware with the static routes
+and gateway groups that use them; EOS takes the interface tracks, and the rest is flagged.
+Everything else (LDAP, ...) is listed in the report under "Not understood", line by
 line, with secrets masked.
 
 ## Usage

@@ -120,7 +120,7 @@ def test_ios_writes_hsrp_and_vrrp() -> None:
     out, report = convert(sample("comware_access.cfg"), "comware", "ios")  # VRRPv3 by default
     assert "fhrp version vrrp v3\n" in out
     assert (" vrrp 10 address-family ipv4\n  address 10.10.0.254 primary\n  priority 120\n"
-            "  timers advertise 2000\n  exit-vrrp\n") in out
+            "  timers advertise 2000\n  track 5 decrement 30\n  exit-vrrp\n") in out
 
 
 def test_anycast_gateway() -> None:

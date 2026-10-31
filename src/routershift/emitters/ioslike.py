@@ -26,6 +26,7 @@ from .. import vpn as vpn_text
 from .. import vrfs as vrfs_text
 from .. import multicast as multicast_text
 from .. import monitor as monitor_text
+from .. import tracking as tracking_text
 from .. import igp as igp_text
 from .. import bfd as bfd_text
 from .. import routemap as routemap_text
@@ -79,6 +80,7 @@ class Writer:
                 continue
             for name in nat_text.outside(self.device, rule):
                 self.nat_outside.setdefault(name, []).append(rule)
+        self.track_plan = tracking_text.plan(self.device, self.report, self.target, "IOS" if self.ios else "EOS")
         self.system()
         self.spanning_tree()
         self.vrfs()
@@ -88,6 +90,7 @@ class Writer:
         self.l2sec()
         self.multicast()
         self.flows()
+        self.tracking()
         self.mlag()
         self.mpls()
         for iface in self.device.interfaces.values():
@@ -422,6 +425,7 @@ class Writer:
             lines.append(f"{pre} timers {self._ms(g.hello_ms)} {self._ms(hold)}")
         if g.name:
             lines.append(f"{pre} name {g.name.replace(' ', '_')}")
+        lines += [f"{pre} track {t} decrement {dec}" for t, dec in self.track_plan.fhrp_tracks(g.tracks)]
         if g.shutdown:
             lines.append(f"{pre} shutdown")
         return lines
@@ -446,6 +450,8 @@ class Writer:
                 lines.append(f"{pre} ipv4 version 3")
         if g.name:
             lines.append(f"{pre} description {g.name}" if self.ios else f"{pre} session description {g.name}")
+        word = "track" if self.ios else "tracked-object"
+        lines += [f"{pre} {word} {t} decrement {dec}" for t, dec in self.track_plan.fhrp_tracks(g.tracks)]
         if g.shutdown:
             lines.append(f"{pre} shutdown" if self.ios else f"{pre} disabled")
         return lines
@@ -462,6 +468,7 @@ class Writer:
             body.append("vrrpv2")
         if g.name:
             body.append(f"description {g.name}")
+        body += [f"track {t} decrement {dec}" for t, dec in self.track_plan.fhrp_tracks(g.tracks)]
         if g.shutdown:
             body.append("shutdown")
         return [f"vrrp {g.group} address-family ipv4"] + [f"{self.ind}{line}" for line in body] + [
@@ -1010,6 +1017,40 @@ class Writer:
         if lines:
             self.out += lines + (["!"] if lines[-1] != "!" else [])
 
+    def tracking(self) -> None:
+        """IP SLA probes (IOS) and tracked objects."""
+        d = self.device
+        plan = self.track_plan
+        lines: List[str] = []
+        for sla in d.ip_slas.values():
+            if sla.name not in plan.slas:
+                continue
+            number = plan.slas[sla.name]
+            source = f" source-interface {self.port(sla.source_interface)}" if sla.source_interface else \
+                f" source-ip {sla.source_address}" if sla.source_address else ""
+            lines += [f"ip sla {number}", f" icmp-echo {sla.target}{source}"]
+            if sla.vrf:
+                lines.append(f"  vrf {self.vrf(sla.vrf)}")
+            if sla.frequency is not None:
+                lines.append(f"  frequency {sla.frequency}")
+            if sla.timeout_ms is not None:
+                lines.append(f"  timeout {sla.timeout_ms}")
+            lines.append(f"ip sla schedule {number} life forever start-time now")
+        for t in d.tracks.values():
+            if t.name not in plan.tracks:
+                continue
+            name = plan.tracks[t.name]
+            if t.sla:
+                lines.append(f"track {name} ip sla {plan.slas[t.sla]} reachability")
+            else:
+                lines.append(f"track {name} interface {self.port(t.interface)} line-protocol")
+            delays = [f"{way} {value}" for way, value in (("up", t.delay_up), ("down", t.delay_down))
+                      if value is not None]
+            if delays and self.ios:
+                lines.append(f" delay {' '.join(delays)}")
+        if lines:
+            self.out += lines + ["!"]
+
     def flows(self) -> None:
         """sFlow (EOS; IOS has none) and Flexible NetFlow (IOS; not written for EOS)."""
         d = self.device
@@ -1333,6 +1374,8 @@ class Writer:
             words.append(str(route.distance))
         if route.name:
             words += ["name", route.name.replace(" ", "_")]  # one word
+        if self.ios and self.track_plan.route_track(route.track):
+            words += ["track", self.track_plan.route_track(route.track)]
         self.report.item("route", f"{route.vrf + ' ' if route.vrf else ''}{route.prefix}")
         return " ".join(words)
 

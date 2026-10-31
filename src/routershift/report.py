@@ -65,6 +65,7 @@ _KIND_TITLES = [
     ("interface", "Interfaces"),
     ("fhrp", "Gateway redundancy (HSRP, VRRP)"),
     ("route", "Static routes"),
+    ("track", "IP SLA and object tracking"),
     ("ospf", "OSPF"),
     ("rip", "RIP"),
     ("isis", "IS-IS"),
