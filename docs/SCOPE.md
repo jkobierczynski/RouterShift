@@ -62,6 +62,7 @@ platform converts to and from all the others.
 | Port mirroring (SPAN): local sessions, source ports with direction, destination port | `MirrorSession` | 4 (done) |
 | sFlow: collectors, agent address, sampling rate, polling interval, sampled ports (not IOS) | `Sflow`, `Interface.sflow` | 4 (done) |
 | NetFlow: collectors, export version, source interface, ports by direction (IOS, Comware) | `Netflow`, `Interface.flow` | 4 (done) |
+| IP SLA (ICMP echo; Comware NQA), tracked objects (probe reachability, interface line protocol), tracked static routes and gateway groups (IOS, Comware; EOS interface tracks) | `IpSla`, `Track`, `StaticRoute.track`, `FhrpGroup.tracks` | 4 (done) |
 | vPC (NX-OS), VXLAN/EVPN | to come | 3+ |
 
 ### AOS-S specifics
@@ -278,6 +279,24 @@ platform converts to and from all the others.
   `ip netstream export version`, `ip netstream export source interface`, `ip netstream inbound`). The IOS writer
   names its exporters RS-EXPORT-N and its monitor RS-MONITOR, with the predefined record `netflow ipv4
   original-input` (a record of the source's own is reported). EOS, AOS-CX and AOS-S NetFlow is reported, not written.
+
+## IP SLA and object tracking
+
+* IP SLA probes are ICMP echoes with a target, a source interface or address, a frequency, a timeout and a VRF: IOS
+  `ip sla N` / `icmp-echo A source-interface X` (scheduled with `ip sla schedule N life forever start-time now`),
+  Comware NQA `nqa entry admin NAME` / `type icmp-echo` / `destination ip`, `frequency` (milliseconds), `probe
+  timeout`, `source interface` or `source ip`, `vpn-instance`, with `reaction 1 checked-element probe-fail` for the
+  track and `nqa schedule ... start-time now lifetime forever`. Other probe types and schedules are listed under
+  "Not understood". EOS, AOS-CX and AOS-S probes are reported, not written.
+* Tracked objects follow a probe's reachability (IOS `track N ip sla M reachability`, Comware `track N nqa entry admin
+  NAME reaction 1`) or an interface's line protocol (IOS and EOS `track N interface X line-protocol`, Comware `track
+  N interface X`), with delays (IOS `delay up U down D`, Comware `delay positive U negative D`; EOS has none). EOS
+  names its tracks; IOS and Comware number them (renumbering is reported). AOS-CX and AOS-S tracks are reported.
+* Static routes keep their track on IOS (`track N`) and Comware (`ip route-static ... track N`); elsewhere the route
+  is written without it (reported). Gateway groups keep the priority decrement of each track: IOS `standby N track
+  T decrement D`, `vrrp N track T decrement D` and `track T decrement D` in a VRRPv3 block, EOS `vrrp N
+  tracked-object T decrement D`, Comware `vrrp vrid N track T priority reduced D`. A decrement left out in the
+  source is 10, the IOS and Comware default.
 
 ## RIP and IS-IS
 

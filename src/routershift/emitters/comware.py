@@ -23,6 +23,7 @@ from .. import mgmt as mgmt_text
 from .. import vrfs as vrfs_text
 from .. import multicast as multicast_text
 from .. import monitor as monitor_text
+from .. import tracking as tracking_text
 from .. import igp as igp_text
 from .. import bfd as bfd_text
 from .. import routemap as routemap_text
@@ -59,6 +60,7 @@ class Writer:
                        for i in self.device.interfaces.values() if i.fhrp}
         groups = [g for gs in self.groups.values() for g in gs]
         self.vrrp_v2 = any(g.version != 3 for g in groups)
+        self.track_plan = tracking_text.plan(self.device, self.report, "comware", "Comware")
         self.system()
         self.users()
         self.aaa()
@@ -82,6 +84,7 @@ class Writer:
         self.nat()
         self.vpn()
         self.monitor()
+        self.tracking()
         order = {InterfaceKind.LAG: 0}
         for iface in sorted(self.device.interfaces.values(), key=lambda i: order.get(i.kind, 1)):
             self.interface(iface)
@@ -93,6 +96,42 @@ class Writer:
         self.out.append("return")
         self.report.unparsed(self.device.unparsed)
         return "\n".join(self.out) + "\n"
+
+    def tracking(self) -> None:
+        """NQA tests (IP SLA) and tracked objects."""
+        d = self.device
+        plan = self.track_plan
+        lines: List[str] = []
+        slas = [sla for sla in d.ip_slas.values() if sla.name in plan.slas]
+        if slas:
+            lines.append("nqa agent enable")
+        for sla in slas:
+            name = f"admin {plan.slas[sla.name]}"
+            body = [f"destination ip {sla.target}"]
+            if sla.frequency is not None:
+                body.append(f"frequency {sla.frequency * 1000}")
+            if sla.timeout_ms is not None:
+                body.append(f"probe timeout {sla.timeout_ms}")
+            if sla.source_interface:
+                body.append(f"source interface {self.port(sla.source_interface)}")
+            elif sla.source_address:
+                body.append(f"source ip {sla.source_address}")
+            if sla.vrf:
+                body.append(f"vpn-instance {sla.vrf}")
+            body.append("reaction 1 checked-element probe-fail threshold-type consecutive 1 action-type trigger-only")
+            lines += [f"nqa entry {name}", f"{_IND}type icmp-echo"] + [_IND * 2 + b for b in body] + \
+                [f"nqa schedule {name} start-time now lifetime forever"]
+        for t in d.tracks.values():
+            if t.name not in plan.tracks:
+                continue
+            what = f"nqa entry admin {plan.slas[t.sla]} reaction 1" if t.sla else \
+                f"interface {self.port(t.interface)}"
+            delays = [f"{word} {value}" for word, value in (("positive", t.delay_up), ("negative", t.delay_down))
+                      if value is not None]
+            lines.append(f"track {plan.tracks[t.name]} {what}" + (f" delay {' '.join(delays)}" if delays else ""))
+        if lines:
+            self.out += lines
+            self.block_end()
 
     def monitor(self) -> None:
         """Mirroring groups, sFlow and NetStream; the ports name themselves in their interfaces."""
@@ -1322,6 +1361,7 @@ class Writer:
             add(Severity.APPROX, "fhrp-version", "VRRPv3 written as VRRPv2: Comware runs one version for all groups")
         if g.name:
             add(Severity.APPROX, "fhrp-name", f"description '{g.name}' left out: Comware has none for a group")
+        lines += [f"{pre} track {t} priority reduced {dec}" for t, dec in self.track_plan.fhrp_tracks(g.tracks)]
         if g.shutdown:
             lines.append(f"{pre} shutdown")
         return lines
@@ -1378,6 +1418,8 @@ class Writer:
                 words.append(self.port(route.interface))
             if route.next_hop:
                 words.append(route.next_hop)
+        if self.track_plan.route_track(route.track):
+            words += ["track", self.track_plan.route_track(route.track)]
         if route.distance is not None:
             words += ["preference", str(route.distance)]
         if route.name:

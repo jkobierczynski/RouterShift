@@ -31,13 +31,14 @@ from .. import mgmt as mgmt_text
 from .. import vrfs as vrfs_text
 from .. import igp as igp_text
 from .. import monitor as monitor_text
+from .. import tracking as tracking_text
 from .. import bfd as bfd_text
 from .. import routemap as routemap_text
 from .. import qos as qos_text
 from .. import vpn as vpn_text
 from ..confparse import Node
 from ..errors import ParseError
-from ..model import (Netflow, Sflow, AaaGroup, AaaMethod, AaaServer, Acl, AclAction, AclEntry, Device, DhcpPool, FhrpGroup, IkePolicy, IpsecPeer, IpsecTransform,
+from ..model import (IpSla, Netflow, Sflow, AaaGroup, AaaMethod, AaaServer, Acl, AclAction, AclEntry, Device, DhcpPool, FhrpGroup, IkePolicy, IpsecPeer, IpsecTransform,
                      NtpKey, PreSharedKey, SnmpCommunity, SnmpGroup, SnmpHost, SnmpUser, Interface, InterfaceKind, LacpMode, LocalUser,
                      NatPool, NatRule, Origin, QosAction, QosClass, QosPolicy, Ospf, Rip, Isis, Wlan, OspfNetwork, StaticRoute, StpMode, SwitchportMode, Unparsed, Vlan)
 from .ioslike import _cidr, _is_address
@@ -207,6 +208,8 @@ class _Reader:
             "port-security": lambda node: node.words == ["port-security", "enable"],
             "mirroring-group": self.mirroring_group,
             "sflow": self.sflow,
+            "nqa": self.nqa,
+            "track": self.track,
         }
         for node in roots:
             if node.text.startswith(_NOISE):
@@ -877,6 +880,8 @@ class _Reader:
                 route.discard = True
             elif word == "preference" and rest:
                 route.distance = int(rest.pop(0))
+            elif word == "track" and rest:
+                route.track = rest.pop(0)
             elif word == "description" and rest:
                 route.name = " ".join(rest)
                 rest = []
@@ -1500,6 +1505,8 @@ class _Reader:
             group.priority = int(w[1])
         elif w[:2] == ["timer", "advertise"] and n == 3:
             group.hello_ms = int(w[2]) * 10  # centiseconds
+        elif w[0] == "track" and n in (4, 5) and w[2:4] == ["priority", "reduced"]:
+            group.tracks[w[1]] = int(w[4]) if n == 5 else tracking_text.DEFAULT_DECREMENT
         elif w == ["shutdown"]:
             group.shutdown = True
         else:
@@ -1701,6 +1708,78 @@ class _Reader:
         return True
 
     # port mirroring, sFlow, NetStream ---------------------------------------------------------------------------------
+
+    # NQA and tracking -------------------------------------------------------------------------------------------------
+
+    @staticmethod
+    def _nqa_name(admin: str, tag: str) -> str:
+        return tag if admin == "admin" else f"{admin}-{tag}"
+
+    def nqa(self, node: Node) -> bool:
+        """nqa agent enable; nqa schedule A T start-time now lifetime forever; nqa entry A T / type icmp-echo / ..."""
+        w = node.words
+        if w == ["nqa", "agent", "enable"]:
+            return True
+        if w[1:2] == ["schedule"] and len(w) == 8:
+            return w[4:] == ["start-time", "now", "lifetime", "forever"]
+        if w[1:2] != ["entry"] or len(w) != 4:
+            return False
+        sla = IpSla(self._nqa_name(w[2], w[3]), origin=Origin(node.line, node.text))
+        for child in node.children:
+            if child.words != ["type", "icmp-echo"]:
+                self.unparsed(child, node.text)
+                continue
+            for line in child.children:
+                c = line.words
+                n = len(c)
+                if c[:2] == ["destination", "ip"] and n == 3:
+                    sla.target = str(ipaddress.ip_address(c[2]))
+                elif c[0] == "frequency" and n == 2:
+                    sla.frequency = max(1, int(c[1]) // 1000)  # milliseconds
+                elif c[:2] == ["probe", "timeout"] and n == 3:
+                    sla.timeout_ms = int(c[2])
+                elif c[:2] == ["source", "interface"] and n == 3:
+                    sla.source_interface = canonical(c[2])[0]
+                elif c[:2] == ["source", "ip"] and n == 3:
+                    sla.source_address = str(ipaddress.ip_address(c[2]))
+                elif c[0] == "vpn-instance" and n == 2:
+                    sla.vrf = c[1]
+                elif c[:2] == ["reaction", "1"] and "probe-fail" in c:  # what the track follows
+                    pass
+                else:
+                    self.unparsed(line, f"{node.text} / {child.text}")
+        if not sla.target:
+            return False
+        self.device.ip_slas[sla.name] = sla
+        return True
+
+    def track(self, node: Node) -> bool:
+        """track N nqa entry A T reaction 1 | interface X [protocol ipv4] [delay positive U negative D]."""
+        w = node.words
+        if len(w) < 4 or not w[1].isdigit() or node.children:
+            return False
+        rest = w[2:]
+        sla = interface = ""
+        if rest[:2] == ["nqa", "entry"] and len(rest) >= 6 and rest[4:6] == ["reaction", "1"]:
+            sla, rest = self._nqa_name(rest[2], rest[3]), rest[6:]
+        elif rest[0] == "interface" and len(rest) >= 2:
+            interface, rest = canonical(rest[1])[0], rest[2:]
+            if rest[:2] == ["protocol", "ipv4"]:
+                rest = rest[2:]
+        else:
+            return False
+        delays: Dict[str, int] = {}
+        if rest[:1] == ["delay"]:
+            pairs = rest[1:]
+            if len(pairs) not in (2, 4) or not set(pairs[::2]) <= {"positive", "negative"}:
+                return False
+            delays = {k: int(v) for k, v in zip(pairs[::2], pairs[1::2])}
+        elif rest:
+            return False
+        t = tracking_text.track(self.device, w[1], node.line, node.text)
+        t.sla, t.interface = sla, interface
+        t.delay_up, t.delay_down = delays.get("positive"), delays.get("negative")
+        return True
 
     def mirroring_group(self, node: Node) -> bool:
         """mirroring-group N local; mirroring-group N mirroring-port P.. both|inbound|outbound; ... monitor-port P."""

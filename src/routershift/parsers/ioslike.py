@@ -24,6 +24,7 @@ from .. import mgmt as mgmt_text
 from .. import vrfs as vrfs_text
 from .. import multicast as multicast_text
 from .. import monitor as monitor_text
+from .. import tracking as tracking_text
 from .. import igp as igp_text
 from .. import routemap as routemap_text
 from .. import qos as qos_text
@@ -33,7 +34,7 @@ from .. import vpn as vpn_text
 from .. import aaa as aaa_text
 from ..confparse import Node
 from ..errors import ParseError
-from ..model import (Netflow, Sflow, AaaGroup, AaaMethod, AaaServer, Acl, Device, LocalUser, DhcpPool, FhrpGroup, IkePolicy, IpsecPeer, IpsecTransform, NtpKey, PreSharedKey,
+from ..model import (IpSla, Netflow, Sflow, AaaGroup, AaaMethod, AaaServer, Acl, Device, LocalUser, DhcpPool, FhrpGroup, IkePolicy, IpsecPeer, IpsecTransform, NtpKey, PreSharedKey,
                      SnmpCommunity, SnmpGroup, SnmpHost, SnmpUser, NatPool, NatRule, Interface, InterfaceKind, LacpMode, Origin, Ospf, OspfNetwork, Wlan, Mlag, Rip, Isis,
                      QosAction, QosClass, QosPolicy, StaticRoute, StpMode, SwitchportMode, Unparsed, Vlan)
 
@@ -158,6 +159,7 @@ class _Reader:
             "monitor": self.monitor_session,
             "sflow": self.sflow,
             "flow": self.flow,
+            "track": self.track,
         }
         for node in roots:
             if node.text.startswith(_NOISE) or node.text == "end":
@@ -364,6 +366,10 @@ class _Reader:
         m = self.device.management
         if w[1:3] == ["igmp", "snooping"]:
             return self.igmp_snooping(w[3:], True)
+        if w[1:3] == ["sla", "schedule"]:  # the probes run as written
+            return len(w) == 8 and w[4:] == ["life", "forever", "start-time", "now"]
+        if w[1:2] == ["sla"] and len(w) == 3 and w[2].isdigit():
+            return self.ip_sla(node, w[2])
         if w[1:2] == ["flow-export"]:
             return self.flow_export(w[2:])
         if w[1:2] == ["multicast-routing"] and w[2:] in ([], ["distributed"]):
@@ -1249,6 +1255,56 @@ class _Reader:
             return False
         return True
 
+    def ip_sla(self, node: Node, name: str) -> bool:
+        """ip sla N / icmp-echo A [source-interface X | source-ip A] / frequency, timeout, vrf (beside it or under
+        it)."""
+        sla = self.device.ip_slas[name] = IpSla(name, origin=Origin(node.line, node.text))
+        lines: List[Tuple[Node, str]] = []
+        for child in node.children:
+            c = child.words
+            if c[0] == "icmp-echo" and len(c) in (2, 4):
+                sla.target = str(ipaddress.ip_address(c[1]))
+                if c[2:3] == ["source-interface"]:
+                    sla.source_interface = names.canonical(c[3])[0]
+                elif c[2:3] == ["source-ip"]:
+                    sla.source_address = str(ipaddress.ip_address(c[3]))
+                elif len(c) == 4:
+                    self.unparsed(child, node.text)
+                lines += [(grand, f"{node.text} / {child.text}") for grand in child.children]
+            else:
+                lines.append((child, node.text))
+        for line, section in lines:
+            c = line.words
+            if c[0] == "frequency" and len(c) == 2:
+                sla.frequency = int(c[1])
+            elif c[0] == "timeout" and len(c) == 2:
+                sla.timeout_ms = int(c[1])
+            elif c[0] == "vrf" and len(c) == 2:
+                sla.vrf = c[1]
+            else:
+                self.unparsed(line, section)
+        return bool(sla.target)
+
+    def track(self, node: Node) -> bool:
+        """track N ip sla M reachability / delay up U down D; track N interface X line-protocol (EOS: a name)."""
+        w = node.words
+        if len(w) == 6 and w[2:4] == ["ip", "sla"] and w[5] == "reachability":
+            t = tracking_text.track(self.device, w[1], node.line, node.text)
+            t.sla = w[4]
+        elif len(w) >= 5 and w[2] == "interface" and w[-1] == "line-protocol":
+            t = tracking_text.track(self.device, w[1], node.line, node.text)
+            t.interface = names.canonical(" ".join(w[3:-1]))[0]
+        else:
+            return False
+        for child in node.children:
+            c = child.words
+            if c[0] == "delay" and len(c) in (3, 5) and set(c[1::2]) <= {"up", "down"}:
+                for way, value in zip(c[1::2], c[2::2]):
+                    setattr(t, f"delay_{way}", int(value))
+            else:
+                self.unparsed(child, node.text)
+        return True
+
     def _finish_monitor(self) -> None:
         d = self.device
         if self._sflow_run:
@@ -1893,6 +1949,8 @@ class _Reader:
                 route.distance = int(word)
             elif word == "name" and args:
                 route.name = args.pop(0)
+            elif word == "track" and args:
+                route.track = args.pop(0)
             elif word.lower().startswith("null"):
                 route.discard = True
             elif not route.interface and not route.next_hop:
@@ -2000,6 +2058,19 @@ class _Reader:
             group.name = w[1]
         elif w == ["shutdown"]:
             group.shutdown = True
+        elif w[0] == "track":
+            return self._fhrp_track(group, w[1:])
+        else:
+            return False
+        return True
+
+    @staticmethod
+    def _fhrp_track(group: FhrpGroup, w: List[str]) -> bool:
+        """track T [decrement D] (IOS), tracked-object T decrement D (EOS)."""
+        if len(w) == 1 and w[0].isdigit():
+            group.tracks[w[0]] = tracking_text.DEFAULT_DECREMENT
+        elif len(w) == 3 and w[1] == "decrement":
+            group.tracks[w[0]] = int(w[2])
         else:
             return False
         return True
@@ -2034,6 +2105,8 @@ class _Reader:
             group.name = " ".join(w[2:])
         elif w in (["shutdown"], ["disabled"]):
             group.shutdown = True
+        elif w[0] in ("track", "tracked-object"):
+            return self._fhrp_track(group, w[1:])
         else:
             return False
         return True
@@ -2067,6 +2140,8 @@ class _Reader:
             elif w == ["shutdown"]:
                 group.shutdown = True
             elif w == ["exit-vrrp"]:
+                pass
+            elif w[0] == "track" and self._fhrp_track(group, w[1:]):
                 pass
             else:
                 self.unparsed(child, node.text)

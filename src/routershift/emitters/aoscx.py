@@ -12,6 +12,7 @@ from typing import Callable, Dict, List, Tuple
 from .. import acl as acl_text
 from .. import multicast as multicast_text
 from .. import monitor as monitor_text
+from .. import tracking as tracking_text
 from .. import bfd as bfd_text
 from .. import igp as igp_text
 from .. import routemap as routemap_text
@@ -82,6 +83,7 @@ class Writer:
             self.interface(iface)
         self.vsx()
         self.monitor()
+        tracking_text.plan(self.device, self.report, "aoscx", "AOS-CX")
         self.routes()
         self.dhcp()
         nat_text.skip_all(self.device, self.report, "AOS-CX")
