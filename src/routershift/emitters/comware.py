@@ -18,6 +18,7 @@ from .. import vpn as vpn_text
 from .. import ospf as ospf_text
 from .. import snmp as snmp_text
 from .. import stp as stp_text
+from .. import mgmt as mgmt_text
 from .. import mpls as mpls_text
 from .. import qos as qos_text
 from .. import wlan as wlan_text
@@ -137,6 +138,13 @@ class Writer:
             self.out.append(f"{_IND}info-center loghost{vpn} {host}")
         if s.syslog_servers:
             rep.item("system", "syslog servers")
+        if s.logging_source:
+            self.out.append(f"{_IND}info-center loghost source {self.port(s.logging_source)}")
+            rep.item("system", "syslog source")
+        if s.logging_level is not None:
+            self.out.append(f"{_IND}info-center source default loghost level {mgmt_text.COMWARE[s.logging_level]}")
+            rep.item("system", "syslog level")
+        self.management()
         self.snmp()
         if s.banner_motd:
             delim = "%" if "%" not in s.banner_motd else "^"
@@ -154,6 +162,47 @@ class Writer:
         if privilege is None or privilege in (1, 15):
             return aaa_text.role(privilege, COMWARE_ROLES)
         return f"level-{privilege}"
+
+    def _vty(self, scheme: bool) -> None:
+        """line vty 0 63: AAA login when there are method lists or users, the protocols that come in, the timeout."""
+        m = self.device.management
+        vty = []
+        if m.ssh is not None or m.telnet is not None:
+            allowed = mgmt_text.transport(self.device).split()
+            if allowed == ["none"]:
+                self.report.add("management", "telnet server", Severity.REVIEW, "mgmt-lines",
+                                "the source allows no remote login protocol; Comware has no 'protocol inbound none'")
+            else:
+                vty.append(f"protocol inbound {'all' if len(allowed) == 2 else allowed[0]}")
+        if m.exec_timeout is not None:
+            vty.append(f"idle-timeout {m.exec_timeout} 0")
+        if scheme or self.device.users or vty:
+            self.out.append("line vty 0 63")
+            if scheme or self.device.users:
+                self.out.append(f"{_IND}authentication-mode scheme")
+            self.out += [f"{_IND}{line}" for line in vty]
+            self.block_end()
+
+    def management(self) -> None:
+        """SSH, Telnet and HTTP(S) servers and LLDP (global commands); the VTY lines are written with AAA."""
+        d = self.device
+        m = d.management
+        rep = self.report
+        mgmt_text.items(d, rep)
+        for word, value in (("ssh server enable", m.ssh), ("telnet server enable", m.telnet),
+                            ("ip http enable", m.http), ("ip https enable", m.https), ("lldp global enable", m.lldp)):
+            if value is not None:
+                self.out.append(f"{_IND}{'' if value else 'undo '}{word}")
+        if m.vty_acl:
+            rep.add("management", "remote login ACL", Severity.REVIEW, "mgmt-acl",
+                    f"apply ACL {m.vty_acl} with 'ssh server acl' / 'telnet server acl' (by ACL number) by hand")
+        if m.vrf:
+            rep.add("management", "ssh server", Severity.APPROX, "mgmt-vrf",
+                    f"the servers listen in every VPN instance on Comware (the source used VRF {m.vrf})")
+        if m.cdp:
+            rep.add("management", "CDP", Severity.APPROX, "cdp-lldp",
+                    "Comware has no CDP; LLDP announces the switch ('lldp compliance cdp' lets it talk to CDP "
+                    "neighbors)")
 
     def users(self) -> None:
         rep = self.report
@@ -211,6 +260,7 @@ class Writer:
         a = self.device.aaa
         rep = self.report
         if not aaa_text.has_aaa(self.device):
+            self._vty(False)
             return
         keys = {}
         for s in a.servers:
@@ -250,9 +300,7 @@ class Writer:
         if lines:
             self.out += ["domain system"] + lines
             self.block_end()
-        if lines or self.device.users:
-            self.out += ["line vty 0 63", f"{_IND}authentication-mode scheme"]
-            self.block_end()
+        self._vty(bool(lines))
 
     _DOMAIN = {("authentication", "login"): "authentication login", ("authentication", "enable"): "authentication super",
                ("authorization", "exec"): "authorization login", ("authorization", "commands"): "authorization command",
@@ -648,6 +696,9 @@ class Writer:
             lines.append(f"qos trust {'dot1p' if iface.qos_trust == 'cos' else 'dscp'}")
         if iface.mpls:
             lines += ["mpls enable", "mpls ldp enable"]
+        if not (iface.lldp_tx and iface.lldp_rx):
+            status = "tx" if iface.lldp_tx else "rx" if iface.lldp_rx else "disable"
+            lines.append(f"lldp admin-status {status}")
         for attr, v6, direction in (("acl_in", "", "inbound"), ("acl_out", "", "outbound"),
                                     ("acl6_in", "ipv6 ", "inbound"), ("acl6_out", "ipv6 ", "outbound")):
             acl_name = getattr(iface, attr)

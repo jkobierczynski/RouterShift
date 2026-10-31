@@ -28,6 +28,8 @@ and accounting method lists), 802.1X and MAC authentication on ports, the TFTP/F
 source interface, QoS (classes, policies with DSCP marking and policing, port trust), MPLS with LDP
 (on IOS, EOS and Comware), and wireless networks (SSID, VLAN, security) between IOS XE and Comware
 controllers, flagged on the switches that have none.
+Management access converts too: SSH, Telnet and HTTP(S) servers, the remote login ACL and idle timeout,
+the syslog level and source, and LLDP and CDP (globally and per port).
 Everything else (route maps, LDAP, ...) is listed in the report under "Not understood", line by
 line, with secrets masked.
 

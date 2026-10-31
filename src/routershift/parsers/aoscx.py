@@ -27,6 +27,7 @@ from .. import dhcp as dhcp_text
 from .. import fhrp
 from .. import ospf as ospf_text
 from .. import aaa as aaa_text
+from .. import mgmt as mgmt_text
 from .. import qos as qos_text
 from .. import confparse
 from ..confparse import Node
@@ -110,6 +111,11 @@ class _Reader:
             "aaa": self.aaa,
             "class": self.qos_class,
             "policy": self.qos_policy,
+            "ssh": self.server,
+            "https-server": self.server,
+            "cli-session": self.cli_session,
+            "lldp": lambda node: node.words == ["lldp"] and self._set_lldp(True),
+            "no": lambda node: node.words == ["no", "lldp"] and self._set_lldp(False),
         }
         for node in roots:
             if node.text.startswith(_NOISE):
@@ -145,10 +151,13 @@ class _Reader:
 
     def ip(self, node: Node) -> bool:
         w = node.words
-        if w[1] == "source-interface" and len(w) >= 5 and w[2] == "tftp" and w[3] == "interface":
+        if w[1] == "source-interface" and len(w) >= 5 and w[2] in ("tftp", "syslog") and w[3] == "interface":
             end = w.index("vrf") if "vrf" in w else len(w)
             name = re.sub(r"^(vlan|loopback)(\d)", r"\1 \2", " ".join(w[4:end]))
-            self.device.system.transfer_source["tftp"] = canonical(name)[0]
+            if w[2] == "tftp":
+                self.device.system.transfer_source["tftp"] = canonical(name)[0]
+            else:
+                self.device.system.logging_source = canonical(name)[0]
             return end in (5, 6) and len(w) in (end, end + 2)
         if w[1] == "source-interface" and len(w) >= 5 and w[2] in ("radius", "tacacs", "all") and w[3] == "interface":
             # ip source-interface radius|tacacs|all interface X [vrf V]
@@ -371,8 +380,36 @@ class _Reader:
         self.device.snmp.users.append(user)
         return not args
 
+    def server(self, node: Node) -> bool:
+        """ssh server vrf V, https-server vrf V."""
+        w = node.words
+        args = w[2:] if w[:2] == ["ssh", "server"] else w[1:] if w[0] == "https-server" else []
+        if len(args) != 2 or args[0] != "vrf":
+            return False
+        m = self.device.management
+        setattr(m, "ssh" if w[0] == "ssh" else "https", True)
+        if w[0] == "ssh" and (not m.vrf or args[1] != "default"):
+            m.vrf = "" if args[1] == "default" else args[1]
+        return True
+
+    def cli_session(self, node: Node) -> bool:
+        """cli-session with 'timeout M' (minutes)."""
+        for child in node.children:
+            if child.words[0] == "timeout" and len(child.words) == 2 and child.words[1].isdigit():
+                self.device.management.exec_timeout = int(child.words[1])
+            else:
+                self.unparsed(child, node.text)
+        return True
+
+    def _set_lldp(self, on: bool) -> bool:
+        self.device.management.lldp = on
+        return True
+
     def logging(self, node: Node) -> bool:
         args = self._service_vrf(node.words[1:])
+        if len(args) == 3 and args[1] == "severity" and mgmt_text.level(args[2]) is not None:
+            self.device.system.logging_level = mgmt_text.level(args[2])
+            args = args[:1]
         if len(args) == 1 and _is_address(args[0]):
             self.device.system.syslog_servers.append(args[0])
             return True
@@ -827,6 +864,8 @@ class _Reader:
             setattr(iface, f"qos_policy_{w[3].replace('routed-', '')}", w[2])
         elif w[:2] == ["qos", "trust"] and n == 3 and w[2] in ("dscp", "cos", "none"):
             iface.qos_trust = w[2]
+        elif w in (["no", "lldp", "transmit"], ["no", "lldp", "receive"]):
+            setattr(iface, "lldp_tx" if w[2] == "transmit" else "lldp_rx", False)
         elif w[:2] == ["ip", "helper-address"] and n >= 3:
             iface.helper_addresses.append(w[2])
             if n == 5 and w[3] == "vrf":

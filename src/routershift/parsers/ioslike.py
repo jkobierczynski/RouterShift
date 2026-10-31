@@ -19,6 +19,7 @@ from .. import acl as acl_text
 from .. import bgp as bgp_text
 from .. import fhrp
 from .. import ospf as ospf_text
+from .. import mgmt as mgmt_text
 from .. import qos as qos_text
 from .. import confparse, names
 from .. import dhcp as dhcp_text
@@ -136,6 +137,11 @@ class _Reader:
             "mpls": self.mpls,
             "wlan": self.wlan,
             "wireless": self.wireless,
+            "line": self.line,
+            "lldp": self.discovery,
+            "cdp": self.discovery,
+            "no": self.no_global,
+            "management": self.management,
         }
         for node in roots:
             if node.text.startswith(_NOISE) or node.text == "end":
@@ -298,6 +304,13 @@ class _Reader:
 
     def logging(self, node: Node) -> bool:
         w = node.words
+        s = self.device.system
+        if len(w) == 3 and w[1] == "trap" and mgmt_text.level(w[2]) is not None:
+            s.logging_level = mgmt_text.level(w[2])
+            return True
+        if len(w) == 3 and w[1] == "source-interface":
+            s.logging_source = names.canonical(w[2])[0]
+            return True
         args = w[2:] if len(w) >= 3 and w[1] == "host" else w[1:]
         if args and args[0] == "vrf" and len(args) >= 3:  # EOS: logging vrf X host Y
             self.device.system.service_vrf = args[1]
@@ -320,6 +333,13 @@ class _Reader:
 
     def ip(self, node: Node) -> bool:
         w = node.words
+        m = self.device.management
+        if w[1:] == ["ssh", "version", "2"]:
+            m.ssh = True
+            return True
+        if w[1:] in (["http", "server"], ["http", "secure-server"]):
+            setattr(m, "http" if w[2] == "server" else "https", True)
+            return True
         if w[1:2] == ["routing"]:
             return True  # implied by the presence of layer 3 configuration
         if w[1:2] in (["domain-name"], ["domain"]) and len(w) >= 3:
@@ -1314,6 +1334,71 @@ class _Reader:
             return True
         return False
 
+    def line(self, node: Node) -> bool:
+        """IOS: line vty 0 15 with transport input, access-class and exec-timeout; other lines stay unread."""
+        w = node.words
+        if w[1:2] != ["vty"]:
+            return False
+        m = self.device.management
+        for child in node.children:
+            c = child.words
+            if c[:2] == ["transport", "input"] and len(c) >= 3:
+                allowed = set(c[2:])
+                if not allowed <= {"ssh", "telnet", "all", "none"}:
+                    self.unparsed(child, node.text)
+                    continue
+                m.ssh = bool(allowed & {"ssh", "all"})
+                m.telnet = bool(allowed & {"telnet", "all"})
+            elif c[0] == "access-class" and len(c) in (3, 4) and c[2] == "in" and c[3:] in ([], ["vrf-also"]):
+                m.vty_acl = c[1]
+            elif c[0] == "exec-timeout" and len(c) in (2, 3) and all(x.isdigit() for x in c[1:]):
+                m.exec_timeout = int(c[1]) + (1 if c[2:] and int(c[2]) else 0)
+            else:
+                self.unparsed(child, node.text)
+        return True
+
+    def discovery(self, node: Node) -> bool:
+        """lldp run, cdp run (the no forms come through no_global)."""
+        if node.words[1:] == ["run"]:
+            setattr(self.device.management, node.words[0], True)
+            return True
+        return False
+
+    def no_global(self, node: Node) -> bool:
+        w = node.words
+        m = self.device.management
+        if w[1:] in (["lldp", "run"], ["cdp", "run"]):
+            setattr(m, w[1], False)
+            return True
+        if w[1:] in (["ip", "http", "server"], ["ip", "http", "secure-server"]):
+            setattr(m, "http" if w[3] == "server" else "https", False)
+            return True
+        return False
+
+    def management(self, node: Node) -> bool:
+        """EOS: management ssh (shutdown, idle-timeout, ip access-group, vrf V with no shutdown) and management
+        telnet."""
+        w = node.words
+        m = self.device.management
+        if w[1:] not in (["ssh"], ["telnet"]):
+            return False
+        server = w[1]
+        setattr(m, server, True)
+        for child in node.children:
+            c = child.words
+            if c in (["shutdown"], ["no", "shutdown"]):
+                setattr(m, server, c[0] == "no")
+            elif server == "ssh" and c[0] == "idle-timeout" and len(c) == 2 and c[1].isdigit():
+                m.exec_timeout = int(c[1])
+            elif server == "ssh" and c[:2] == ["ip", "access-group"] and len(c) in (4, 6) and c[-1] == "in":
+                m.vty_acl = c[2]
+            elif server == "ssh" and c[0] == "vrf" and len(c) == 2 \
+                    and all(g.words in (["no", "shutdown"],) for g in child.children):
+                m.vrf = c[1]
+            else:
+                self.unparsed(child, node.text)
+        return True
+
     def wlan(self, node: Node) -> bool:
         """IOS XE controller: wlan NAME ID SSID, with WPA2 802.1X unless told otherwise."""
         w = node.words
@@ -1740,6 +1825,10 @@ class _Reader:
             iface.qos_trust = w[3]
         elif w[:2] == ["qos", "trust"] and n == 3 and w[2] in ("dscp", "cos", "disabled"):
             iface.qos_trust = "none" if w[2] == "disabled" else w[2]
+        elif w in (["no", "lldp", "transmit"], ["no", "lldp", "receive"]):
+            setattr(iface, "lldp_tx" if w[2] == "transmit" else "lldp_rx", False)
+        elif w in (["cdp", "enable"], ["no", "cdp", "enable"]):
+            iface.cdp = w[0] == "cdp"
         elif w == ["mpls", "ip"] or w == ["mpls", "ldp", "interface"]:
             # IOS: mpls ip (label switching and LDP); EOS: mpls ldp interface (mpls ip is the EOS default)
             if self.device.platform == "ios" or w[1] == "ldp":

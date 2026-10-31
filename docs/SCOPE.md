@@ -48,6 +48,7 @@ platform converts to and from all the others.
 | QoS: classes (DSCP or ACL), policies with DSCP marking and policing, policies on ports, port trust | `QosClass`, `QosPolicy`, `QosAction`, `Interface.qos_*` | 3 (done) |
 | MPLS: label switching with LDP on interfaces, the LDP router ID | `Mpls`, `Interface.mpls` | 3 (done) |
 | WLAN: SSIDs with their VLAN, security (open, WPA2-PSK, WPA2-Enterprise) and state, on IOS XE and Comware controllers | `Wlan` | 3 (done) |
+| Management access: SSH, Telnet, HTTP and HTTPS servers, remote login ACL and idle timeout, syslog level and source, LLDP and CDP | `Management`, `System.logging_*`, `Interface.lldp_*` | 3 (done) |
 | LDAP and Kerberos servers (listed under "Not understood") | to come | 3+ |
 | Route maps, prefix lists, MLAG/VSX/vPC, VXLAN/EVPN | to come | 3+ |
 
@@ -189,6 +190,28 @@ platform converts to and from all the others.
   `loop-protect` as the alternative).
 * Per-instance and per-VLAN port costs and priorities, and timers (hello, forward delay, max age), are listed under
   "Not understood" for now.
+
+## Management access, logging, LLDP and CDP
+
+* What the source states is converted; what it leaves to the platform default stays unwritten, so the target keeps
+  its own default.
+* IOS: `ip ssh version 2`, `[no] ip http server|secure-server`, `line vty` with `transport input`, `access-class` and
+  `exec-timeout` (the writer uses `line vty 0 15` and asks for the host key to be generated). EOS: `management ssh`
+  (`ip access-group`, `idle-timeout`, `vrf V`), `management telnet`. AOS-CX: `ssh server vrf`, `https-server vrf`,
+  `cli-session timeout`. AOS-S: `[no] ip ssh`, `[no] telnet-server`, `web-management plaintext|ssl`, `console
+  idle-timeout` (in seconds). Comware: `ssh server enable`, `telnet server enable`, `ip http(s) enable`, and
+  `protocol inbound` and `idle-timeout` on `line vty 0 63`.
+* Reported limits: AOS-CX has no Telnet or plain HTTP server, EOS no web interface (its eAPI is not converted). Only
+  IOS and EOS take an ACL on remote logins; AOS-CX (control-plane ACL), AOS-S (`ip authorized-managers`) and Comware
+  (`ssh server acl` by number) are left to a person. AOS-S and Comware have no management VRF for the servers.
+* Syslog keeps its level (IOS and EOS `logging trap`, AOS-CX `severity` per server, AOS-S `logging severity` with five
+  levels, the nearest one that sends at least as much; Comware `info-center source default loghost level`) and its
+  source interface.
+* LLDP on or off, and per port transmit and receive (`no lldp transmit|receive`, AOS-S `lldp admin-status PORTS
+  txonly|rxonly|disable`, Comware `lldp admin-status tx|rx|disable`). CDP is kept on IOS and AOS-S; EOS, AOS-CX and
+  Comware have none and report it (LLDP announces the switch).
+* Console and AUX lines, banners other than the MOTD, logging buffers, facilities and timestamps, and SSH ciphers are
+  listed under "Not understood" for now.
 
 ## Wireless (WLAN)
 

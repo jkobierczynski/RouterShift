@@ -25,6 +25,7 @@ from .. import acl as acl_text
 from .. import confparse
 from .. import dhcp as dhcp_text
 from .. import ospf as ospf_text
+from .. import mgmt as mgmt_text
 from .. import qos as qos_text
 from ..confparse import Node
 from ..errors import ParseError
@@ -137,6 +138,12 @@ class _Reader:
             "policy": self.qos_policy,
             "router": self.router,
             "dhcp-server": self.dhcp_server,
+            "telnet-server": self.server,
+            "web-management": self.server,
+            "console": self.console,
+            "lldp": self.lldp,
+            "cdp": lambda node: node.words == ["cdp", "run"] and self._set("cdp", True),
+            "no": self.no_global,
         }
         for node in roots:
             if node.text.startswith(_NOISE):
@@ -361,7 +368,53 @@ class _Reader:
             return True
         return False
 
+    def _set(self, name: str, value: bool) -> bool:
+        setattr(self.device.management, name, value)
+        return True
+
+    def server(self, node: Node) -> bool:
+        """telnet-server, web-management plaintext|ssl (the no forms come through no_global)."""
+        w = node.words
+        if w == ["telnet-server"]:
+            return self._set("telnet", True)
+        if w in (["web-management", "plaintext"], ["web-management", "ssl"]):
+            return self._set("http" if w[1] == "plaintext" else "https", True)
+        return False
+
+    def console(self, node: Node) -> bool:
+        """console idle-timeout SECONDS (remote sessions too); kept in minutes."""
+        w = node.words
+        if w[1:2] == ["idle-timeout"] and len(w) == 3 and w[2].isdigit():
+            self.device.management.exec_timeout = -(-int(w[2]) // 60)
+            return True
+        return False
+
+    def lldp(self, node: Node) -> bool:
+        """lldp run, lldp admin-status PORTS txonly|rxonly|disable."""
+        w = node.words
+        if w == ["lldp", "run"]:
+            return self._set("lldp", True)
+        if w[1:2] == ["admin-status"] and len(w) == 4 and w[3] in ("txonly", "rxonly", "disable", "tx_rx"):
+            for name in ports(w[2]):
+                iface = self.port(name)
+                iface.lldp_tx = w[3] in ("txonly", "tx_rx")
+                iface.lldp_rx = w[3] in ("rxonly", "tx_rx")
+            return True
+        return False
+
+    def no_global(self, node: Node) -> bool:
+        w = node.words[1:]
+        if w in (["ip", "ssh"], ["telnet-server"], ["lldp", "run"], ["cdp", "run"]):
+            return self._set({"ip": "ssh", "telnet-server": "telnet", "lldp": "lldp", "cdp": "cdp"}[w[0]], False)
+        if w in (["web-management", "plaintext"], ["web-management", "ssl"]):
+            return self._set("http" if w[1] == "plaintext" else "https", False)
+        return False
+
     def logging(self, node: Node) -> bool:
+        w = node.words
+        if w[1:2] == ["severity"] and len(w) == 3 and w[2] in mgmt_text.AOSS.values():
+            self.device.system.logging_level = mgmt_text.level(w[2])
+            return True
         if len(node.words) == 2 and _is_address(node.words[1]):
             self.device.system.syslog_servers.append(node.words[1])
             return True
@@ -369,10 +422,14 @@ class _Reader:
 
     def ip(self, node: Node) -> bool:
         w = node.words
-        if w[1] == "source-interface" and len(w) == 5 and w[2] in ("radius", "tacacs", "tftp") \
+        if w[1:] == ["ssh"]:
+            return self._set("ssh", True)
+        if w[1] == "source-interface" and len(w) == 5 and w[2] in ("radius", "tacacs", "tftp", "syslog") \
                 and w[3] in ("vlan", "loopback"):
             source = f"{'Vlan' if w[3] == 'vlan' else 'Loopback'}{w[4]}"
-            if w[2] == "tftp":
+            if w[2] == "syslog":
+                self.device.system.logging_source = source
+            elif w[2] == "tftp":
                 self.device.system.transfer_source["tftp"] = source
             else:
                 self.device.aaa.source[w[2]] = source
