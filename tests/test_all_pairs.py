@@ -1,3 +1,5 @@
+from typing import Optional
+
 import pytest
 from helpers import DATA
 
@@ -5,11 +7,12 @@ from routershift import bgp as bgp_text
 from routershift import nat as nat_text
 from routershift import aaa as aaa_text
 from routershift import snmp as snmp_text
+from routershift import stp as stp_text
 from routershift import vpn as vpn_text
 from routershift import ospf as ospf_text
 from routershift.acl import safe_name
 from routershift.convert import PLATFORMS, convert, parse
-from routershift.model import AclAction, Device, InterfaceKind
+from routershift.model import AclAction, Device, InterfaceKind, StpMode
 
 SAMPLES = {"ios": "ios_access.cfg", "eos": "eos_leaf.cfg", "aoscx": "aoscx_access.cfg", "aoss": "aoss_edge.cfg",
            "comware": "comware_access.cfg"}
@@ -137,6 +140,23 @@ def test_converts_and_reads_back(source: str, target: str) -> None:
         sorted(k for k, source in dev.system.transfer_source.items() if not (aos and k == "ftp") and not (
             target == "aoss" and not source.startswith(("Vlan", "Loopback")))))
     assert dot1x(first) == dot1x(back)
+    # Spanning tree keeps the bridge priority of every VLAN (per VLAN or through its MST instance), the MST region,
+    # and the guards, BPDU filter, cost and priority of the ports (AOS-S has no loop guard)
+    def priority(dev: Device, vlan: int) -> Optional[int]:
+        instance = next((n for n, vlans in dev.stp.instances.items() if vlan in vlans), 0)
+        return dev.stp.vlan_priority.get(vlan, dev.stp.priority.get(instance, dev.stp.priority.get(0)))
+
+    vlans = sorted(first.vlans) or [1]
+    assert [priority(first, v) for v in vlans] == [priority(back, v) for v in vlans]
+    if first.stp_mode == StpMode.MSTP:
+        region = lambda dev: (dev.stp.region, dev.stp.revision, dev.stp.instances)  # noqa: E731
+        assert region(first) == region(back)
+    stp_ports = lambda dev: sorted(  # noqa: E731
+        ("" if target == "aoss" and i.stp_guard == "loop" else i.stp_guard, i.stp_bpdufilter, i.stp_cost,
+         i.stp_port_priority) for i in dev.interfaces.values() if stp_text.has_port_settings(i)
+        and not (target == "aoss" and i.stp_guard == "loop" and not (i.stp_bpdufilter or i.stp_cost or
+                                                                     i.stp_port_priority)))
+    assert stp_ports(first) == stp_ports(back)
     # BGP keeps every neighbor with its settings (peer groups may be written out on their members), networks and
     # redistribution; AOS-S leaves it to a person
     if first.bgp is not None and target == "aoss":

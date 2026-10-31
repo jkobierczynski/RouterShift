@@ -34,7 +34,7 @@ platform converts to and from all the others.
 | Static routes | `StaticRoute` | 1 |
 | DHCP server: pools, ranges and exclusions, gateways, DNS, domain, lease | `DhcpPool` | 2 (done) |
 | Gateway redundancy: HSRP, VRRP, anycast gateways (IPv4) | `FhrpGroup` | 2 (done) |
-| Spanning tree mode, edge ports, BPDU guard | `Device.stp_mode`, `Interface` | 2 |
+| Spanning tree: mode, bridge priorities (per instance or per VLAN), MST region, edge ports, BPDU guard and filter, root and loop guard, port cost and priority | `Device.stp_mode`, `Stp`, `Interface.stp_*` | 3 (done) |
 | OSPFv2: processes per VRF, areas and area types, passive interfaces, redistribution, cost, network type | `Ospf`, `Interface.ospf_cost` | 2 (done) |
 | BGP: neighbors, peer groups, IPv4/IPv6 activation, networks, redistribution | `Bgp`, `BgpNeighbor` | 2 (done) |
 | Access lists (IPv4 and IPv6) and their interface bindings | `Acl`, `AclEntry`, `Interface.acl_in` ... | 2 (done) |
@@ -170,6 +170,22 @@ platform converts to and from all the others.
 * Communities and keys in clear text are carried over. Encrypted ones (Comware cipher, AOS-CX ciphertext, EOS
   localized keys, IOS and EOS type 7 NTP keys) become `CHANGE-ME`, and the report asks for them. The report never
   shows a community or key: communities are numbered (`community #1 (ro)`).
+
+## Spanning tree
+
+* The mode carries over where the target has it (IOS has no RSTP and writes rapid PVST+; AOS-CX has no RSTP and
+  writes MSTP; PVST+ becomes the rapid variant).
+* Bridge priorities follow the mode the target runs: per MST instance (instance 0 for STP and RSTP) or per VLAN for
+  PVST. MST priorities going to PVST are written for each VLAN defined, through the instance the VLAN is in (reported).
+  Per-VLAN priorities going to MST become one priority for the common tree; when they differed the lowest is written
+  and the report suggests MST instances for load sharing.
+* The MST region (name, revision, instance-to-VLAN map) is written where the target runs MSTP and reported otherwise.
+* AOS-CX and AOS-S count bridge priorities in steps of 4096 and port priorities in steps of 16; the readers and writers
+  convert to and from 0-61440 and 0-240.
+* Ports keep root and loop guard, BPDU filter, cost and port priority. AOS-S has no loop guard (reported, with
+  `loop-protect` as the alternative).
+* Per-instance and per-VLAN port costs and priorities, and timers (hello, forward delay, max age), are listed under
+  "Not understood" for now.
 
 ## Users and AAA
 

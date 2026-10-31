@@ -412,6 +412,27 @@ class _Reader:
         if w[1:2] == ["mode"] and len(w) == 3 and w[2] in ("mstp", "rpvst"):
             self.device.stp_mode = StpMode.MSTP if w[2] == "mstp" else StpMode.RAPID_PVST
             return True
+        stp = self.device.stp
+        # priorities are multipliers of 4096: spanning-tree [instance N | vlan LIST] priority M
+        if w[1] == "priority" and len(w) == 3:
+            stp.priority[0] = int(w[2]) * 4096
+            return True
+        if w[1] == "instance" and len(w) == 5 and w[3] == "priority":
+            stp.priority[int(w[2])] = int(w[4]) * 4096
+            return True
+        if w[1] == "vlan" and len(w) == 5 and w[3] == "priority":
+            for vlan in _vlan_ids(w[2]):
+                stp.vlan_priority[vlan] = int(w[4]) * 4096
+            return True
+        if w[1] == "instance" and len(w) == 5 and w[3] == "vlan":
+            stp.instances.setdefault(int(w[2]), []).extend(_vlan_ids(w[4]))
+            return True
+        if w[1] == "config-name" and len(w) == 3:
+            stp.region = w[2]
+            return True
+        if w[1] == "config-revision" and len(w) == 3:
+            stp.revision = int(w[2])
+            return True
         return False
 
     def route(self, node: Node, args: List[str]) -> bool:
@@ -782,6 +803,14 @@ class _Reader:
             iface.stp_portfast = w[2] == "admin-edge"
         elif w == ["spanning-tree", "bpdu-guard"]:
             iface.stp_bpduguard = True
+        elif w in (["spanning-tree", "root-guard"], ["spanning-tree", "loop-guard"]):
+            iface.stp_guard = w[1][:-len("-guard")]
+        elif w == ["spanning-tree", "bpdu-filter"]:
+            iface.stp_bpdufilter = True
+        elif w[:2] == ["spanning-tree", "cost"] and n == 3:
+            iface.stp_cost = int(w[2])
+        elif w[:2] == ["spanning-tree", "port-priority"] and n == 3:
+            iface.stp_port_priority = int(w[2]) * 16  # a multiplier of 16
         else:
             return False
         return True

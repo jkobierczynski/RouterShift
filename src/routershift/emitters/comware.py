@@ -17,6 +17,7 @@ from .. import nat as nat_text
 from .. import vpn as vpn_text
 from .. import ospf as ospf_text
 from .. import snmp as snmp_text
+from .. import stp as stp_text
 from ..model import (AaaMethod, AaaServer, AclAction, AclEntry, BgpNeighbor, Device, FhrpGroup, IpsecPeer, SnmpGroup, Interface, InterfaceKind, LacpMode, NatRule,
                      Ospf, StaticRoute, StpMode, SwitchportMode)
 from ..names import PortMapper
@@ -426,6 +427,25 @@ class Writer:
         mode = self.device.stp_mode
         if mode == StpMode.NONE or (mode is None and not self.is_switch):
             return
+        written = StpMode.RAPID_PVST if mode in stp_text.PER_VLAN else mode or StpMode.MSTP
+        if stp_text.region(self.device, written, self.report):
+            s = self.device.stp
+            self.out.append("stp region-configuration")
+            self.out += [f"{_IND}region-name {s.region}"] if s.region else []
+            self.out += [f"{_IND}revision-level {s.revision}"] if s.revision is not None else []
+            self.out += [f"{_IND}instance {n} vlan {vlan_words(stp_text.vlan_text(v))}"
+                         for n, v in sorted(s.instances.items())]
+            self.out += [f"{_IND}active region-configuration"]
+            self.block_end()
+        instances, vlans = stp_text.priorities(self.device, written, self.report)
+        for instance, priority in sorted(instances.items()):
+            self.out.append(f"{_IND}stp priority {priority}" if instance == 0 else
+                            f"{_IND}stp instance {instance} priority {priority}")
+        for priority in sorted(set(vlans.values())):
+            members = stp_text.vlan_text([v for v, p in vlans.items() if p == priority])
+            self.out.append(f"{_IND}stp vlan {vlan_words(members)} priority {priority}")
+        if instances or vlans:
+            self.report.item("system", "bridge priority")
         if mode is None:
             self.report.add("system", "spanning-tree mode", Severity.APPROX, "stp-default",
                             "the source runs spanning tree in its default mode; written as Comware's default, MSTP")
@@ -567,6 +587,14 @@ class Writer:
         lines += self._dot1x(iface, add)
         if iface.stp_portfast:
             lines.append("stp edged-port")
+        if iface.stp_guard:
+            lines.append(f"stp {iface.stp_guard}-protection")
+        if iface.stp_bpdufilter:
+            lines.append("stp port bpdu-filter enable")
+        if iface.stp_cost is not None:
+            lines.append(f"stp cost {iface.stp_cost}")
+        if iface.stp_port_priority is not None:
+            lines.append(f"stp port priority {iface.stp_port_priority}")
         lines.append("shutdown" if iface.shutdown else "undo shutdown")
         mode = f" mode {iface.tunnel_mode}" if iface.kind == InterfaceKind.TUNNEL and iface.tunnel_mode else ""
         self.out.append(f"interface {name}{mode}")
