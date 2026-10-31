@@ -25,6 +25,7 @@ from .. import vrfs as vrfs_text
 from .. import multicast as multicast_text
 from .. import monitor as monitor_text
 from .. import tracking as tracking_text
+from .. import vxlan as vxlan_text
 from .. import igp as igp_text
 from .. import routemap as routemap_text
 from .. import qos as qos_text
@@ -95,6 +96,8 @@ class _Reader:
         self._flow_monitors: Dict[str, Tuple[List[str], str]] = {}  # IOS flow monitor -> exporters, record
         self._sflow_run = False  # EOS: sflow run
         self._sflow_off: List[str] = []  # EOS: ports with no sflow enable
+        self._nve_vrfs: Dict[int, str] = {}  # IOS nve: layer 3 VNI -> VRF
+        self._nve_vlans: Dict[int, int] = {}  # IOS: VNI -> VLAN of vlan configuration / member vni
 
     def unparsed(self, node: Node, section: str = "") -> None:
         self.device.unparsed.append(Unparsed(node.line, node.text, section))
@@ -160,6 +163,7 @@ class _Reader:
             "sflow": self.sflow,
             "flow": self.flow,
             "track": self.track,
+            "l2vpn": self.l2vpn,
         }
         for node in roots:
             if node.text.startswith(_NOISE) or node.text == "end":
@@ -1532,6 +1536,11 @@ class _Reader:
                 continue
             if w[0] == "address-family" and w[1:] in (["ipv4"], ["ipv4", "unicast"], ["ipv6"], ["ipv6", "unicast"]):
                 af = w[1]
+            elif w[0] == "address-family" and w[1:] in (["evpn"], ["l2vpn", "evpn"]):
+                af = "evpn"
+            elif w[0] == "vlan" and len(w) == 2 and w[1].isdigit() and self.device.platform == "eos":
+                self._eos_evpn_vlan(int(w[1]), child)
+                continue
             elif w[0] == "address-family":
                 self.unparsed(child, node.text)
                 continue
@@ -1545,6 +1554,92 @@ class _Reader:
                 if not understood:
                     self.unparsed(line, child.text if af else node.text)
         self.device.bgp = b.finish()
+        return True
+
+    def _eos_evpn_vlan(self, vid: int, node: Node) -> None:
+        """EOS: router bgp / vlan N with rd auto, route-target both auto, redistribute learned."""
+        vxlan_text.vtep(self.device).evpn_vlans.append(vid)
+        for child in node.children:
+            if child.words not in (["rd", "auto"], ["route-target", "both", "auto"], ["redistribute", "learned"]):
+                self.unparsed(child, node.text)
+
+    def _vxlan_interface(self, node: Node) -> bool:
+        """EOS interface Vxlan1 (vxlan source-interface, udp-port, vlan N vni V, vrf V vni N, flood vtep A..);
+        IOS interface nve1 (source-interface, host-reachability protocol bgp, member vni N [vrf V] with its
+        ingress-replication peers)."""
+        vx = vxlan_text.vtep(self.device)
+        vx.origin = Origin(node.line, node.text)
+        for child in node.children:
+            w = child.words
+            n = len(w)
+            if w[0] == "vxlan" and n >= 2:
+                w = w[1:]
+                n -= 1
+                if w[0] == "source-interface" and n == 2:
+                    vx.source_interface = names.canonical(w[1])[0]
+                elif w[0] == "udp-port" and n == 2:
+                    vx.udp_port = int(w[1])
+                elif w[0] == "vlan" and n == 4 and w[2] == "vni":
+                    vx.vlan_vnis[int(w[1])] = int(w[3])
+                elif w[0] == "vrf" and n == 4 and w[2] == "vni":
+                    vx.vrf_vnis[w[1]] = int(w[3])
+                elif w[:2] == ["flood", "vtep"] and n >= 3:
+                    vx.flood_vteps += [str(ipaddress.ip_address(a)) for a in w[2:]]
+                else:
+                    self.unparsed(child, node.text)
+            elif w[0] == "source-interface" and n == 2:
+                vx.source_interface = names.canonical(w[1])[0]
+            elif w == ["host-reachability", "protocol", "bgp"]:
+                pass  # the VNIs of the EVPN instances are learned by BGP
+            elif w[:2] == ["member", "vni"] and n in (3, 4, 5):
+                vni = int(w[2])
+                if w[3:4] == ["vrf"] and n == 5:
+                    self._nve_vrfs[vni] = w[4]
+                elif w[3:] not in ([], ["ingress-replication"]):
+                    self.unparsed(child, node.text)
+                for grand in child.children:
+                    g = grand.words
+                    if g[0] == "ingress-replication" and len(g) == 2:
+                        if g[1] not in vx.flood_vteps:
+                            vx.flood_vteps.append(str(ipaddress.ip_address(g[1])))
+                    else:
+                        self.unparsed(grand, f"{node.text} / {child.text}")
+            elif w in (["no", "ip", "address"], ["no", "shutdown"]) or w[0] == "description":
+                pass
+            else:
+                self.unparsed(child, node.text)
+        return True
+
+    def l2vpn(self, node: Node) -> bool:
+        """IOS: l2vpn evpn (replication-type ingress, router-id X) and l2vpn evpn instance N vlan-based (encapsulation
+        vxlan)."""
+        w = node.words
+        if w == ["l2vpn", "evpn"]:
+            ok = ("replication-type", "router-id", "logging")
+            for child in node.children:
+                if child.words[0] not in ok:
+                    self.unparsed(child, node.text)
+            return True
+        if w[:3] == ["l2vpn", "evpn", "instance"] and len(w) == 5 and w[4] == "vlan-based":
+            for child in node.children:
+                if child.words not in (["encapsulation", "vxlan"], ["replication-type", "ingress"]):
+                    self.unparsed(child, node.text)
+            return True
+        return False
+
+    def vlan_configuration(self, node: Node) -> bool:
+        """IOS: vlan configuration N / member evpn-instance E vni V, or member vni V (a layer 3 VNI's VLAN)."""
+        vid = int(node.words[2])
+        for child in node.children:
+            c = child.words
+            if c[:2] == ["member", "evpn-instance"] and len(c) == 5 and c[3] == "vni":
+                vx = vxlan_text.vtep(self.device)
+                vx.vlan_vnis[vid] = int(c[4])
+                vx.evpn_vlans.append(vid)
+            elif c[:2] == ["member", "vni"] and len(c) == 3:
+                self._nve_vlans[int(c[2])] = vid
+            else:
+                self.unparsed(child, node.text)
         return True
 
     def _eos_bgp_vrf(self, name: str, node: Node) -> None:
@@ -1945,6 +2040,8 @@ class _Reader:
 
     def vlan(self, node: Node) -> bool:
         w = node.words
+        if w[1:2] == ["configuration"] and len(w) == 3 and w[2].isdigit() and self.device.platform == "ios":
+            return self.vlan_configuration(node)
         if len(w) != 2:
             return False
         try:
@@ -2005,6 +2102,8 @@ class _Reader:
 
     def interface(self, node: Node) -> bool:
         source = " ".join(node.words[1:])
+        if source.lower().startswith("vxlan" if self.device.platform == "eos" else "nve"):
+            return self._vxlan_interface(node)
         canon, kind, media = names.canonical(source)
         iface = Interface(canon, kind, source_name=source, media=media, origin=Origin(node.line, node.text))
         if kind == InterfaceKind.SUBINTERFACE:
@@ -2419,6 +2518,12 @@ class _Reader:
         self._finish_vpn()
         multicast_text.finish(self.device)
         self._finish_monitor()
+        if self.device.vxlan is not None:
+            for vni, vrf in self._nve_vrfs.items():
+                self.device.vxlan.vrf_vnis[vrf] = vni
+            for vni, vid in self._nve_vlans.items():  # a VLAN mapped to a VNI without EVPN floods to static peers
+                if vni not in self._nve_vrfs:
+                    self.device.vxlan.vlan_vnis[vid] = vni
         for wl in self.device.wlans:
             wl.vlan = self._wlan_profiles.get(self._wlan_tags.get(wl.name, ""))
         self._finish_aaa()
@@ -2494,6 +2599,8 @@ def ioslike_neighbor(b: bgp_text.Builder, name: str, w: List[str], af: str) -> b
         peer.next_hop_self = True
     elif w[0] == "send-community" and w[1:] in ([], ["both"], ["standard"]):
         peer.send_community = True
+    elif w == ["send-community", "extended"]:  # implied for EVPN
+        pass
     elif w == ["activate"]:
         b.activate(name, af or "ipv4")
     elif w in (["fall-over", "bfd"], ["bfd"]):

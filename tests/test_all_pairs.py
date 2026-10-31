@@ -20,6 +20,7 @@ from routershift import igp as igp_text
 from routershift import multicast as multicast_text
 from routershift import monitor as monitor_text
 from routershift import hosts as hosts_text
+from routershift import vxlan as vxlan_text
 from routershift import routemap as routemap_text
 from routershift import ospf as ospf_text
 from routershift.acl import safe_name
@@ -262,7 +263,11 @@ def test_converts_and_reads_back(source: str, target: str) -> None:
     elif first.bgp is not None:
         assert back.bgp is not None
         assert (back.bgp.local_as, back.bgp.router_id) == (first.bgp.local_as, first.bgp.router_id)
-        assert bgp_text.flat(back.bgp) == bgp_text.flat(first.bgp)
+        expected = bgp_text.flat(first.bgp)
+        if target == "comware":  # EVPN is reported, not written
+            for n in expected:
+                n.families = [f for f in n.families if f != "evpn"]
+        assert bgp_text.flat(back.bgp) == expected
         assert sorted(back.bgp.networks) == sorted(first.bgp.networks)
         assert (back.bgp.redistribute, back.bgp.redistribute6) == (first.bgp.redistribute, first.bgp.redistribute6)
     # VRF route leaking keeps every route distinguisher and route target outside the management VRF; AOS-S has no
@@ -418,4 +423,15 @@ def test_converts_and_reads_back(source: str, target: str) -> None:
         sorted(hosts_text.poe_priority(i, allowed, lambda *a: None, target) for i in on(first) if i.poe_priority)
     assert sorted(i.poe_max_mw for i in on(back) if i.poe_max_mw) == \
         (sorted(i.poe_max_mw for i in on(first) if i.poe_max_mw) if target in ("ios", "eos", "comware") else [])
+    # VXLAN keeps its source, the VNIs of VLANs and VRFs (IOS: VLANs only), the static flood list and the VLANs EVPN
+    # advertises (IOS, EOS, AOS-CX)
+    if first.vxlan is None or target in ("aoss", "comware"):
+        assert back.vxlan is None
+    else:
+        fx, bx = first.vxlan, back.vxlan
+        assert bx is not None
+        assert bool(bx.source_interface) == bool(fx.source_interface)
+        assert bx.vlan_vnis == fx.vlan_vnis and sorted(bx.evpn_vlans) == sorted(fx.evpn_vlans)
+        assert sorted(bx.vrf_vnis.values()) == ([] if target == "ios" else sorted(fx.vrf_vnis.values()))
+        assert bx.flood_vteps == (fx.flood_vteps if set(fx.vlan_vnis) - set(fx.evpn_vlans) else bx.flood_vteps)
     assert report.counts()

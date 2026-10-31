@@ -12,6 +12,7 @@ from typing import Callable, Dict, List, Tuple
 from .. import acl as acl_text
 from .. import multicast as multicast_text
 from .. import monitor as monitor_text
+from .. import vxlan as vxlan_text
 from .. import tracking as tracking_text
 from .. import hosts as hosts_text
 from .. import bfd as bfd_text
@@ -83,6 +84,7 @@ class Writer:
         for iface in sorted(self.device.interfaces.values(), key=lambda i: order.get(i.kind, 2)):
             self.interface(iface)
         self.vsx()
+        self.vxlan()
         self.monitor()
         tracking_text.plan(self.device, self.report, "aoscx", "AOS-CX")
         self.routes()
@@ -592,6 +594,33 @@ class Writer:
             self.report.item("system", "multicast routing")
             self.out += ["router pim", f"{_IND}enable"] + [f"{_IND}rp-address {rp}" for rp in d.pim_rps]
 
+    def vxlan(self) -> None:
+        """interface vxlan 1 with its VNIs, and the evpn block for the VLANs EVPN advertises."""
+        d = self.device
+        vx = d.vxlan
+        if vx is None:
+            return
+        vxlan_text.item(d, self.report)
+        self.out.append("interface vxlan 1")
+        source = vxlan_text.source_address(d)
+        if source:
+            self.out.append(f"{_IND}source ip {source}")
+        elif vx.source_interface:
+            self.report.add("interface", vxlan_text.LABEL, Severity.REVIEW, "vxlan-source",
+                            f"AOS-CX takes a source address; {vx.source_interface} has none, left out")
+        self.out.append(f"{_IND}no shutdown")
+        for vid, vni in vx.vlan_vnis.items():
+            self.out += [f"{_IND}vni {vni}", f"{_IND * 2}vlan {vid}"]
+            if vid not in vx.evpn_vlans:
+                self.out += [f"{_IND * 2}vtep-peer {a}" for a in vx.flood_vteps]
+        for vrf, vni in vx.vrf_vnis.items():
+            self.out += [f"{_IND}vni {vni}", f"{_IND * 2}vrf {self.vrf(vrf)}"]
+        if vx.evpn_vlans:
+            self.out.append("evpn")
+            for vid in vx.evpn_vlans:
+                self.out += [f"{_IND}vlan {vid}", f"{_IND * 2}rd auto", f"{_IND * 2}route-target export auto",
+                             f"{_IND * 2}route-target import auto"]
+
     def monitor(self) -> None:
         """Mirror sessions and sFlow; AOS-CX NetFlow (IPFIX) is not written."""
         d = self.device
@@ -855,6 +884,12 @@ class Writer:
                 lines.append(f"address-family {af} unicast")
                 lines += [_IND + line for line in body]
                 lines.append("exit-address-family")
+        evpn = [p for p in neighbors if "evpn" in p.families]
+        if evpn:
+            lines.append("address-family l2vpn evpn")
+            for p in evpn:
+                lines += [f"{_IND}neighbor {p.address} activate", f"{_IND}neighbor {p.address} send-community extended"]
+            lines.append("exit-address-family")
         self.out.append(f"router bgp {bgp.local_as}")
         self.out += [_IND + line for line in lines]
 
