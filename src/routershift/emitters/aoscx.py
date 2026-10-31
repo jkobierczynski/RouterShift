@@ -12,6 +12,7 @@ from typing import Callable, Dict, List, Tuple
 from .. import acl as acl_text
 from .. import bgp as bgp_text
 from .. import dhcp as dhcp_text
+from .. import l2sec as l2sec_text
 from .. import mgmt as mgmt_text
 from .. import mpls as mpls_text
 from .. import nat as nat_text
@@ -156,6 +157,28 @@ class Writer:
         self.users()
         self.aaa()
         self.out.append("!")
+
+    def _l2sec_interface(self, iface: Interface, add: Callable[[Severity, str, str], None]) -> List[str]:
+        lines = []
+        if iface.dhcp_trust:
+            lines.append("dhcpv4-snooping trust")
+        if iface.arp_trust:
+            lines.append("arp inspection trust")
+        if iface.source_guard:
+            lines.append("ipv4 source-lockdown")
+        if iface.port_security:
+            lines += ["port-access port-security", "    enable"]
+            if iface.port_security_max is not None:
+                lines.append(f"    client-limit {iface.port_security_max}")
+            if iface.port_security_violation not in ("", "shutdown"):
+                add(Severity.REVIEW, "port-security",
+                    f"violation mode {iface.port_security_violation} is not written; set the AOS-CX port security "
+                    "violation action by hand")
+        if iface.storm_control:
+            levels = ", ".join(f"{k} {l2sec_text.level_text(v)}%" for k, v in iface.storm_control.items())
+            add(Severity.REVIEW, "storm-control",
+                f"storm control ({levels}) is not written: AOS-CX rate-limits in kbps or pps; set 'rate-limit' by hand")
+        return lines
 
     def management(self) -> None:
         """SSH and HTTPS servers in a VRF, the CLI session timeout and LLDP; AOS-CX has no Telnet or plain HTTP
@@ -477,6 +500,12 @@ class Writer:
 
     def vlans(self) -> None:
         voice = {i.voice_vlan for i in self.device.interfaces.values() if i.voice_vlan is not None}
+        snooped = set(l2sec_text.snooping_vlans_written(self.device, self.report))
+        if self.device.dhcp_snooping or snooped:
+            self.out.append("dhcpv4-snooping")
+            self.report.item("vlan", "DHCP snooping")
+        if l2sec_text.inspection_vlans(self.device):
+            self.report.item("vlan", "ARP inspection")
         for vlan in sorted(self.device.vlans.values(), key=lambda v: v.vlan_id):
             self.out.append(f"vlan {vlan.vlan_id}")
             if vlan.name:
@@ -485,6 +514,10 @@ class Writer:
                 self.out.append(f"{_IND}voice")
             if vlan.shutdown:
                 self.out.append(f"{_IND}shutdown")
+            if vlan.vlan_id in snooped:
+                self.out.append(f"{_IND}dhcpv4-snooping")
+            if vlan.arp_inspection:
+                self.out.append(f"{_IND}arp inspection")
             self.report.item("vlan", str(vlan.vlan_id))
 
     # interfaces ------------------------------------------------------------------------------------------------------
@@ -539,6 +572,7 @@ class Writer:
         lines += self._port_access_interface(iface, add)
         lines += self._qos_interface(iface, add)
         lines += [f"no lldp {name}" for name, on in (("transmit", iface.lldp_tx), ("receive", iface.lldp_rx)) if not on]
+        lines += self._l2sec_interface(iface, add)
         if iface.stp_portfast:
             lines.append("spanning-tree port-type admin-edge")
         if iface.stp_bpduguard:

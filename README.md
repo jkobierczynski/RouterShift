@@ -30,6 +30,8 @@ source interface, QoS (classes, policies with DSCP marking and policing, port tr
 controllers, flagged on the switches that have none.
 Management access converts too: SSH, Telnet and HTTP(S) servers, the remote login ACL and idle timeout,
 the syslog level and source, and LLDP and CDP (globally and per port).
+Layer 2 security converts as well: DHCP snooping, ARP inspection, IP source guard, port security and storm
+control.
 Everything else (route maps, LDAP, ...) is listed in the report under "Not understood", line by
 line, with secrets masked.
 

@@ -123,6 +123,8 @@ class Vlan:
     vlan_id: int
     name: str = ""
     shutdown: bool = False
+    dhcp_snooping: bool = False  # DHCP snooping on the VLAN
+    arp_inspection: bool = False  # dynamic ARP inspection on the VLAN
     origin: Origin = field(default_factory=Origin)
 
 
@@ -170,6 +172,13 @@ class Interface:
     lldp_tx: bool = True  # LLDP sends on the port (where LLDP runs)
     lldp_rx: bool = True  # LLDP listens on the port
     cdp: Optional[bool] = None  # CDP on the port, where stated
+    dhcp_trust: bool = False  # trusted for DHCP snooping (a port towards a DHCP server)
+    arp_trust: bool = False  # trusted for ARP inspection
+    source_guard: bool = False  # IP source guard: only addresses DHCP snooping has seen
+    port_security: bool = False
+    port_security_max: Optional[int] = None  # MAC addresses allowed
+    port_security_violation: str = ""  # shutdown, restrict (drop and report) or protect (drop)
+    storm_control: Dict[str, float] = field(default_factory=dict)  # broadcast|multicast|unicast|unknown-unicast -> %
     fhrp: List["FhrpGroup"] = field(default_factory=list)
     nat: str = ""  # "inside", "outside" or ""
     ospf_cost: Optional[int] = None
@@ -615,6 +624,7 @@ class Device:
     mpls: Mpls = field(default_factory=Mpls)
     wlans: List[Wlan] = field(default_factory=list)
     management: Management = field(default_factory=Management)
+    dhcp_snooping: bool = False  # DHCP snooping switched on
     qos_classes: Dict[str, QosClass] = field(default_factory=dict)
     qos_policies: Dict[str, QosPolicy] = field(default_factory=dict)
     snmp: Snmp = field(default_factory=Snmp)

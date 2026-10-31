@@ -49,6 +49,7 @@ platform converts to and from all the others.
 | MPLS: label switching with LDP on interfaces, the LDP router ID | `Mpls`, `Interface.mpls` | 3 (done) |
 | WLAN: SSIDs with their VLAN, security (open, WPA2-PSK, WPA2-Enterprise) and state, on IOS XE and Comware controllers | `Wlan` | 3 (done) |
 | Management access: SSH, Telnet, HTTP and HTTPS servers, remote login ACL and idle timeout, syslog level and source, LLDP and CDP | `Management`, `System.logging_*`, `Interface.lldp_*` | 3 (done) |
+| L2 security: DHCP snooping and ARP inspection (per VLAN, trusted ports), IP source guard, port security, storm control | `Vlan.dhcp_snooping`, `Vlan.arp_inspection`, `Interface.dhcp_trust` ... | 4 (done) |
 | LDAP and Kerberos servers (listed under "Not understood") | to come | 3+ |
 | Route maps, prefix lists, MLAG/VSX/vPC, VXLAN/EVPN | to come | 3+ |
 
@@ -190,6 +191,25 @@ platform converts to and from all the others.
   `loop-protect` as the alternative).
 * Per-instance and per-VLAN port costs and priorities, and timers (hello, forward delay, max age), are listed under
   "Not understood" for now.
+
+## Layer 2 security
+
+* DHCP snooping keeps its VLANs and trusted ports, ARP inspection its VLANs and trusted ports; ports keep IP source
+  guard, port security (MAC limit, violation mode) and storm control levels (percent).
+* IOS and EOS: `ip dhcp snooping [vlan]`, `ip arp inspection vlan`, `ip dhcp snooping trust`, `ip arp inspection
+  trust`, `ip verify source`, `switchport port-security [maximum|violation]`, `storm-control ... level`. AOS-CX:
+  `dhcpv4-snooping` (global and per VLAN), `arp inspection` per VLAN, `... trust`, `ipv4 source-lockdown`,
+  `port-access port-security` with `client-limit`. AOS-S: `dhcp-snooping [vlan|trust]`, `arp-protect [vlan|trust]`,
+  `ip source-lockdown`, `port-security PORTS learn-mode static address-limit N action ...`, `broadcast-limit`.
+  Comware: `dhcp snooping enable` (every VLAN), `arp detection enable` per VLAN, `... trust`, `ip verify source`,
+  `port-security port-mode autolearn` with `max-mac-count` and `intrusion-mode`, `*-suppression`.
+* Violation modes: shutdown, restrict (drop and report) and protect (drop). Each reader fills in its platform's
+  default; EOS has no restrict (protect is written), AOS-S maps them to send-disable, send-alarm and none, Comware to
+  disableport and blockmac (protect is the default). AOS-CX violation actions are left to a person (reported).
+* Reported limits: EOS DHCP snooping only adds option 82, so its trusted ports are not written; Comware snoops every
+  VLAN, and from Comware the VLANs defined are listed; IOS limits all unicast and the others unknown unicast; AOS-S
+  limits broadcast only, and AOS-S and Comware take whole percents; AOS-CX rate-limits in kbps or pps, so storm
+  control is left to a person.
 
 ## Management access, logging, LLDP and CDP
 

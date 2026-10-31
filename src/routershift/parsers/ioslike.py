@@ -19,6 +19,7 @@ from .. import acl as acl_text
 from .. import bgp as bgp_text
 from .. import fhrp
 from .. import ospf as ospf_text
+from .. import l2sec as l2sec_text
 from .. import mgmt as mgmt_text
 from .. import qos as qos_text
 from .. import confparse, names
@@ -334,6 +335,14 @@ class _Reader:
     def ip(self, node: Node) -> bool:
         w = node.words
         m = self.device.management
+        if w[1:] == ["dhcp", "snooping"]:
+            self.device.dhcp_snooping = True
+            return True
+        if w[1:4] in (["dhcp", "snooping", "vlan"], ["arp", "inspection", "vlan"]) and len(w) == 5:
+            for vid in _vlan_ids(w[4]):
+                vlan = self.device.vlans.setdefault(vid, Vlan(vid))
+                setattr(vlan, "dhcp_snooping" if w[1] == "dhcp" else "arp_inspection", True)
+            return True
         if w[1:] == ["ssh", "version", "2"]:
             m.ssh = True
             return True
@@ -1716,6 +1725,15 @@ class _Reader:
             return self._speed(iface, w[1:])
         elif w[0] == "duplex" and n == 2:
             iface.duplex = w[1]
+        elif w in (["ip", "dhcp", "snooping", "trust"], ["ip", "arp", "inspection", "trust"]):
+            setattr(iface, "dhcp_trust" if w[1] == "dhcp" else "arp_trust", True)
+        elif w == ["ip", "verify", "source"]:
+            iface.source_guard = True
+        elif w[:2] == ["switchport", "port-security"]:
+            return self._port_security(iface, w[2:])
+        elif w[0] == "storm-control" and n == 4 and w[2] == "level" and w[1] in (
+                "broadcast", "multicast", "unicast", "unknown-unicast"):
+            iface.storm_control[w[1]] = float(w[3])
         elif w == ["switchport"]:
             if iface.mode == SwitchportMode.ROUTED:
                 iface.mode = SwitchportMode.ACCESS
@@ -1837,6 +1855,23 @@ class _Reader:
         else:
             return False
         return True
+
+    @staticmethod
+    def _port_security(iface: Interface, args: List[str]) -> bool:
+        """switchport port-security [maximum N | mac-address maximum N | violation shutdown|restrict|protect]"""
+        iface.port_security = True
+        iface.port_security_violation = iface.port_security_violation or "shutdown"  # the IOS and EOS default
+        if not args:
+            return True
+        if args[:1] == ["mac-address"] and args[1:2] == ["maximum"]:  # EOS
+            args = args[1:]
+        if args[0] == "maximum" and len(args) == 2:
+            iface.port_security_max = int(args[1])
+            return True
+        if args[0] == "violation" and len(args) == 2 and args[1] in l2sec_text.VIOLATIONS:
+            iface.port_security_violation = args[1]
+            return True
+        return False
 
     def _speed(self, iface: Interface, args: List[str]) -> bool:
         value = args[-1].lower()
