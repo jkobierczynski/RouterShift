@@ -18,6 +18,7 @@ from typing import Dict, List, Tuple
 
 from .. import aaa as aaa_text
 from .. import bgp as bgp_text
+from .. import stp as stp_text
 from .. import hosts as hosts_text
 from .. import ospf as ospf_text
 from .. import partial
@@ -523,6 +524,11 @@ class Writer:
                 remotes = {bgp_text.remote_as(bgp, n) for n in members}
                 kind = "internal" if remotes == {bgp.local_as} else "external"
             self.add("protocols", "bgp", f"group {name}", f"type {kind}")
+        if bgp.maximum_paths or bgp.maximum_paths_ibgp:
+            self.report.add("bgp", label, Severity.REVIEW, "junos-not-yet",
+                            "maximum-paths is not written for Junos yet; add multipath to the groups and a "
+                            "load-balance policy")
+        bgp_text.unwritten_vrfs(bgp, self.report, "Junos")
         for neighbor in bgp.neighbors:
             nlabel = f"neighbor {neighbor.address}"
             self.report.item("bgp", nlabel)
@@ -558,6 +564,18 @@ class Writer:
         if p.bfd:
             self.add(*path, "bfd-liveness-detection", "minimum-interval 300")
             self.report.add("bgp", label, Severity.APPROX, "bfd", "BFD is written with a 300 ms interval")
+        if p.password:
+            self.add(*path, f"authentication-key {quote(p.password)}")
+        if p.hold is not None or p.keepalive is not None:
+            hold = p.hold if p.hold is not None else 3 * (p.keepalive or 60)
+            self.add(*path, f"hold-time {hold}")
+            if p.keepalive is not None and p.keepalive * 3 != hold:
+                self.report.add("bgp", label, Severity.APPROX, "bgp-timers",
+                                f"Junos sets the hold time only and sends keepalives at a third of it; keepalive "
+                                f"{p.keepalive} becomes {hold // 3}")
+        if p.remove_private_as:
+            self.add(*path, "remove-private")
+        bgp_text.unwritten(p, {"password", "timers", "remove_private_as"}, self.report, label, "Junos")
         families = p.families
         if families and families != [bgp_text.family(p.address)]:
             for family in families:
@@ -628,7 +646,7 @@ class Writer:
                 else:
                     self.add("protocols", "mstp", f"msti {instance}", f"bridge-priority {value}")
         elif protocol == "vstp":
-            for vid, value in sorted(dev.stp.vlan_priority.items()):
+            for vid, value in sorted(stp_text.defined_vlan_priorities(dev, self.report).items()):
                 self.add("protocols", "vstp", f"vlan {vid}", f"bridge-priority {value}")
             if not dev.stp.vlan_priority:
                 self.add("protocols", "vstp", "vlan all")

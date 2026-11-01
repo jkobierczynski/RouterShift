@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Dict, List, Tuple
 
+from . import known
 from .model import Unparsed
 
 
@@ -34,6 +35,8 @@ def redact(text: str) -> str:
     words = text.split()
     result = list(words)
     secret_words = _SECRET_WORDS | ({"authentication"} if words and words[0] in _AUTH_COMMANDS else set())
+    if words and words[0] in ("match", "set"):  # route maps: "match community LIST" names a list, not a secret
+        secret_words = secret_words - {"community"}
     n = 0
     while n < len(words) - 1:
         if words[n].lower() in secret_words:
@@ -49,6 +52,20 @@ def redact(text: str) -> str:
             result[n + 1] = "<removed>"
         n += 1
     return " ".join(result)
+
+
+def _ranges(lines: List[int]) -> str:
+    """'9-18, 23, 71-77' for a list of line numbers."""
+    parts: List[str] = []
+    numbers = sorted(set(lines))
+    start = prev = numbers[0]
+    for n in numbers[1:] + [0]:
+        if n == prev + 1:
+            prev = n
+            continue
+        parts.append(f"{start}-{prev}" if prev > start else str(start))
+        start = prev = n
+    return ", ".join(parts)
 
 
 class Severity(IntEnum):
@@ -80,6 +97,7 @@ _KIND_TITLES = [
     ("monitor", "Port mirroring, sFlow and NetFlow"),
     ("wlan", "Wireless (WLAN)"),
     ("management", "Management"),
+    ("known", "Recognised, not converted"),
     ("unparsed", "Not understood"),
 ]
 
@@ -130,10 +148,25 @@ class Report:
         item.findings.append(Finding(Severity.REVIEW, code, message))
 
     def unparsed(self, entries: List[Unparsed]) -> None:
+        """Lines no writer could use. Those RouterShift recognises are grouped by feature, with the reason, once per
+        feature; the others are grouped by the block they are in, with every line listed."""
+        recognised: Dict[str, Tuple[str, List[int]]] = {}
         for entry in entries:
-            where = f" (in '{redact(entry.section)}')" if entry.section else ""
-            self.skip("unparsed", f"line {entry.line}: {redact(entry.text)}", "not-converted",
-                      f"not converted{where}; translate it by hand if the new device needs it")
+            group = (entry.group, entry.reason) if entry.group else known.classify(entry.text, entry.section)
+            if group is not None:
+                recognised.setdefault(group[0], (group[1], []))[1].append(entry.line)
+                continue
+            if not entry.section:
+                self.skip("unparsed", f"line {entry.line}: {redact(entry.text)}", "not-converted",
+                          "not converted; translate it by hand if the new device needs it")
+                continue
+            head = entry.section.split(" / ")[0]
+            block = next((k for k in self.items if k[0] == "unparsed" and k[1].endswith(f": {redact(head)}")), None)
+            name = block[1] if block else f"in '{redact(head)}'"
+            self.skip("unparsed", name, "not-converted", f"line {entry.line}: {redact(entry.text)} not converted")
+        for label, (reason, lines) in sorted(recognised.items()):
+            count = f"{len(lines)} line" + ("s" if len(lines) > 1 else "")
+            self.skip("known", label, "not-converted", f"{reason} ({count}: {_ranges(lines)})")
 
     def counts(self) -> Dict[str, int]:
         result: Dict[str, int] = {}

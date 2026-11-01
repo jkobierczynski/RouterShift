@@ -798,6 +798,8 @@ class _Reader:
                     vlan.igmp_querier = False
                 elif c[1:2] == ["access-group"] and c[0] in ("ip", "ipv6") and c[-1] in ("in", "out"):
                     self._access_group(l3(), c)
+                elif c[0] == "service-policy" and len(c) == 3 and c[2] in ("in", "out"):  # on the VLAN interface
+                    setattr(l3(), f"qos_policy_{c[2]}", unquote(c[1]))
                 elif c[:2] == ["ip", "helper-address"] and len(c) == 3:
                     l3().helper_addresses.append(c[2])
                 elif c[:2] == ["ip", "ospf"] and len(c) in (4, 5) and c[-2] == "area":

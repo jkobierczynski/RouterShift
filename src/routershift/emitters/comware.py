@@ -26,6 +26,7 @@ from .. import monitor as monitor_text
 from .. import vxlan as vxlan_text
 from .. import tracking as tracking_text
 from .. import hosts as hosts_text
+from .. import bgp as bgp_text
 from .. import igp as igp_text
 from .. import bfd as bfd_text
 from .. import routemap as routemap_text
@@ -1303,6 +1304,7 @@ class Writer:
             lines += self._bgp_peer(group)
         for peer in bgp.neighbors:
             self.report.item("bgp", f"neighbor {peer.address}")
+            bgp_text.unwritten(peer, set(bgp_text.OPTIONS), self.report, f"neighbor {peer.address}", "Comware")
             if peer.peer_group:
                 lines.append(f"peer {peer.address} group {peer.peer_group}")
             lines += self._bgp_peer(peer)
@@ -1327,9 +1329,33 @@ class Writer:
                 if af in peer.families:
                     body.append(f"peer {peer.address} enable")
                     body += self._bgp_af_options(peer)
+            if af == "ipv4":
+                body += [f"balance {bgp.maximum_paths}"] if bgp.maximum_paths else []
+                body += [f"balance ibgp {bgp.maximum_paths_ibgp}"] if bgp.maximum_paths_ibgp else []
             if body:
                 lines.append(f"address-family {af} unicast")
                 lines += [_IND + line for line in body]
+        for name, v in bgp.vrfs.items():
+            self.report.item("bgp", f"bgp vrf {name}")
+            lines.append(f"ip vpn-instance {name}")
+            body = []
+            for peer in v.neighbors:
+                label = f"neighbor {peer.address} (vrf {name})"
+                self.report.item("bgp", label)
+                bgp_text.unwritten(peer, set(bgp_text.OPTIONS), self.report, label, "Comware")
+                lines += [_IND + line for line in self._bgp_peer(peer)]
+                body += [f"peer {peer.address} enable"] + self._bgp_af_options(peer)
+            for prefix in v.networks:
+                net = ipaddress.ip_network(prefix)
+                body.append(f"network {net.network_address} {net.netmask}")
+            for source in v.redistribute:
+                rm = v.redistribute_maps.get(source)
+                body.append(f"import-route {'direct' if source == 'connected' else source}" +
+                            (f" route-policy {rm}" if rm else ""))
+            body += [f"balance {v.maximum_paths}"] if v.maximum_paths else []
+            if body:
+                lines.append(f"{_IND}address-family ipv4 unicast")
+                lines += [_IND * 2 + line for line in body]
         self.out.append(f"bgp {bgp.local_as}")
         self.out += [_IND + line for line in lines]
         self.block_end()
@@ -1349,6 +1375,11 @@ class Writer:
             lines.append(f"{pre} ignore")
         if peer.bfd:
             lines.append(f"{pre} bfd")
+        if peer.password:
+            lines.append(f"{pre} password simple {peer.password}")
+        if peer.keepalive is not None or peer.hold is not None:
+            lines.append(f"{pre} timer keepalive {peer.keepalive if peer.keepalive is not None else 60} "
+                         f"hold {peer.hold if peer.hold is not None else 180}")
         return lines
 
     @staticmethod
@@ -1358,6 +1389,14 @@ class Writer:
             lines.append(f"peer {peer.address} next-hop-local")
         if peer.send_community:
             lines.append(f"peer {peer.address} advertise-community")
+        if peer.route_reflector_client:
+            lines.append(f"peer {peer.address} reflect-client")
+        if peer.maximum_prefix is not None:
+            lines.append(f"peer {peer.address} route-limit {peer.maximum_prefix}")
+        if peer.remove_private_as:
+            lines.append(f"peer {peer.address} public-as-only")
+        if peer.allowas_in is not None:
+            lines.append(f"peer {peer.address} allow-as-loop" + (f" {peer.allowas_in}" if peer.allowas_in else ""))
         for kind, attr in (("route-policy", "route_map"), ("prefix-list", "prefix_list")):
             for direction, word in (("in", "import"), ("out", "export")):
                 name = getattr(peer, f"{attr}_{direction}")

@@ -33,7 +33,7 @@ from .. import igp as igp_text
 from .. import bfd as bfd_text
 from .. import routemap as routemap_text
 from .. import wlan as wlan_text
-from ..model import (AaaMethod, AaaServer, LocalUser, AclAction, Bgp, BgpNeighbor, Device, DhcpPool, IkePolicy, IpsecPeer, NatRule, SnmpGroup, FhrpGroup, Interface, InterfaceKind, LacpMode, Ospf,
+from ..model import (AaaMethod, AaaServer, LocalUser, AclAction, Bgp, BgpNeighbor, BgpVrf, Device, DhcpPool, IkePolicy, IpsecPeer, NatRule, SnmpGroup, FhrpGroup, Interface, InterfaceKind, LacpMode, Ospf,
                      StaticRoute, StpMode, SwitchportMode)
 from ..names import PortMapper
 from ..report import Report, Severity
@@ -1269,13 +1269,15 @@ class Writer:
             lines += self._bgp_neighbor(group)
         for neighbor in bgp.neighbors:
             self.report.item("bgp", f"neighbor {neighbor.address}")
+            bgp_text.unwritten(neighbor, set(bgp_text.OPTIONS), self.report, f"neighbor {neighbor.address}",
+                               ("IOS" if self.ios else "EOS"))
             if neighbor.peer_group:
                 word = "peer-group" if self.ios else "peer group"
                 lines.append(f"neighbor {neighbor.address} {word} {neighbor.peer_group}")
             lines += self._bgp_neighbor(neighbor)
         if not self.ios:
             for peer in list(bgp.peer_groups.values()) + bgp.neighbors:
-                lines += self._bgp_af_options(peer)
+                lines += self._bgp_af_options(peer, ios=False)
         for af in ("ipv4", "ipv6"):
             body: List[str] = []
             for prefix in bgp.networks:
@@ -1297,27 +1299,79 @@ class Writer:
                     body.append(f"neighbor {peer.address} activate")
                     if self.ios:
                         body += self._bgp_af_options(peer)
+            if af == "ipv4" and self.ios:
+                body += self._maximum_paths(bgp.maximum_paths, bgp.maximum_paths_ibgp)
             if not body:
                 continue
             lines.append(f"address-family {af}" + (" unicast" if self.ios else ""))
             lines += [ind + line for line in body]
             if self.ios:
                 lines.append("exit-address-family")
-        lines += self._bgp_evpn(bgp)
         if not self.ios:
-            for name in self.device.vrfs:
+            lines += self._maximum_paths(bgp.maximum_paths, bgp.maximum_paths_ibgp)
+        lines += self._bgp_evpn(bgp)
+        if self.ios:
+            for name, v in bgp.vrfs.items():
+                body = self._bgp_vrf_body(v, name)
+                lines.append(f"address-family ipv4 vrf {self.vrf(name)}")
+                lines += [ind + line for line in body] + ["exit-address-family"]
+        else:
+            for name in list(self.device.vrfs) + [n for n in bgp.vrfs if n not in self.device.vrfs]:
                 info = self.device.vrf_info.get(name)
-                if not info or not (info.rd or info.rt_import or info.rt_export):
+                vrf_bgp = bgp.vrfs.get(name)
+                if vrf_bgp is None and (not info or not (info.rd or info.rt_import or info.rt_export)):
                     continue
                 lines.append(f"vrf {self.vrf(name)}")
-                if info.rd:
+                if info and info.rd:
                     lines.append(f"{ind}rd {info.rd}")
-                for direction, value in vrfs_text.targets(info):
+                elif vrf_bgp is not None:
+                    self.report.add("bgp", f"bgp vrf {name}", Severity.REVIEW, "vrf-rd",
+                                    f"EOS needs a route distinguisher for BGP in VRF {name}; add an rd line")
+                for direction, value in vrfs_text.targets(info) if info else []:
                     for d in (["import", "export"] if direction == "both" else [direction]):
                         lines.append(f"{ind}route-target {d} vpn-ipv4 {value}")
+                if vrf_bgp is not None:
+                    lines += [ind + line for line in self._bgp_vrf_body(vrf_bgp, name)]
         self.out.append(f"router bgp {bgp.local_as}")
         self.out += [ind + line for line in lines]
         self.out.append("!")
+
+    def _maximum_paths(self, ebgp: Optional[int], ibgp: Optional[int]) -> List[str]:
+        if self.ios:
+            return ([f"maximum-paths {ebgp}"] if ebgp else []) + ([f"maximum-paths ibgp {ibgp}"] if ibgp else [])
+        if ebgp and ibgp and ebgp != ibgp:
+            self.report.add("bgp", f"bgp {self.device.bgp.local_as if self.device.bgp else ''}", Severity.APPROX,
+                            "maximum-paths", f"EOS has one maximum-paths for eBGP and iBGP; {max(ebgp, ibgp)} "
+                            f"is written for both (eBGP {ebgp}, iBGP {ibgp} in the source)")
+        most = max(ebgp or 0, ibgp or 0)
+        return [f"maximum-paths {most}"] if most else []
+
+    def _bgp_vrf_body(self, v: BgpVrf, name: str) -> List[str]:
+        """The neighbors, networks and redistribution of BGP in one VRF."""
+        self.report.item("bgp", f"bgp vrf {name}")
+        body: List[str] = []
+        for prefix in v.networks:
+            net = ipaddress.ip_network(prefix)
+            body.append(f"network {net.network_address} mask {net.netmask}" if self.ios else f"network {net}")
+        for source in v.redistribute:
+            rm = v.redistribute_maps.get(source)
+            body.append(self._bgp_redistribute(source) + (f" route-map {rm}" if rm else ""))
+        for peer in v.neighbors:
+            label = f"neighbor {peer.address} (vrf {name})"
+            self.report.item("bgp", label)
+            bgp_text.unwritten(peer, set(bgp_text.OPTIONS), self.report, label, ("IOS" if self.ios else "EOS"))
+            body += self._bgp_neighbor(peer)
+            if not self.ios:
+                body += self._bgp_af_options(peer, ios=False)
+        if not self.ios and v.neighbors:
+            body.append("address-family ipv4")
+        for peer in v.neighbors:
+            if self.ios:
+                body.append(f"neighbor {peer.address} activate")
+                body += self._bgp_af_options(peer)
+            else:
+                body.append(f"{self.ind}neighbor {peer.address} activate")
+        return body + self._maximum_paths(v.maximum_paths, None)
 
     def _bgp_neighbor(self, peer: BgpNeighbor) -> List[str]:
         pre = f"neighbor {peer.address}"
@@ -1334,6 +1388,11 @@ class Writer:
             lines.append(f"{pre} shutdown")
         if peer.bfd:
             lines.append(f"{pre} fall-over bfd" if self.ios else f"{pre} bfd")
+        if peer.password:
+            lines.append(f"{pre} password {peer.password}" if self.ios else f"{pre} password 0 {peer.password}")
+        if peer.keepalive is not None or peer.hold is not None:
+            lines.append(f"{pre} timers {peer.keepalive if peer.keepalive is not None else 60} "
+                         f"{peer.hold if peer.hold is not None else 180}")
         return lines
 
     def _bgp_evpn(self, bgp: Bgp) -> List[str]:
@@ -1404,8 +1463,18 @@ class Writer:
         self.out += lines + ["!"]
 
     @staticmethod
-    def _bgp_af_options(peer: BgpNeighbor) -> List[str]:
+    def _bgp_af_options(peer: BgpNeighbor, ios: bool = True) -> List[str]:
+        """Neighbor settings IOS takes per address family (EOS takes them once, beside the session settings)."""
         lines = []
+        if peer.route_reflector_client:
+            lines.append(f"neighbor {peer.address} route-reflector-client")
+        if peer.maximum_prefix is not None:
+            lines.append(f"neighbor {peer.address} {'maximum-prefix' if ios else 'maximum-routes'} "
+                         f"{peer.maximum_prefix}")
+        if peer.remove_private_as:
+            lines.append(f"neighbor {peer.address} remove-private-as")
+        if peer.allowas_in is not None:
+            lines.append(f"neighbor {peer.address} allowas-in" + (f" {peer.allowas_in}" if peer.allowas_in else ""))
         if peer.next_hop_self:
             lines.append(f"neighbor {peer.address} next-hop-self")
         if peer.send_community:

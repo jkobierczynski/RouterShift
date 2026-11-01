@@ -14,6 +14,7 @@ bgp, hsrp and vrrp blocks, use-vrf on the services), read when the platform is "
 from __future__ import annotations
 
 import ipaddress
+import re
 from typing import Callable, Dict, List, Optional, Tuple
 
 from .. import acl as acl_text
@@ -38,7 +39,7 @@ from ..confparse import Node
 from ..errors import ParseError
 from ..model import (IpSla, Netflow, Sflow, AaaGroup, AaaMethod, AaaServer, Acl, Device, LocalUser, DhcpPool, FhrpGroup, IkePolicy, IpsecPeer, IpsecTransform, NtpKey, PreSharedKey,
                      SnmpCommunity, SnmpGroup, SnmpHost, SnmpUser, NatPool, NatRule, Interface, InterfaceKind, LacpMode, Origin, Ospf, OspfNetwork, Wlan, Mlag, Rip, Isis,
-                     QosAction, QosClass, QosPolicy, StaticRoute, StpMode, SwitchportMode, Unparsed, Vlan)
+                     QosAction, QosClass, QosPolicy, StaticRoute, BgpNeighbor, BgpVrf, StpMode, SwitchportMode, Unparsed, Vlan)
 
 # Lines that only describe the file or the software, not the device's behaviour.
 _NOISE = ("Building configuration", "Current configuration", "version ", "end", "boot-start-marker",
@@ -60,6 +61,20 @@ def _vlan_ids(text: str) -> List[int]:
         else:
             result.append(int(part))
     return result
+
+
+def _range_ports(text: str) -> List[str]:
+    """IOS interface range: "GigabitEthernet1/0/26 - 47, GigabitEthernet1/0/48" -> each port; [] when unreadable."""
+    ports: List[str] = []
+    for part in text.split(","):
+        m = re.fullmatch(r"\s*(\S*?)(\d+)\s*(?:-\s*(\d+))?\s*", part)
+        if not m or not m.group(1):
+            return []
+        first, last = int(m.group(2)), int(m.group(3) or m.group(2))
+        if last < first or last - first > 512:
+            return []
+        ports += [f"{m.group(1)}{n}" for n in range(first, last + 1)]
+    return ports
 
 
 def _cidr(address: str, mask: str) -> str:
@@ -103,11 +118,22 @@ class _Reader:
         self._sflow_off: List[str] = []  # EOS: ports with no sflow enable
         self._nve_vrfs: Dict[int, str] = {}  # IOS nve: layer 3 VNI -> VRF
         self._nve_vlans: Dict[int, int] = {}  # IOS: VNI -> VLAN of vlan configuration / member vni
+        # Set by a line handler that understood part of a line: the report group and reason the line is listed under
+        self._reason: Optional[Tuple[str, str]] = None
+        self._stp_defaults: Dict[str, bool] = {}  # IOS: spanning-tree portfast [bpduguard] default
+        self._templates: Dict[Tuple[str, str], Tuple[BgpNeighbor, List[str]]] = {}  # IOS BGP peer templates
+        self._inherits: List[Tuple[str, str, str]] = []  # neighbor, peer-session|peer-policy, template
+        self._bgp_vrfs: Dict[str, Tuple[bgp_text.Builder, BgpVrf]] = {}
 
     def unparsed(self, node: Node, section: str = "") -> None:
-        self.device.unparsed.append(Unparsed(node.line, node.text, section))
+        group, reason = self._reason if self._reason else ("", "")
+        self._reason = None
+        self._unparsed(node, section, group, reason)
+
+    def _unparsed(self, node: Node, section: str, group: str, reason: str) -> None:
+        self.device.unparsed.append(Unparsed(node.line, node.text, section, group, reason))
         for child in node.children:
-            self.unparsed(child, section or node.text)
+            self._unparsed(child, section or node.text, group, reason)
 
     # global ----------------------------------------------------------------------------------------------------------
 
@@ -117,7 +143,9 @@ class _Reader:
             if banner.kind == "motd":
                 self.device.system.banner_motd = banner.text
             else:
-                self.device.unparsed.append(Unparsed(banner.line, f"banner {banner.kind}", "banner"))
+                self.device.unparsed.append(Unparsed(
+                    banner.line, f"banner {banner.kind}", "", "Login and exec banners",
+                    "only the message-of-the-day banner is converted; copy this banner by hand"))
         if not roots:
             raise ParseError("no configuration lines found")
         # IOS: a switch is a device that has switchports at all.
@@ -366,8 +394,10 @@ class _Reader:
         if len(w) == 3 and w[1] == "trap" and mgmt_text.level(w[2]) is not None:
             s.logging_level = mgmt_text.level(w[2])
             return True
-        if len(w) == 3 and w[1] == "source-interface":
+        if len(w) in (3, 5) and w[1] == "source-interface" and (len(w) == 3 or w[3] == "vrf"):
             s.logging_source = names.canonical(w[2])[0]
+            if len(w) == 5:
+                s.service_vrf = w[4]
             return True
         if w[1] == "server" and len(w) >= 3:  # NX-OS: logging server A [level] [use-vrf V]
             args, vrf = self._use_vrf(w[3:])
@@ -385,6 +415,8 @@ class _Reader:
             args = args[2:]
         if args[:1] == ["host"]:
             args = args[1:]
+        if args[-4:] == ["transport", "udp", "port", "514"] or args[-2:] == ["transport", "udp"]:
+            args = args[:-4] if args[-1] == "514" else args[:-2]  # the default
         if len(args) == 3 and args[1] == "vrf":  # IOS: logging host Y vrf X
             self.device.system.service_vrf = args[2]
             args = args[:1]
@@ -486,6 +518,10 @@ class _Reader:
             return self.acl(node, 4)
         if w[1:] == ["security"]:
             return self.eos_security(node)
+        if w[1] in ("radius", "tacacs") and w[2:3] == ["source-interface"] and len(w) == 6 and w[4] == "vrf":
+            # IOS XE: ip radius source-interface X vrf V (the VRF is the one the servers are in)
+            self.device.aaa.source["radius" if w[1] == "radius" else "tacacs"] = names.canonical(w[3])[0]
+            return True
         if w[1] in ("radius", "tacacs") and w[-2] == "source-interface" and len(w) in (4, 6):
             # IOS: ip radius source-interface X; EOS: ip radius [vrf V] source-interface X
             self.device.aaa.source["radius" if w[1] == "radius" else "tacacs"] = names.canonical(w[-1])[0]
@@ -538,10 +574,10 @@ class _Reader:
     def ios_nat(self, node: Node, w: List[str]) -> bool:
         """ip nat inside source list ACL interface X overload | pool P [overload]; static [tcp|udp] A [p] B [q]"""
         rule = NatRule("dynamic", origin=Origin(node.line, node.text))
-        if w[-2:-1] == ["vrf"]:
-            rule.vrf, w = w[-1], w[:-2]
         if w[-1:] == ["extendable"]:
             w = w[:-1]
+        if w[-2:-1] == ["vrf"]:
+            rule.vrf, w = w[-1], w[:-2]
         if w[0] == "list" and len(w) >= 4:
             rule.acl = w[1]
             rule.overload = w[-1] == "overload"
@@ -621,6 +657,8 @@ class _Reader:
         while args:
             if args[0] == "privilege" and len(args) >= 2:
                 user.privilege, args = int(args[1]), args[2:]
+            elif args[0] == "algorithm-type" and len(args) >= 2:  # IOS XE: the hash the secret is made with
+                args = args[2:]
             elif args[0] == "role" and len(args) >= 2:
                 role = aaa_text.privilege(args[1], _EOS_ROLES)
                 if role is None:
@@ -640,6 +678,8 @@ class _Reader:
     def enable(self, node: Node) -> bool:
         """enable secret [type] X; EOS: enable password [sha512] X"""
         w = node.words
+        if w[1] == "algorithm-type" and len(w) >= 5:  # IOS XE: enable algorithm-type scrypt secret 9 X
+            w = w[:1] + w[3:]
         if w[1] not in ("secret", "password") or len(w) < 3:
             return False
         user = LocalUser("enable", 15, origin=Origin(node.line, node.text))
@@ -1220,6 +1260,11 @@ class _Reader:
             for port in ports:
                 s.sources[port] = way or "both"
             return True
+        if w[3] == "destination" and rest[-2:] == ["encapsulation", "replicate"] and not eos:
+            rest = rest[:-2]
+            self.device.unparsed.append(Unparsed(node.line, node.text, "", "Mirroring options",
+                                                 "the destination is converted; keeping the VLAN tags "
+                                                 "('encapsulation replicate') is not"))
         if w[3] == "destination" and len(rest) in (1, 2):
             ports = monitor_text.ios_ports(rest)
             if len(ports) != 1:
@@ -1374,6 +1419,9 @@ class _Reader:
                 sla.vrf = c[1]
             else:
                 self.unparsed(line, section)
+        if not sla.target:  # the whole block is listed instead
+            del self.device.ip_slas[name]
+            self.device.unparsed = [u for u in self.device.unparsed if u.section.split(" / ")[0] != node.text]
         return bool(sla.target)
 
     def track(self, node: Node) -> bool:
@@ -1579,6 +1627,7 @@ class _Reader:
 
     def bgp(self, node: Node, local_as: str) -> bool:
         b = bgp_text.Builder(local_as)
+        b.type7 = self.device.platform == "ios"
         b.bgp.origin = Origin(node.line, node.text)
         if self.nxos:
             b.default_ipv4 = False  # NX-OS: a neighbor is active only in the families listed under it
@@ -1588,8 +1637,19 @@ class _Reader:
             if self.nxos and w[0] == "neighbor" and len(w) in (2, 4) and (len(w) == 2 or w[2] == "remote-as"):
                 self._nxos_neighbor(b, child)
                 continue
-            if w[0] == "vrf" and len(w) == 2 and self.device.platform == "eos":
-                self._eos_bgp_vrf(w[1], child)
+            if w[0] == "vrf" and len(w) == 2 and self.device.platform in ("eos", "nxos"):
+                self._eos_bgp_vrf(w[1], child, local_as)
+                continue
+            if w[0] == "template" and len(w) == 3 and w[1] in ("peer-session", "peer-policy"):
+                self._bgp_template(child, w[2], node.text)
+                continue
+            if w[0] == "address-family" and len(w) in (3, 4) and w[1] == "ipv4" and w[-2] == "vrf":
+                self._ios_bgp_vrf(b, w[-1], child, node.text)
+                continue
+            if w[0] == "address-family" and w[1:2] in (["vpnv4"], ["vpnv6"]):
+                self._reason = ("MPLS L3VPN (VPNv4) peering",
+                                "VPNv4/VPNv6 address families are not converted yet; activate them on the target")
+                self.unparsed(child, node.text)
                 continue
             if w[0] == "address-family" and w[1:] in (["ipv4"], ["ipv4", "unicast"], ["ipv6"], ["ipv6", "unicast"]):
                 af = w[1]
@@ -1604,14 +1664,94 @@ class _Reader:
             for line in child.children if af else [child]:
                 if line.words == ["exit-address-family"]:
                     continue
+                lw = line.words
+                if lw[0] == "neighbor" and len(lw) == 5 and lw[2] == "inherit" and lw[3] in ("peer-session",
+                                                                                          "peer-policy"):
+                    b.peer(lw[1])
+                    self._inherits.append((lw[1], lw[3], lw[4]))
+                    continue
+                if lw[0] in ("exit-peer-session", "exit-peer-policy"):
+                    continue
                 try:
                     understood = self.bgp_line(b, self._direct(line.words), af)
                 except (ValueError, IndexError):
                     understood = False
+                if not understood and b.note:
+                    self._reason, b.note = b.note, None
                 if not understood:
-                    self.unparsed(line, child.text if af else node.text)
+                    self.unparsed(line, f"{node.text} / {child.text}" if af else node.text)
+        self._apply_templates(b)
         self.device.bgp = b.finish()
+        for name, (vb, v) in self._bgp_vrfs.items():
+            v.neighbors = vb.finish().neighbors
+            if v.neighbors or v.networks or v.redistribute or v.maximum_paths:
+                self.device.bgp.vrfs[name] = v
         return True
+
+    def _bgp_template(self, node: Node, name: str, bgp_text_: str) -> None:
+        """IOS: template peer-session|peer-policy NAME, with neighbor settings (and inherit of other templates)."""
+        kind = node.words[1]
+        b = bgp_text.Builder("")
+        b.type7 = self.device.platform == "ios"
+        peer = b.peer("192.0.2.0")  # a stand-in address: the settings are copied into the neighbors that inherit
+        parents: List[str] = []
+        for child in node.children:
+            c = child.words
+            if c[0] in ("exit-peer-session", "exit-peer-policy"):
+                continue
+            if c[0] == "inherit" and len(c) == 3:
+                parents.append(c[2])
+                continue
+            try:
+                ok = ioslike_neighbor(b, "192.0.2.0", ["next-hop-self"] if c == ["next-hop-self", "all"] else c, "ipv4")
+            except (ValueError, IndexError):
+                ok = False
+            if not ok:
+                self.unparsed(child, f"{bgp_text_} / {node.text}")
+        self._templates[(kind, name)] = (peer, parents)
+
+    def _inherit(self, peer: BgpNeighbor, kind: str, name: str, depth: int = 0) -> None:
+        found = self._templates.get((kind, name))
+        if found is None or depth > 8:
+            return
+        template, parents = found
+        for attr, value in vars(template).items():
+            if attr not in ("address", "families", "peer_group") and value not in (None, False, "", []) and \
+                    getattr(peer, attr) in (None, False, ""):
+                setattr(peer, attr, value)
+        for parent in parents:
+            self._inherit(peer, kind, parent, depth + 1)
+
+    def _apply_templates(self, b: bgp_text.Builder) -> None:
+        for address, kind, name in self._inherits:
+            self._inherit(b.peer(address), kind, name)
+        self._inherits = []
+
+    def _ios_bgp_vrf(self, b: bgp_text.Builder, name: str, node: Node, bgp_text_: str) -> None:
+        """IOS: address-family ipv4 vrf NAME, with the VRF's neighbors, networks and redistribution."""
+        vb, v = self._bgp_vrfs.setdefault(name, (bgp_text.Builder(b.bgp.local_as), BgpVrf()))
+        vb.default_ipv4, vb.type7 = False, b.type7
+        self._add_vrf(name)
+        for child in node.children:
+            c = self._direct(child.words)
+            if c == ["exit-address-family"]:
+                continue
+            try:
+                if c[0] == "maximum-paths" and len(c) in (2, 3) and c[-1].isdigit():
+                    v.maximum_paths = int(c[-1])
+                    ok = len(c) == 2 or c[1] in ("eibgp", "ibgp")
+                elif c[0] in ("network", "redistribute"):
+                    ok = self.bgp_line(vb, c, "ipv4")
+                    v.networks, v.redistribute, v.redistribute_maps = (
+                        vb.bgp.networks, vb.bgp.redistribute, vb.bgp.redistribute_maps)
+                elif c[0] == "neighbor" and len(c) >= 3:
+                    ok = ioslike_neighbor(vb, c[1], c[2:], "ipv4")
+                else:
+                    ok = False
+            except (ValueError, IndexError):
+                ok = False
+            if not ok:
+                self.unparsed(child, f"{bgp_text_} / {node.text}")
 
     def _nxos_neighbor(self, b: bgp_text.Builder, node: Node) -> None:
         """NX-OS: neighbor A [remote-as X], with its settings and address families inside."""
@@ -1726,19 +1866,41 @@ class _Reader:
                 self.unparsed(child, node.text)
         return True
 
-    def _eos_bgp_vrf(self, name: str, node: Node) -> None:
-        """EOS: router bgp / vrf NAME with rd and route-target import|export [vpn-ipv4|evpn] X; the rest of a BGP VRF
-        is not converted yet."""
+    def _eos_bgp_vrf(self, name: str, node: Node, local_as: str = "") -> None:
+        """EOS and NX-OS: router bgp / vrf NAME with rd and route-target import|export [vpn-ipv4|evpn] X (EOS), and
+        the VRF's neighbors, networks and redistribution."""
         info = vrfs_text.info(self.device, name)
+        vb, v = self._bgp_vrfs.setdefault(name, (bgp_text.Builder(local_as), BgpVrf()))
+        vb.default_ipv4 = not self.nxos
+        self._add_vrf(name)
+        lines: List[Tuple[Node, str]] = []
         for child in node.children:
             c = child.words
-            if c[0] == "rd" and len(c) == 2:
-                info.rd = c[1]
-            elif c[0] == "route-target" and len(c) in (3, 4) and c[2:3] != ["evpn"] and \
-                    vrfs_text.route_target(info, c[1], c[-1]):
-                pass
+            if c[0] == "address-family" and c[1:] in (["ipv4"], ["ipv4", "unicast"]):
+                lines += [(grand, "ipv4") for grand in child.children]
+            elif self.nxos and c[0] == "neighbor" and len(c) in (2, 4):
+                self._nxos_neighbor(vb, child)
             else:
+                lines.append((child, ""))
+        for child, af in lines:
+            c = self._direct(child.words)
+            try:
+                if c[0] == "rd" and len(c) == 2 and not af:
+                    info.rd = c[1]
+                    ok = True
+                elif c[0] == "route-target" and len(c) in (3, 4) and c[2:3] != ["evpn"] and not af:
+                    ok = vrfs_text.route_target(info, c[1], c[-1])
+                elif c[0] == "maximum-paths" and len(c) == 2:
+                    v.maximum_paths, ok = int(c[1]), True
+                elif c[0] in ("network", "redistribute", "neighbor"):
+                    ok = self.bgp_line(vb, c, af)
+                else:
+                    ok = False
+            except (ValueError, IndexError):
+                ok = False
+            if not ok:
                 self.unparsed(child, node.text)
+        v.networks, v.redistribute, v.redistribute_maps = vb.bgp.networks, vb.bgp.redistribute, vb.bgp.redistribute_maps
 
     @staticmethod
     def bgp_line(b: bgp_text.Builder, w: List[str], af: str) -> bool:
@@ -1766,6 +1928,13 @@ class _Reader:
             elif rest:
                 return False  # a metric
             (bgp.redistribute6 if af == "ipv6" else bgp.redistribute).append(w[1])
+        elif w[0] == "maximum-paths" and n in (2, 3) and w[-1].isdigit() and af != "ipv6":
+            if n == 3 and w[1] == "ibgp":
+                bgp.maximum_paths_ibgp = int(w[2])
+            elif n == 2 or w[1] == "eibgp":
+                bgp.maximum_paths = int(w[-1])
+            else:
+                return False
         elif w[:2] == ["no", "neighbor"] and n == 4 and w[3] == "activate":
             b.activate(w[2], af or "ipv4", on=False)
         elif w[0] == "neighbor" and n >= 3:
@@ -1800,6 +1969,9 @@ class _Reader:
                 understood = self.ospf_line(p, self._direct(child.words))
             except (ValueError, IndexError):
                 understood = False
+            if not understood and child.words[:2] == ["default-information", "originate"] and p.default_originate:
+                self._reason = ("OSPF default route options", "the default route is originated; its metric, metric "
+                                "type and route map are not converted")
             if not understood:
                 self.unparsed(child, node.text)
         return True
@@ -1835,6 +2007,9 @@ class _Reader:
             p.bfd_all = True
         elif w[:2] == ["default-information", "originate"] and w[2:] in ([], ["always"]):
             p.default_originate = "always" if n == 3 else "on"
+        elif w[:2] == ["default-information", "originate"]:
+            p.default_originate = "always" if "always" in w else "on"
+            return False  # its metric, type or route map are listed for review
         elif w[:2] == ["auto-cost", "reference-bandwidth"] and n in (3, 4) and w[3:] in ([], ["Mbps"], ["Gbps"]):
             p.reference_bandwidth = int(w[2]) * (1000 if w[3:] == ["Gbps"] else 1)
         elif w[0] == "log-adjacency-changes" or w == ["max-lsa", "12000"]:
@@ -1935,6 +2110,11 @@ class _Reader:
                 return True
         if w[1:] == ["extend", "system-id"]:
             return True  # the IOS default
+        if w[1:] in (["portfast", "default"], ["portfast", "bpduguard", "default"],
+                     ["portfast", "edge", "default"], ["portfast", "edge", "bpduguard", "default"]):
+            # IOS: every access port is an edge port, and every edge port has BPDU guard, unless the port says not
+            self._stp_defaults["bpduguard" if "bpduguard" in w else "portfast"] = True
+            return True
         if w[1] in ("vlan", "vlan-id") and len(w) == 5 and w[3] == "priority":
             # IOS: spanning-tree vlan 10,20 priority N; EOS: spanning-tree vlan-id 10 priority N
             for vlan in _vlan_ids(w[2]):
@@ -2188,9 +2368,14 @@ class _Reader:
             return False
         route = StaticRoute(prefix, vrf=vrf, origin=Origin(node.line, node.text))
         ok = True
+        missing: List[str] = []
         while args:
             word = args.pop(0)
-            if _is_address(word) and not route.next_hop:
+            if word == "tag" and args:
+                missing.append(f"tag {args.pop(0)}")
+            elif word in ("global", "permanent", "multicast"):
+                missing.append(word)
+            elif _is_address(word) and not route.next_hop:
                 route.next_hop = word
             elif word.isdigit() and route.distance is None:
                 route.distance = int(word)
@@ -2204,8 +2389,17 @@ class _Reader:
                 canon, _, _ = names.canonical(word)
                 route.interface = canon
             else:
-                ok = False  # tag, track, permanent, ...: kept for the report
+                ok = False  # kept for the report
         self.device.static_routes.append(route)
+        if "global" in missing:
+            self.device.unparsed.append(Unparsed(
+                node.line, node.text, "", "Static routes leaking out of a VRF",
+                "the next hop is in the global table ('global'); the converted route looks it up in the VRF, so "
+                "rebuild the leak the target's way"))
+        elif missing:
+            self.device.unparsed.append(Unparsed(
+                node.line, node.text, "", "Static route options",
+                f"the route is converted; {', '.join(missing)} is not"))
         if not ok:
             self.device.unparsed.append(Unparsed(node.line, node.text, "ip route (options not converted)"))
         return True
@@ -2213,6 +2407,11 @@ class _Reader:
     # interfaces ------------------------------------------------------------------------------------------------------
 
     def interface(self, node: Node) -> bool:
+        if node.words[1:2] == ["range"]:
+            ports = _range_ports(" ".join(node.words[2:]))
+            for port in ports:
+                self.interface(Node(node.line, f"interface {port}", node.children))
+            return bool(ports)
         source = " ".join(node.words[1:])
         if source.lower().startswith("vxlan" if self.device.platform == "eos" else "nve"):
             return self._vxlan_interface(node)
@@ -2222,6 +2421,8 @@ class _Reader:
             iface.parent = canon.rsplit(".", 1)[0]
         if kind == InterfaceKind.ETHERNET and self.switch_defaults:
             iface.mode = SwitchportMode.ACCESS
+        if canon in self.device.interfaces:  # set again (after an interface range): the lines add up
+            iface = self.device.interfaces[canon]
         self.device.interfaces[canon] = iface
         trunk_vlans: Optional[List[str]] = None
         hsrp_version: Optional[int] = None
@@ -2239,6 +2440,7 @@ class _Reader:
                     child.words[1].isdigit():
                 self._nxos_fhrp(iface, child)
                 continue
+            self._reason = None
             try:
                 understood = self.interface_line(iface, child.words)
             except (ValueError, IndexError):
@@ -2294,7 +2496,13 @@ class _Reader:
             group.priority = int(w[1])
         elif w[0] == "preempt":
             group.preempt = True
-            return len(w) == 1  # a delay is listed for review
+            if len(w) > 1:
+                self._reason = ("Gateway redundancy options", "preemption is converted, its delay is not")
+            return len(w) == 1
+        elif w[0] == "authentication":
+            self._reason = ("Gateway redundancy options",
+                            "HSRP and VRRP authentication is not converted; set it on the target, or leave it off")
+            return False
         elif w[0] == "timers" and len(w) >= 3:
             times: List[int] = []
             args = w[1:]
@@ -2429,6 +2637,8 @@ class _Reader:
                 self.unparsed(child, node.text)
 
     def interface_line(self, iface: Interface, w: List[str]) -> bool:
+        if w in (["no", "ip", "address"], ["no", "ipv6", "address"]):
+            return True  # the default
         n = len(w)
         if w[0] == "description":
             iface.description = " ".join(w[1:])
@@ -2683,6 +2893,7 @@ class _Reader:
         for wl in self.device.wlans:
             wl.vlan = self._wlan_profiles.get(self._wlan_tags.get(wl.name, ""))
         self._finish_aaa()
+        self._finish_stp()
         for iface in self.device.interfaces.values():
             if (iface.dot1x or iface.mab) and not iface.dot1x_host_mode:
                 iface.dot1x_host_mode = "single-host"  # the IOS and EOS default
@@ -2736,6 +2947,17 @@ class _Reader:
         self.device.ospf = [p for p in self.device.ospf if not (
             p.process in tags and not p.vrf and p == Ospf(process=p.process, origin=p.origin))]
 
+    def _finish_stp(self) -> None:
+        """IOS: spanning-tree portfast default and portfast bpduguard default, written out on each port they cover."""
+        for iface in self.device.interfaces.values():
+            if iface.kind not in (InterfaceKind.ETHERNET, InterfaceKind.LAG):
+                continue
+            access = iface.mode == SwitchportMode.ACCESS
+            if self._stp_defaults.get("portfast") and access and iface.stp_portfast is None:
+                iface.stp_portfast = True
+            if self._stp_defaults.get("bpduguard") and iface.stp_portfast and iface.stp_bpduguard is None:
+                iface.stp_bpduguard = True
+
     def _lag_mode(self, lag: Interface) -> SwitchportMode:
         if lag.mode != SwitchportMode.ROUTED:
             return lag.mode
@@ -2773,6 +2995,33 @@ def ioslike_neighbor(b: bgp_text.Builder, name: str, w: List[str], af: str) -> b
         b.activate(name, af or "ipv4")
     elif w in (["fall-over", "bfd"], ["bfd"]):
         peer.bfd = True
+    elif w[0] == "password" and n in (2, 3):  # password [0|7] X; EOS and NX-OS encrypt in their own form
+        form = w[1] if n == 3 else "0"
+        if form == "0":
+            peer.password = w[-1]
+        elif form == "7" and b.type7:
+            peer.password = aaa_text.decode_type7(w[2]) or aaa_text.PLACEHOLDER
+        else:
+            peer.password = aaa_text.PLACEHOLDER
+    elif w[0] == "timers" and n == 3:
+        peer.keepalive, peer.hold = int(w[1]), int(w[2])
+    elif w == ["route-reflector-client"]:
+        peer.route_reflector_client = True
+    elif w[0] in ("maximum-prefix", "maximum-routes") and n >= 2 and w[1].isdigit():
+        peer.maximum_prefix = int(w[1])
+        if n > 2:
+            b.note = ("BGP neighbor options", "the prefix limit is converted; its warning threshold and restart "
+                      "timer are not")
+        return n == 2
+    elif w[0] == "remove-private-as" and n <= 3:
+        peer.remove_private_as = True
+        if n > 1:
+            b.note = ("BGP neighbor options", "remove-private-as is converted; 'all' and 'replace-as' are not")
+        return n == 1
+    elif w[0] == "allowas-in" and n in (1, 2):
+        peer.allowas_in = int(w[1]) if n == 2 else 0
+    elif w in (["next-hop-self", "all"],):
+        peer.next_hop_self = True
     elif routemap_text.neighbor_policy(peer, w):
         pass
     else:

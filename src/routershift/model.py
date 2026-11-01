@@ -357,6 +357,25 @@ class BgpNeighbor:
     route_map_out: str = ""
     prefix_list_in: str = ""
     prefix_list_out: str = ""
+    password: str = ""  # MD5 session password in clear text; aaa.PLACEHOLDER when the source holds it encrypted
+    keepalive: Optional[int] = None  # seconds; None = the platform default (60 / 180 hold)
+    hold: Optional[int] = None
+    route_reflector_client: bool = False
+    maximum_prefix: Optional[int] = None  # the most prefixes accepted from the neighbor
+    remove_private_as: bool = False  # private AS numbers are taken out of the AS path sent to the neighbor
+    allowas_in: Optional[int] = None  # accept routes with the own AS in the path this many times (0: the default)
+
+
+@dataclass
+class BgpVrf:
+    """BGP inside a VRF (IOS address-family ipv4 vrf, EOS/NX-OS vrf under router bgp): its own neighbors and
+    redistribution. The RD and route targets are in Device.vrf_info."""
+
+    neighbors: List[BgpNeighbor] = field(default_factory=list)
+    networks: List[str] = field(default_factory=list)
+    redistribute: List[str] = field(default_factory=list)  # IPv4
+    redistribute_maps: Dict[str, str] = field(default_factory=dict)
+    maximum_paths: Optional[int] = None
 
 
 @dataclass
@@ -369,6 +388,9 @@ class Bgp:
     redistribute: List[str] = field(default_factory=list)  # IPv4: "connected", "static", "ospf"
     redistribute6: List[str] = field(default_factory=list)  # IPv6
     redistribute_maps: Dict[str, str] = field(default_factory=dict)  # IPv4 source -> route map that filters it
+    maximum_paths: Optional[int] = None  # equal-cost paths installed (eBGP, or all where the platform has one knob)
+    maximum_paths_ibgp: Optional[int] = None
+    vrfs: Dict[str, BgpVrf] = field(default_factory=dict)
     origin: Origin = field(default_factory=Origin)
 
 
@@ -802,6 +824,10 @@ class Unparsed:
     line: int
     text: str
     section: str = ""
+    # Set when the reader knows what the line is but RouterShift does not convert it: the group it belongs to in the
+    # report, and why it is not converted. known.classify fills these in for the lines readers leave blank.
+    group: str = ""
+    reason: str = ""
 
 
 @dataclass

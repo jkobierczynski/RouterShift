@@ -87,7 +87,8 @@ routershift parse --from comware current-config.txt > model.json
 
 The report lists every item it met, grouped by area (System, VLANs, Interfaces, Gateway redundancy, Static
 routes, IP SLA and tracking, OSPF, RIP, IS-IS, MPLS, BGP, Access lists, Prefix lists and route maps, DHCP server,
-NAT, VPN, QoS, Port mirroring, Wireless, Management, Not understood). Each item has one status:
+NAT, VPN, QoS, Port mirroring, Wireless, Management, Recognised not converted, Not understood). Each item has one
+status:
 
 | Status | Meaning |
 |---|---|
@@ -107,8 +108,20 @@ Gateway redundancy (HSRP, VRRP)
     - [approximated] HSRP group 99 becomes VRRP group 99, as eos has no HSRP; move every router of the group at once
 ```
 
-The section **Not understood** lists, by line number, every line of the source no reader section recognised. They
-are not in the output: translate them by hand if the new device needs them.
+The section **Recognised, not converted** lists, once per feature, what RouterShift knows but does not convert:
+features only one vendor has (EEM applets, Smart Call Home, EIGRP, DMVPN, NBAR, the IOS zone-based firewall),
+features not converted yet (OSPFv3, queuing and shaping, key chains, IPv6 first-hop security, ...), and settings of
+the device itself (boot, licences, services). Each says why and lists the line numbers, for example:
+
+```
+Recognised, not converted
+  Embedded Event Manager (EEM) applets: skipped
+    - [needs-review] EEM is Cisco only; rebuild the automation with the target's own scripting or an external tool (11 lines: 1493-1494, 1496-1503, 1505)
+```
+
+The section **Not understood** lists every other line no reader recognised, grouped by the block it is in (an
+interface, a router process) with the line numbers. Neither section is in the output: translate those lines by hand
+if the new device needs them.
 
 With `--report-format json` the report is:
 

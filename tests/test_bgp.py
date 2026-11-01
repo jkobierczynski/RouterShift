@@ -55,7 +55,7 @@ def test_ios_reader() -> None:
     assert [n.families for n in bgp.neighbors] == [["ipv4"], ["ipv4"], ["ipv4"], ["ipv6"]]
     assert (bgp.networks, bgp.redistribute) == (["10.10.0.0/24", "2001:db8:10::/48"], ["connected", "ospf"])
     assert bgp.redistribute_maps == {"ospf": "O2B"}
-    assert [u.text for u in device.unparsed] == ["neighbor 10.2.0.1 password 7 0822455D0A16"]
+    assert device.unparsed == [] and peers["10.2.0.1"].password == "cisco"
 
 
 def test_password_is_masked() -> None:

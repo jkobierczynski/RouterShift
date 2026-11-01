@@ -34,7 +34,7 @@ from .. import stp as stp_text
 from .. import qos as qos_text
 from .. import aaa as aaa_text
 from ..parsers.aoscx import AOSCX_ROLES
-from ..model import Device, Interface, Ospf, InterfaceKind, LacpMode, StaticRoute, StpMode, SwitchportMode
+from ..model import BgpNeighbor, Device, Interface, Ospf, InterfaceKind, LacpMode, StaticRoute, StpMode, SwitchportMode
 from ..names import PortMapper
 from ..report import Report, Severity
 
@@ -847,8 +847,40 @@ class Writer:
         if bgp.router_id:
             lines.append(f"bgp router-id {bgp.router_id}")
         neighbors = bgp_text.flat(bgp)
+        lines += self._bgp_body(neighbors, bgp.networks, bgp.redistribute, bgp.redistribute6, bgp.redistribute_maps,
+                                "")
+        if bgp.maximum_paths or bgp.maximum_paths_ibgp:
+            most = max(bgp.maximum_paths or 0, bgp.maximum_paths_ibgp or 0)
+            if bgp.maximum_paths and bgp.maximum_paths_ibgp and bgp.maximum_paths != bgp.maximum_paths_ibgp:
+                self.report.add("bgp", label, Severity.APPROX, "maximum-paths",
+                                f"AOS-CX has one maximum-paths for eBGP and iBGP; {most} is written for both")
+            lines.insert(1 if bgp.router_id else 0, f"maximum-paths {most}")
+        evpn = [p for p in neighbors if "evpn" in p.families]
+        if evpn:
+            lines.append("address-family l2vpn evpn")
+            for p in evpn:
+                lines += [f"{_IND}neighbor {p.address} activate", f"{_IND}neighbor {p.address} send-community extended"]
+            lines.append("exit-address-family")
+        for name, v in bgp.vrfs.items():
+            self.report.item("bgp", f"bgp vrf {name}")
+            lines.append(f"vrf {name}")
+            if v.maximum_paths:
+                lines.append(f"{_IND}maximum-paths {v.maximum_paths}")
+            lines += [_IND + line for line in self._bgp_body(v.neighbors, v.networks, v.redistribute, [],
+                                                              v.redistribute_maps, f" (vrf {name})")]
+            lines.append(f"{_IND}exit-vrf")
+        self.out.append(f"router bgp {bgp.local_as}")
+        self.out += [_IND + line for line in lines]
+
+    def _bgp_body(self, neighbors: List[BgpNeighbor], networks: List[str], redistribute: List[str],
+                  redistribute6: List[str], maps: Dict[str, str], where: str) -> List[str]:
+        """Neighbors and address families, of the default VRF or of one VRF."""
+        lines: List[str] = []
         for peer in neighbors:
-            self.report.item("bgp", f"neighbor {peer.address}")
+            label = f"neighbor {peer.address}{where}"
+            self.report.item("bgp", label)
+            bgp_text.unwritten(peer, {"password", "timers", "route_reflector_client", "remove_private_as",
+                                      "allowas_in"}, self.report, label, "AOS-CX")
             pre = f"neighbor {peer.address}"
             if peer.remote_as:
                 lines.append(f"{pre} remote-as {peer.remote_as}")
@@ -862,6 +894,13 @@ class Writer:
                 lines.append(f"{pre} shutdown")
             if peer.bfd:
                 lines.append(f"{pre} fall-over bfd")
+            if peer.password:
+                lines.append(f"{pre} password plaintext {peer.password}")
+            if peer.keepalive is not None or peer.hold is not None:
+                lines.append(f"{pre} timers {peer.keepalive if peer.keepalive is not None else 60} "
+                             f"{peer.hold if peer.hold is not None else 180}")
+            if peer.remove_private_as:
+                lines.append(f"{pre} remove-private-as")
         for af in ("ipv4", "ipv6"):
             body: List[str] = []
             for peer in neighbors:
@@ -871,27 +910,25 @@ class Writer:
                         body.append(f"neighbor {peer.address} next-hop-self")
                     if peer.send_community:
                         body.append(f"neighbor {peer.address} send-community standard")
+                    if peer.route_reflector_client:
+                        body.append(f"neighbor {peer.address} route-reflector-client")
+                    if peer.allowas_in is not None:
+                        body.append(f"neighbor {peer.address} allowas-in" +
+                                    (f" {peer.allowas_in}" if peer.allowas_in else ""))
                     for kind in ("route-map", "prefix-list"):
                         for direction in ("in", "out"):
                             name = getattr(peer, f"{kind.replace('-', '_')}_{direction}")
                             if name:
                                 body.append(f"neighbor {peer.address} {kind} {name} {direction}")
-            body += [f"network {p}" for p in bgp.networks if (":" in p) == (af == "ipv6")]
-            for r in bgp.redistribute6 if af == "ipv6" else bgp.redistribute:
-                rm = bgp.redistribute_maps.get(r) if af == "ipv4" else None
+            body += [f"network {p}" for p in networks if (":" in p) == (af == "ipv6")]
+            for r in redistribute6 if af == "ipv6" else redistribute:
+                rm = maps.get(r) if af == "ipv4" else None
                 body.append(f"redistribute {r}" + (f" route-map {rm}" if rm else ""))
             if body:
                 lines.append(f"address-family {af} unicast")
                 lines += [_IND + line for line in body]
                 lines.append("exit-address-family")
-        evpn = [p for p in neighbors if "evpn" in p.families]
-        if evpn:
-            lines.append("address-family l2vpn evpn")
-            for p in evpn:
-                lines += [f"{_IND}neighbor {p.address} activate", f"{_IND}neighbor {p.address} send-community extended"]
-            lines.append("exit-address-family")
-        self.out.append(f"router bgp {bgp.local_as}")
-        self.out += [_IND + line for line in lines]
+        return lines
 
     def _ospf_interface(self, iface: Interface) -> List[str]:
         lines = [f"ip ospf {number} area {dotted}" for number, dotted in self.ospf_areas.get(iface.name, [])]
