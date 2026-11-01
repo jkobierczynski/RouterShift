@@ -64,8 +64,12 @@ the management port in VRF management, VRFs and their static routes, ACLs, prefi
 VRRP, DHCP relay, storm control, OSPF (interface-based, VRFs in the process), BGP (neighbor blocks, EVPN family),
 spanning tree (rapid PVST+, MST), LLDP and the vty settings. Everything else is reported as "not written for
 NX-OS yet".
-Everything else (LDAP, ...) is listed in the report under "Not understood", line by
-line, with secrets masked.
+BGP covers IOS XE peer templates (written into each neighbor), BGP inside VRFs (IOS `address-family ipv4 vrf`, EOS,
+NX-OS and AOS-CX `vrf`, Comware `ip vpn-instance`), session passwords, timers, route-reflector clients, prefix
+limits, allowas-in, remove-private-as and maximum-paths.
+What RouterShift recognises but does not convert (EEM, telemetry, certificates, the zone-based firewall, EIGRP,
+DMVPN, NBAR, queuing, ...) is reported once per feature under "Recognised, not converted", with the reason and the
+line numbers. Everything else is listed under "Not understood", grouped by the block it is in, with secrets masked.
 
 ## Usage
 

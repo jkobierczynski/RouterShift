@@ -208,6 +208,9 @@ class Reader:
         if rest[0] == "unit" and len(rest) >= 2:
             iface = self.unit(ifd, rest[1])
             return iface is not None and (len(rest) == 2 or self.unit_line(s, iface, rest[2:]))
+        if ifd in _MANAGEMENT + ("lo0",) and (rest[0] == "description" and len(rest) == 2 or rest == ["disable"]):
+            mgmt = self.unit(ifd, "0")  # said of the whole interface: its one unit
+            return mgmt is not None and self.unit_line(s, mgmt, rest)
         if ifd in _MANAGEMENT or ifd in ("irb", "lo0", "vlan"):
             return False
         port = self.port(ifd)
@@ -446,11 +449,13 @@ class Reader:
             self.local_as = w[1]
             self.bgp_line = self.bgp_line or s.line
             return True
+        if w[0] == "rib" and len(w) >= 3 and w[1].endswith("inet6.0"):  # IPv6 routes: rib inet6.0 static ...
+            return self.routing_options(s, w[2:], vrf)
         if w[:2] == ["static", "route"] and len(w) >= 4:
             prefix, rest = w[2], w[3:]
             routes = [r for r in self.device.static_routes if r.prefix == prefix and r.vrf == vrf]
             if rest[0] == "next-hop" and len(rest) == 2:
-                if re.match(r"^[\d.]+$|:", rest[1]):
+                if re.match(r"^[\d.]+$", rest[1]) or ":" in rest[1]:
                     route = StaticRoute(prefix, next_hop=rest[1], vrf=vrf)
                 else:
                     name = self.units.get(rest[1]) or self.units.get(f"{rest[1]}.0")
@@ -662,6 +667,13 @@ class Reader:
                 return False
         elif w[0] == "bfd-liveness-detection" and len(w) >= 2:
             peer.bfd = True
+        elif w[0] == "authentication-key" and len(w) == 2:
+            peer.password = w[1] if not w[1].startswith("$9$") else aaa_text.PLACEHOLDER
+        elif w[0] == "hold-time" and len(w) == 2:
+            peer.hold = int(w[1])
+            peer.keepalive = peer.hold // 3
+        elif w == ["remove-private"]:
+            peer.remove_private_as = True
         elif w[0] == "family" and len(w) >= 2:
             family = {("inet", "unicast"): "ipv4", ("inet6", "unicast"): "ipv6",
                       ("evpn", "signaling"): "evpn"}.get((w[1], w[2] if len(w) > 2 else ""))

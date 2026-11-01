@@ -19,7 +19,7 @@ def priorities(device: Device, written: Optional[StpMode], report: Report) -> Tu
     s = device.stp
     if written in PER_VLAN:
         if s.vlan_priority or not s.priority:
-            return {}, dict(s.vlan_priority)
+            return {}, defined_vlan_priorities(device, report)
         result = {}
         for vlan in sorted(device.vlans) or [1]:
             instance = next((n for n, vlans in s.instances.items() if vlan in vlans), 0)
@@ -49,6 +49,20 @@ def priorities(device: Device, written: Optional[StpMode], report: Report) -> Tu
                        "for all; use MST instances to share the load")
         return {0: lowest}, {}
     return {}, {}
+
+
+def defined_vlan_priorities(device: Device, report: Report) -> Dict[int, int]:
+    """Per-VLAN priorities for the VLANs the configuration defines (and VLAN 1): a source that sets them for a whole
+    range ("spanning-tree vlan 1-4094 priority 4096") would otherwise become thousands of lines."""
+    s = device.stp
+    keep = set(device.vlans) | {1}
+    result = {v: p for v, p in s.vlan_priority.items() if v in keep}
+    dropped = len(s.vlan_priority) - len(result)
+    if dropped:
+        report.add("system", "bridge priority", Severity.APPROX, "stp-priority",
+                   f"the per-VLAN priorities are written for the {len(result)} VLANs defined, not for the {dropped} "
+                   "other VLANs of the range; a VLAN added later takes the default priority")
+    return result
 
 
 def region(device: Device, written: Optional[StpMode], report: Report) -> bool:

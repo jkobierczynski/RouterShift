@@ -8,9 +8,16 @@ from __future__ import annotations
 
 import copy
 import ipaddress
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 
 from .model import Bgp, BgpNeighbor
+from .aaa import PLACEHOLDER
+from .report import Report, Severity
+
+# Neighbor settings beyond the basics, as the report names them
+OPTIONS = {"password": "the session password", "timers": "the keepalive and hold timers",
+           "route_reflector_client": "route-reflector-client", "maximum_prefix": "the maximum-prefix limit",
+           "remove_private_as": "remove-private-as", "allowas_in": "allowas-in"}
 
 REDISTRIBUTE = ("connected", "static", "ospf")
 
@@ -32,6 +39,8 @@ class Builder:
         self.default_ipv4 = True  # IOS and EOS activate IPv4 neighbors in IPv4 unless told not to
         self.activated: Dict[str, Set[str]] = {}
         self.deactivated: Dict[str, Set[str]] = {}
+        self.note: Optional[Tuple[str, str]] = None  # report group and reason for a line read only in part
+        self.type7 = False  # IOS: "password 7 X" is the reversible type 7, read back to the clear text
 
     def peer(self, name: str, group: bool = False) -> BgpNeighbor:
         if name in self.bgp.peer_groups:
@@ -78,7 +87,8 @@ def effective(bgp: Bgp, neighbor: BgpNeighbor) -> BgpNeighbor:
     result.next_hop_self = result.next_hop_self or group.next_hop_self
     result.send_community = result.send_community or group.send_community
     result.bfd = result.bfd or group.bfd
-    for attr in ("route_map_in", "route_map_out", "prefix_list_in", "prefix_list_out"):
+    for attr in ("route_map_in", "route_map_out", "prefix_list_in", "prefix_list_out", "password", "keepalive",
+                 "hold", "route_reflector_client", "maximum_prefix", "remove_private_as", "allowas_in"):
         setattr(result, attr, getattr(result, attr) or getattr(group, attr))
     result.families = sorted(set(result.families) | set(group.families))
     return result
@@ -93,3 +103,33 @@ def remote_as(bgp: Bgp, neighbor: BgpNeighbor) -> Optional[str]:
         return neighbor.remote_as
     group = bgp.peer_groups.get(neighbor.peer_group)
     return group.remote_as if group is not None and group.remote_as else None
+
+
+def options(peer: BgpNeighbor) -> List[str]:
+    """The OPTIONS keys a neighbor uses."""
+    used = [k for k in OPTIONS if k != "timers" and getattr(peer, k) not in (None, False, "")]
+    return used + (["timers"] if peer.keepalive is not None or peer.hold is not None else [])
+
+
+def unwritten(peer: BgpNeighbor, written: Set[str], report: Report, label: str, platform: str) -> None:
+    """Reports the neighbor settings a writer leaves out, and a password it has to write as a placeholder."""
+    missing = [OPTIONS[k] for k in options(peer) if k not in written]
+    if missing:
+        report.add("bgp", label, Severity.REVIEW, "bgp-option",
+                   f"{', '.join(missing)} not written for {platform}; set {'it' if len(missing) == 1 else 'them'} "
+                   "by hand")
+    if "password" in written and peer.password == PLACEHOLDER:
+        report.add("bgp", label, Severity.REVIEW, "secret-placeholder",
+                   f"the session password is stored encrypted in the source; replace {PLACEHOLDER} with it")
+
+
+def vrf_neighbors(bgp: Bgp) -> List[BgpNeighbor]:
+    return [n for v in bgp.vrfs.values() for n in v.neighbors]
+
+
+def unwritten_vrfs(bgp: Bgp, report: Report, platform: str) -> None:
+    """For writers that do not write BGP inside VRFs yet."""
+    for name, v in bgp.vrfs.items():
+        report.skip("bgp", f"bgp vrf {name}", "not-yet",
+                    f"BGP in VRF {name} ({len(v.neighbors)} neighbors) is not written for {platform} yet; set it up "
+                    "by hand")

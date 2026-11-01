@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+* The report lists what RouterShift recognises but does not convert once per feature, with the reason and the line
+  numbers ("Recognised, not converted"), and groups the remaining "Not understood" lines by block. A real IOS XE
+  core router went from 558 separate "not understood" items to none.
+* IOS XE: BGP peer templates, `address-family ipv4 vrf`, scrypt (`algorithm-type`) users and enable secret,
+  `interface range`, `spanning-tree portfast [bpduguard] default`, syslog hosts and sources in a VRF, RADIUS source
+  in a VRF, static NAT in a VRF with `extendable`.
+* BGP, on every platform that has it: BGP inside VRFs, session passwords, timers, route-reflector clients,
+  maximum-prefix, allowas-in, remove-private-as and maximum-paths.
+* Fixes: a static route's `tag` was read as its distance; per-VLAN spanning-tree priorities for a whole range
+  (`spanning-tree vlan 1-4094 priority`) became one line per VLAN; Junos IPv6 static routes and the management
+  port's description did not read back; AOS-S did not read a QoS policy on a VLAN; IP SLA lines were listed twice.
+
 ## 0.1.0 (first release)
 
 The first release converts configurations between seven platforms: Cisco IOS / IOS XE, Cisco NX-OS, Arista EOS,

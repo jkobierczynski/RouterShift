@@ -37,6 +37,7 @@ platform converts to and from all the others.
 | Spanning tree: mode, bridge priorities (per instance or per VLAN), MST region, edge ports, BPDU guard and filter, root and loop guard, port cost and priority | `Device.stp_mode`, `Stp`, `Interface.stp_*` | 3 (done) |
 | OSPFv2: processes per VRF, areas and area types, passive interfaces, redistribution, cost, network type | `Ospf`, `Interface.ospf_cost` | 2 (done) |
 | BGP: neighbors, peer groups, IPv4/IPv6 activation, networks, redistribution | `Bgp`, `BgpNeighbor` | 2 (done) |
+| BGP: IOS XE peer templates, BGP in VRFs, passwords, timers, route-reflector clients, prefix limits, allowas-in, remove-private-as, maximum-paths (Junos: passwords, hold time and remove-private; VRFs reported) | `BgpVrf`, `BgpNeighbor.password` ... | 4 (done) |
 | Access lists (IPv4 and IPv6) and their interface bindings | `Acl`, `AclEntry`, `Interface.acl_in` ... | 2 (done) |
 | NAT: pools, dynamic source NAT and PAT, one-to-one and port forwarding rules, inside/outside interfaces | `NatPool`, `NatRule`, `Interface.nat` | 2 (done) |
 | Site-to-site IPsec VPN: IKE proposals, transform sets, crypto maps, IPsec profiles on tunnel interfaces, pre-shared keys | `IkePolicy`, `IpsecTransform`, `IpsecPeer`, `PreSharedKey`, `Interface.tunnel_*` | 2 (done) |
@@ -163,8 +164,8 @@ platform converts to and from all the others.
   `vrrp N address-family ipv4` form for v3. The writers carry the version across; AOS-S runs VRRPv2 only.
 * AOS-S writes the group inside its VLAN, as `owner` when the virtual address is the VLAN's own, and switches on
   `ip routing` and `router vrrp`.
-* Authentication, tracking, preempt delays and IPv6 groups are listed under "Not understood" for now (secrets
-  masked).
+* Authentication, preempt delays and IPv6 groups are listed under "Recognised, not converted" or "Not understood"
+  for now (secrets masked); preemption itself is converted.
 
 ## OSPF
 

@@ -603,6 +603,8 @@ class Writer:
             self.out.append(f"{IND}router-id {bgp.router_id}")
         af: List[str] = [f"network {n}" for n in bgp.networks if ipaddress.ip_network(n).version == 4]
         af += [self.redistribute(s, bgp.redistribute_maps.get(s), "bgp", label) for s in bgp.redistribute]
+        af += [f"maximum-paths {bgp.maximum_paths}"] if bgp.maximum_paths else []
+        af += [f"maximum-paths ibgp {bgp.maximum_paths_ibgp}"] if bgp.maximum_paths_ibgp else []
         if af:
             self.out.append(f"{IND}address-family ipv4 unicast")
             self.out += [IND * 2 + line for line in af]
@@ -613,7 +615,23 @@ class Writer:
             self.out += [IND * 2 + line for line in af6]
         for peer in bgp_text.flat(bgp):
             self.report.item("bgp", f"neighbor {peer.address}")
+            bgp_text.unwritten(peer, set(bgp_text.OPTIONS), self.report, f"neighbor {peer.address}", "NX-OS")
             self.out += [IND + line for line in self.neighbor(peer)]
+        for name, v in bgp.vrfs.items():
+            vlabel = f"bgp vrf {name}"
+            self.report.item("bgp", vlabel)
+            self.out.append(f"{IND}vrf {name}")
+            vaf = [f"network {n}" for n in v.networks]
+            vaf += [self.redistribute(s, v.redistribute_maps.get(s), "bgp", vlabel) for s in v.redistribute]
+            vaf += [f"maximum-paths {v.maximum_paths}"] if v.maximum_paths else []
+            if vaf:
+                self.out.append(f"{IND * 2}address-family ipv4 unicast")
+                self.out += [IND * 3 + line for line in vaf]
+            for peer in v.neighbors:
+                plabel = f"neighbor {peer.address} (vrf {name})"
+                self.report.item("bgp", plabel)
+                bgp_text.unwritten(peer, set(bgp_text.OPTIONS), self.report, plabel, "NX-OS")
+                self.out += [IND * 2 + line for line in self.neighbor(peer)]
         self.out.append("!")
 
     def neighbor(self, p: BgpNeighbor) -> List[str]:
@@ -632,6 +650,13 @@ class Writer:
             body.append("bfd")
         if p.shutdown:
             body.append("shutdown")
+        if p.password:
+            body.append(f"password 0 {p.password}")
+        if p.keepalive is not None or p.hold is not None:
+            body.append(f"timers {p.keepalive if p.keepalive is not None else 60} "
+                        f"{p.hold if p.hold is not None else 180}")
+        if p.remove_private_as:
+            body.append("remove-private-as")
         for family in p.families:
             header = {"ipv4": "address-family ipv4 unicast", "ipv6": "address-family ipv6 unicast",
                       "evpn": "address-family l2vpn evpn"}[family]
@@ -644,6 +669,12 @@ class Writer:
                     options.append("send-community")
                 if p.next_hop_self:
                     options.append("next-hop-self")
+                if p.route_reflector_client:
+                    options.append("route-reflector-client")
+                if p.maximum_prefix is not None:
+                    options.append(f"maximum-prefix {p.maximum_prefix}")
+                if p.allowas_in is not None:
+                    options.append("allowas-in" + (f" {p.allowas_in}" if p.allowas_in else ""))
                 for attr, direction in (("route_map_in", "in"), ("route_map_out", "out")):
                     if getattr(p, attr):
                         options.append(f"route-map {getattr(p, attr)} {direction}")

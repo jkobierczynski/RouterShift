@@ -37,7 +37,7 @@ from .. import qos as qos_text
 from .. import confparse
 from ..confparse import Node
 from ..errors import ParseError
-from ..model import (Sflow, AaaGroup, AaaMethod, AaaServer, Acl, Device, LocalUser, DhcpPool, FhrpGroup, NtpKey, SnmpCommunity, SnmpHost, SnmpUser, Interface, InterfaceKind, LacpMode, Origin, Ospf, QosAction, QosClass,
+from ..model import (BgpVrf, Sflow, AaaGroup, AaaMethod, AaaServer, Acl, Device, LocalUser, DhcpPool, FhrpGroup, NtpKey, SnmpCommunity, SnmpHost, SnmpUser, Interface, InterfaceKind, LacpMode, Origin, Ospf, QosAction, QosClass,
                      QosPolicy, StaticRoute, StpMode, SwitchportMode, Unparsed, Vlan, Mlag)
 from .ioslike import _is_address, _vlan_ids
 
@@ -740,15 +740,41 @@ class _Reader:
         b = bgp_text.Builder(local_as)
         b.default_ipv4 = False  # AOS-CX lists "neighbor X activate" in the address family
         b.bgp.origin = Origin(node.line, node.text)
-        for child in node.children:
+        vrfs: Dict[str, Tuple[bgp_text.Builder, BgpVrf]] = {}
+        self._bgp_block(b, node.children, node.text, vrfs)
+        self.device.bgp = b.finish()
+        for name, (vb, v) in vrfs.items():
+            v.neighbors = vb.finish().neighbors
+            v.networks, v.redistribute, v.redistribute_maps = vb.bgp.networks, vb.bgp.redistribute, \
+                vb.bgp.redistribute_maps
+            self.device.bgp.vrfs[name] = v
+
+    def _bgp_block(self, b: bgp_text.Builder, children: List[Node], section: str,
+                   vrfs: Optional[Dict[str, Tuple[bgp_text.Builder, BgpVrf]]]) -> None:
+        for child in children:
             w = child.words
             af = ""
+            if w == ["exit-vrf"]:
+                continue
+            if w[0] == "vrf" and len(w) == 2 and vrfs is not None:
+                vb = bgp_text.Builder(b.bgp.local_as)
+                vb.default_ipv4 = False
+                v = BgpVrf()
+                vrfs[w[1]] = (vb, v)
+                rest = []
+                for c in child.children:
+                    if c.words[0] == "maximum-paths" and len(c.words) == 2 and c.words[1].isdigit():
+                        v.maximum_paths = int(c.words[1])
+                    elif c.words != ["exit-vrf"]:
+                        rest.append(c)
+                self._bgp_block(vb, rest, f"{section} / {child.text}", None)
+                continue
             if w[0] == "address-family" and w[1:] in (["ipv4", "unicast"], ["ipv6", "unicast"]):
                 af = w[1]
             elif w == ["address-family", "l2vpn", "evpn"]:
                 af = "evpn"
             elif w[0] == "address-family":
-                self.unparsed(child, node.text)
+                self.unparsed(child, section)
                 continue
             for line in child.children if af else [child]:
                 try:
@@ -756,8 +782,7 @@ class _Reader:
                 except (ValueError, IndexError):
                     understood = False
                 if not understood:
-                    self.unparsed(line, child.text if af else node.text)
-        self.device.bgp = b.finish()
+                    self.unparsed(line, f"{section} / {child.text}" if af else section)
 
     @staticmethod
     def bgp_line(b: bgp_text.Builder, w: List[str], af: str) -> bool:
@@ -779,6 +804,9 @@ class _Reader:
             return True
         if w[:2] == ["no", "neighbor"] and n == 4 and w[3] == "activate":
             b.activate(w[2], af or "ipv4", on=False)
+            return True
+        if w[0] == "maximum-paths" and n == 2 and not af:
+            b.bgp.maximum_paths = int(w[1])
             return True
         if w[0] != "neighbor" or n < 3:
             return False
@@ -804,6 +832,16 @@ class _Reader:
             pass
         elif args == ["fall-over", "bfd"]:
             peer.bfd = True
+        elif args[0] == "password" and len(args) == 3 and args[1] in ("plaintext", "ciphertext"):
+            peer.password = args[2] if args[1] == "plaintext" else aaa_text.PLACEHOLDER
+        elif args[0] == "timers" and len(args) == 3:
+            peer.keepalive, peer.hold = int(args[1]), int(args[2])
+        elif args == ["route-reflector-client"]:
+            peer.route_reflector_client = True
+        elif args == ["remove-private-as"]:
+            peer.remove_private_as = True
+        elif args[0] == "allowas-in" and len(args) in (1, 2):
+            peer.allowas_in = int(args[1]) if len(args) == 2 else 0
         elif routemap_text.neighbor_policy(peer, args):
             pass
         else:
