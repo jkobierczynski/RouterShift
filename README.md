@@ -69,12 +69,13 @@ profiles, control-plane ACLs and CoPP classes, MACsec and MKA policies, MAC ACLs
 banners, user groups and SSH keys, the REST API, syslog over TLS, PTP, OSPF authentication and timers, GRE tunnels
 and policy-based routing as classifier policies. What AOS-CX has no form for (RIP, IS-IS, MPLS, NAT, IPsec, event
 handlers, TWAMP, SNMP views, ...) is left out and reported, and the nearest construct is flagged as approximated.
-Cisco NX-OS reads through the IOS reader (with its own blocks: features, vrf context, neighbor blocks, hsrp and
-vrrp blocks, use-vrf) and writes the system settings, users, SNMP communities, VLANs, ports, port-channels, SVIs,
-the management port in VRF management, VRFs and their static routes, ACLs, prefix lists and route maps, HSRP and
-VRRP, DHCP relay, storm control, OSPF (interface-based, VRFs in the process), BGP (neighbor blocks, EVPN family),
-spanning tree (rapid PVST+, MST), LLDP and the vty settings. Everything else is reported as "not written for
-NX-OS yet".
+Cisco NX-OS reads and writes to the same depth too: AAA servers and lists, 802.1X, DHCP snooping, port security,
+SNMPv3, community and AS-path lists, VXLAN and EVPN with the anycast gateway, vPC and ethernet segments, VRF route
+targets and leaking, BGP templates and options, IGMP snooping, PIM rendezvous points, anycast RP and MSDP, QoS and
+queuing policies, CoPP, MACsec, MAC ACLs, NAT, SPAN, sFlow, NetFlow, IP SLA and tracking, banners, local logging,
+syslog over TLS, roles, SSH keys, NX-API, PTP, EEM applets, OSPF authentication and options, BFD, ECMP hashing, RIP,
+IS-IS, MPLS/LDP, GRE tunnels and PBR. What NX-OS has no form for (the DHCP server, PoE, IPsec, TWAMP, ...) is left
+out and reported, and the nearest construct is flagged as approximated.
 BGP covers IOS XE peer templates (written into each neighbor), BGP inside VRFs (IOS `address-family ipv4 vrf`, EOS,
 NX-OS and AOS-CX `vrf`, Comware `ip vpn-instance`), session passwords, timers, route-reflector clients, prefix
 limits, allowas-in, remove-private-as and maximum-paths.

@@ -12,7 +12,7 @@ approximated and what a person has to look at.
 | `ios` | Cisco IOS and IOS XE | `show running-config` | CLI configuration | 1 (done) |
 | `eos` | Arista EOS | `show running-config` | CLI configuration | 1 (done) |
 | `junos` | Juniper Junos (EX and QFX with ELS, MX, SRX in switching/routing) | `show configuration`, or `\| display set` | curly braces, for `load merge terminal` | 4 (done) |
-| `nxos` | Cisco NX-OS (Nexus 9000/3000, 9.x and 10.x) | `show running-config` | CLI configuration | 2 (core done) |
+| `nxos` | Cisco NX-OS (Nexus 9000/3000, 9.x and 10.x) | `show running-config` | CLI configuration | 4 (done) |
 | `aoscx` | HPE Aruba AOS-CX (10.x) | `show running-config` | CLI configuration | 4 (done) |
 | `aoss` | HPE Aruba AOS-S (ProCurve / ProVision, 16.x) | `show running-config` | CLI configuration | 1 (done) |
 | `comware` | HPE Comware 7 (FlexFabric, 5130/5140/5510...) | `display current-configuration` | system-view commands | 1 (done) |
@@ -53,7 +53,7 @@ platform converts to and from all the others.
 | L2 security: DHCP snooping and ARP inspection (per VLAN, trusted ports), IP source guard, port security, storm control | `Vlan.dhcp_snooping`, `Vlan.arp_inspection`, `Interface.dhcp_trust` ... | 4 (done) |
 | LDAP and Kerberos servers (listed under "Not understood") | to come | 3+ |
 | VRF route leaking: route distinguisher, import and export route targets | `VrfInfo` | 4 (done) |
-| Multi-chassis LAG: EOS MLAG and AOS-CX VSX (peer link, keepalive, shared LAGs) | `Mlag`, `Interface.mlag_id` | 4 (done) |
+| Multi-chassis LAG: EOS MLAG, AOS-CX VSX and NX-OS vPC (peer link, keepalive, shared LAGs) | `Mlag`, `Interface.mlag_id` | 4 (done) |
 | Prefix lists and route maps (Comware route policies), on BGP neighbors and redistribution | `PrefixList`, `RouteMap`, `BgpNeighbor.route_map_*` | 4 (done) |
 | Policy-based routing (route map on an interface; EOS pbr policy, Comware policy-based-route) | `Interface.pbr` | 4 (done) |
 | BFD: interface timers, BGP neighbors, OSPF interfaces | `Interface.bfd_*`, `BgpNeighbor.bfd`, `Ospf.bfd_all` | 4 (done) |
@@ -67,7 +67,6 @@ platform converts to and from all the others.
 | DNS client: name lookup off, search domains, source interface, static hosts | `System.dns_*` | 4 (done) |
 | PoE per port: on/off, priority, power limit | `Interface.poe*` | 4 (done) |
 | VXLAN: source interface, VLAN and VRF VNIs, static flood list; BGP EVPN neighbors and advertised VLANs (IOS, EOS, AOS-CX) | `Vxlan`, `BgpNeighbor.families` | 4 (done) |
-| vPC (NX-OS) | to come | 3+ |
 
 ### AOS-S specifics
 
@@ -131,23 +130,46 @@ platform converts to and from all the others.
 
 ### NX-OS specifics
 
-* The IOS reader reads NX-OS too. It knows `feature` lines, `vrf context` blocks with their static routes,
-  `vrf member`, `ip router ospf TAG area A` and `ip ospf passive-interface` on interfaces, OSPF `vrf` sub-blocks,
-  BGP `neighbor` blocks with their address families (a neighbor is active only where listed), `hsrp N` and
-  `vrrp N` blocks, `use-vrf` on NTP, DNS and syslog, `username ... role` and `ip dhcp relay address`.
-* Port names: `Ethernet1/N` (the writer numbers ports from 1), `port-channelN`, `VlanN`, `loopbackN`, `mgmt0`.
-* The writer adds the `feature` lines the configuration needs (interface-vlan, lacp, hsrp, vrrp, dhcp, lldp, ospf,
-  bgp, bfd, telnet) and `nv overlay evpn` for the EVPN address family.
+* The IOS reader reads NX-OS too. Besides the IOS forms it knows `feature` lines, `vrf context` blocks, `vrf
+  member`, interface-based OSPF, RIP and IS-IS, BGP `template peer` and `neighbor` blocks, `hsrp N` and `vrrp N`
+  blocks, `use-vrf`, `interface nve1`, the `evpn` block, `vpc domain`, `vlan configuration`, `policy-map type
+  queuing`, `monitor session` blocks, `role name`, `macsec policy` and `clock summer-time`.
+* Port names: `Ethernet1/N` (the writer numbers ports from 1), `port-channelN`, `VlanN`, `loopbackN`, `TunnelN`,
+  `mgmt0`.
+* The writer adds the `feature` lines the configuration needs (and `install feature-set mpls` / `feature-set mpls`
+  for MPLS), `nv overlay evpn` and `evpn esi multihoming`.
 * `mgmt0` is always in VRF `management`; the source's management VRF becomes it, without RD or route targets.
-* OSPF runs on the interfaces; the processes of VRFs become `vrf` blocks of the first process. Passive interfaces
-  are set per interface.
 * NX-OS redistributes only through a route map; where the source has none, `RS-PERMIT-ALL` (permit everything) is
-  written and flagged.
-* BGP peer groups are written into each neighbor (no templates). NTP keys are MD5 only. STP and RSTP become MST,
-  PVST becomes rapid PVST+.
-* Not written for NX-OS yet, and so listed in the report: vPC (MLAG), VXLAN, the DHCP server, NAT, IPsec, QoS,
-  AAA servers and 802.1X, SNMP notifications and v3, port security and DHCP snooping, mirroring, sFlow, NetFlow,
-  MPLS, RIP, IS-IS, multicast, tracking, BFD timers, PoE and the voice VLAN.
+  written, and read back as no route map.
+* Every feature group the IOS and EOS writers write is written for NX-OS too, and read back. Where NX-OS has another
+  shape, the writer uses the nearest construct and the report says so:
+  * AAA: server groups with `use-vrf` and `source-interface`, `aaa authorization commands` (and
+    `config-commands`), one `aaa accounting default`; SNMPv3 groups become roles (`network-operator`,
+    `network-admin`); views and the engine ID are left out.
+  * EVPN/VXLAN: `interface nve1` with `member vni` (multicast group, ingress replication or static peers), `evpn` /
+    `vni N l2`, the anycast gateway (`fabric forwarding mode anycast-gateway`); a VRF's layer 3 VNI needs a VLAN and
+    SVI of its own, picked from 3900 down. MLAG is vPC (`vpc domain`, `peer-keepalive`, `vpc peer-link`, `vpc N`);
+    ethernet segments are `ethernet-segment` / `system-mac`. BGP peer groups are `template peer`.
+  * Route leaking is the target VRF importing the source VRF's export route targets.
+  * QoS: `class-map type qos` and `policy-map type qos` (inbound only); the DSCP map is `policy-map type qos
+    RS-DSCP-MAP` (`set qos-group`) on the ports that queue by profile; queuing profiles are `policy-map type
+    queuing` with the `c-out-8q-q*` classes; CoPP is `copp profile strict` with the source's classes reported.
+  * Security: MACsec is a `macsec policy` with a key chain `KC-<name> macsec`; MAC ACLs filter inbound (`mac port
+    access-group`); NAT is the IOS form with a TCAM note; IPsec is reported (a Nexus switch terminates no VPNs).
+  * Monitoring: one sFlow collector (`sflow collector-ip A vrf V`), NetFlow with the built-in record and ingress
+    only, `monitor session` blocks with `switchport monitor` on the destination, IP SLA and tracking in the IOS
+    form.
+  * Management: the login banner is `banner motd`, an after-login motd `banner exec`; the log buffer is the log
+    file; roles are `role name` with rules numbered from the top down (NX-OS checks the highest first); one SSH key
+    per user; the HTTP API is NX-API; a tz database zone is written as its offset with this year's
+    `clock summer-time` rule and read back as an equivalent zone.
+  * PTP needs `ptp source`; a Nexus 9000 is a boundary clock (gPTP is `ptp device-type generalized-ptp`). Event
+    handlers are EEM applets; delays and shell commands are reported.
+  * Routing: SHA OSPF keys go through a key chain; the distribute list is `table-map NAME filter`; RIP and IS-IS
+    run on the interfaces that name them (RIP networks become those interfaces); GRE tunnels are `tunnel mode gre
+    ip`; PBR is `ip policy route-map`.
+* What NX-OS does not have is reported instead of written: the DHCP server, PoE, the voice VLAN, IPsec, TWAMP,
+  output QoS policies and MAC ACLs, more than one sFlow collector.
 
 ## Access lists
 

@@ -14,6 +14,15 @@
   user groups, SSH keys, the REST API, syslog transport, PTP, OSPF authentication and timers, GRE tunnels and PBR.
   Each converts EOS (the bl1-dc1 border leaf) to AOS-CX and back with no line left unread; what AOS-CX lacks is
   flagged instead of labelled exact.
+* NX-OS is written and read to the same depth as IOS and EOS: AAA and 802.1X, SNMPv3, DHCP snooping and port
+  security, community and AS-path lists, VXLAN/EVPN with the anycast gateway, vPC and ethernet segments, VRF route
+  targets and leaking, BGP templates and options, multicast (IGMP snooping and querier, PIM RPs, anycast RP, MSDP),
+  QoS, the DSCP map and queuing policies, CoPP, MACsec, MAC ACLs, NAT, SPAN, sFlow, NetFlow, IP SLA and tracking,
+  banners, local logging, syslog over TLS, roles, SSH keys, NX-API, password length, tz database zones (offset plus
+  summer-time rule), PTP, EEM applets, OSPF authentication and options, BFD, ECMP hashing, RIP, IS-IS, MPLS/LDP, GRE
+  tunnels and PBR. EOS (the bl1-dc1 border leaf) converts to NX-OS with nothing left as not written yet, and every
+  sample converts to NX-OS and back with no line left unread; what NX-OS lacks is flagged instead of labelled exact.
+* The EOS reader reads `ip address unnumbered`.
 * The text report shows the device security section (CoPP, MACsec).
 
 * The report lists what RouterShift recognises but does not convert once per feature, with the reason and the line
