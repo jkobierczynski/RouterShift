@@ -28,7 +28,9 @@ _FULL = ("ios", "eos")
 _NAMES = {"aoscx": "AOS-CX", "aoss": "AOS-S", "comware": "Comware", "junos": "Junos", "nxos": "NX-OS"}
 
 # The settings below each other writer writes (or reports itself, where the target has no equivalent), by key
-WRITES: Dict[str, Set[str]] = {}
+WRITES: Dict[str, Set[str]] = {
+    "junos": {"policy-lists"},
+}
 
 Option = Tuple[str, str, object]  # (key, what the report calls it, whether the device has it)
 

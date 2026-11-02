@@ -26,7 +26,13 @@ class Statement:
 
 
 def quote(word: str) -> str:
-    return f'"{word}"' if not word or re.search(r'[\s;{}\[\]#"]', word) else word
+    if not word or re.search(r'[\s;{}\[\]#"]', word):
+        return '"' + word.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    return word
+
+
+def _unquote(text: str) -> str:
+    return re.sub(r'\\(["\\])', r"\1", text)
 
 
 def _strip_comments(text: str) -> str:
@@ -52,8 +58,8 @@ def read(text: str) -> List[Statement]:
 
 
 def _words(line: str) -> List[str]:
-    return [m.group(1) if m.group(1) is not None else m.group(3) or m.group(4) for m in _TOKEN.finditer(line)
-            if m.group(2) is None]
+    return [_unquote(m.group(1)) if m.group(1) is not None else m.group(3) or m.group(4)
+            for m in _TOKEN.finditer(line) if m.group(2) is None]
 
 
 def _hierarchy(text: str) -> List[Statement]:
@@ -61,7 +67,7 @@ def _hierarchy(text: str) -> List[Statement]:
     for n, line in enumerate(text.splitlines(), 1):
         for m in _TOKEN.finditer(line):
             if m.group(1) is not None:
-                tokens.append((n, m.group(1), True))
+                tokens.append((n, _unquote(m.group(1)), True))
             elif m.group(2) is None:  # not a comment
                 tokens.append((n, m.group(3) or m.group(4), False))
     out: List[Statement] = []
@@ -111,7 +117,7 @@ def _hierarchy(text: str) -> List[Statement]:
 
 
 # Statements that hold a list of values
-LISTS = {"members", "vlan", "domain-search", "next-hop"}
+LISTS = {"members", "vlan", "domain-search", "next-hop", "import", "export", "source-port", "destination-port"}
 
 
 @dataclass

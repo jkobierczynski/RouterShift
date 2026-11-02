@@ -7,7 +7,8 @@ from routershift import bgp as bgp_text
 from routershift import ospf as ospf_text
 from routershift.convert import convert, parse
 from routershift.junostext import Tree, read
-from routershift.model import Device, InterfaceKind, LacpMode, StpMode, SwitchportMode
+from routershift.acl import safe_name
+from routershift.model import AclAction, Device, InterfaceKind, LacpMode, StpMode, SwitchportMode
 
 JUNOS = sample("junos_core.cfg")
 SAMPLES = {"ios": "ios_access.cfg", "eos": "eos_leaf.cfg", "aoscx": "aoscx_access.cfg", "aoss": "aoss_edge.cfg",
@@ -119,9 +120,10 @@ def test_every_sample_to_junos(source: str) -> None:
         assert back.bgp is not None
         pairs = lambda b: sorted((n.address, bgp_text.remote_as(b, n)) for n in b.neighbors)  # noqa: E731
         assert pairs(back.bgp) == pairs(first.bgp)
-    # what is not written yet is listed, not dropped
-    for name in first.acls:
-        assert report.items[("acl", name)].skipped
+    # every ACL arrives as a firewall filter with its convertible entries
+    for name, acl in first.acls.items():
+        rules = lambda a: [e for e in a.entries if e.action != AclAction.REMARK and not e.unsupported]  # noqa: E731
+        assert len(rules(back.acls[safe_name(name)])) >= len(rules(acl)), name
 
 
 def mgmt(device: Device) -> set:

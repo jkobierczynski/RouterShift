@@ -20,6 +20,7 @@ from .. import aaa as aaa_text
 from .. import bgp as bgp_text
 from .. import stp as stp_text
 from .. import hosts as hosts_text
+from .. import junospolicy
 from .. import ospf as ospf_text
 from .. import partial
 from .. import snmp as snmp_text
@@ -35,6 +36,8 @@ LEVELS = ["emergency", "alert", "critical", "error", "warning", "notice", "info"
 CLASSES = [(15, "super-user"), (5, "operator"), (0, "read-only")]
 HASHES = ("md5-crypt", "sha256-crypt", "sha512-crypt", "junos")
 MGMT_INSTANCE = "mgmt_junos"
+# What partial.device need not report: the device-wide features this writer writes
+WRITTEN = {"acl", "policy"}
 _NAME_CHARS = re.compile(r"[^A-Za-z0-9_.-]+")
 
 
@@ -56,10 +59,13 @@ class Writer:
         self.port = ports
         self.report = report
         self.root = Tree()
-        for section in ("system", "chassis", "interfaces", "snmp", "routing-options", "protocols", "vlans",
-                        "routing-instances"):
+        for section in ("system", "chassis", "interfaces", "snmp", "forwarding-options", "routing-options",
+                        "protocols", "policy-options", "class-of-service", "firewall", "vlans", "routing-instances"):
             self.root.add(section)
         self.vlan_names: Dict[int, str] = {}
+        self.prefix_kinds: Dict[str, str] = {}
+        self.communities: Dict[str, List[str]] = {}
+        self.filter_names: Dict[str, str] = {}
         self.mgmt_vrfs = {i.vrf for i in device.interfaces.values() if i.kind == InterfaceKind.MANAGEMENT and i.vrf}
 
     def add(self, *path: str) -> None:
@@ -75,6 +81,7 @@ class Writer:
         self.vlans()
         self.system()
         self.users()
+        self.policy()
         self.interfaces()
         self.snmp()
         self.routing_instances()
@@ -348,6 +355,7 @@ class Writer:
                     self.add(*path, "family inet", "dhcp")
                 for address in iface.ipv6:
                     self.add(*path, "family inet6", f"address {address}")
+                self.interface_filters(iface, path)
                 if iface.kind in (InterfaceKind.VLAN, InterfaceKind.LOOPBACK) and not (
                         iface.ipv4 or iface.ipv6 or iface.dhcp_client):
                     self.add(*path, "family inet")
@@ -355,11 +363,29 @@ class Writer:
         if lags:
             self.add("chassis", "aggregated-devices", "ethernet", f"device-count {lags}")
 
+    def interface_filters(self, iface: Interface, path: Tuple[str, ...]) -> None:
+        for family, acl, direction in (("inet", iface.acl_in, "input"), ("inet", iface.acl_out, "output"),
+                                       ("inet6", iface.acl6_in, "input"), ("inet6", iface.acl6_out, "output")):
+            if acl:
+                self.add(*path, f"family {family}", "filter", f"{direction} {self.filter_names.get(acl, acl)}")
+
     def leftovers(self, iface: Interface) -> None:
         """What a port carries that this writer does not write yet."""
-        partial.port(iface, self.report, self.label(iface), PLATFORM)
+        written = set()
+        if iface.mode == SwitchportMode.ROUTED or iface.kind not in (InterfaceKind.ETHERNET, InterfaceKind.LAG):
+            written.add("acl")
+        partial.port(iface, self.report, self.label(iface), PLATFORM, written)
         if iface.cdp:
             self.report.add("interface", self.label(iface), Severity.APPROX, "cdp", "Junos has no CDP")
+
+    # routing policy and firewall filters --------------------------------------------------------------------------
+
+    def policy(self) -> None:
+        dev = self.device
+        self.prefix_kinds = junospolicy.prefix_lists(dev, self.add, self.report)
+        self.communities = junospolicy.lists(dev, self.add, self.report)
+        junospolicy.policies(dev, self.add, self.report, self.prefix_kinds, self.communities)
+        self.filter_names = junospolicy.filters(dev, self.add, self.report)
 
     # SNMP --------------------------------------------------------------------------------------------------------
 
@@ -495,13 +521,21 @@ class Writer:
                     self.add(*path, f"metric {iface.ospf_cost}")
                 if iface.ospf_network == "point-to-point":
                     self.add(*path, "interface-type p2p")
-            missing = [what for what, stated in (
-                (f"redistribution of {', '.join(p.redistribute)}", bool(p.redistribute)),
-                ("the default route", bool(p.default_originate)),
-                ("BFD", p.bfd_all)) if stated]
-            if missing:
+            if p.redistribute or p.default_originate:
+                name = f"{p.vrf}-OSPF-EXPORT" if p.vrf else "OSPF-EXPORT"
+                junospolicy.export_policy(self.add, name, p.redistribute, p.redistribute_maps,
+                                          default=p.default_originate)
+                self.add(*base, f"export {name}")
+                if p.default_originate == "always":
+                    where = ("routing-instances", self.instance(p.vrf), "routing-options") if p.vrf else \
+                        ("routing-options",)
+                    self.add(*where, "generate", "route 0.0.0.0/0", "discard")
+                    self.report.add("ospf", label, Severity.APPROX, "default-always",
+                                    "default-information originate always is written as a generated default route "
+                                    "that OSPF exports")
+            if p.bfd_all:
                 self.report.add("ospf", label, Severity.REVIEW, "junos-not-yet",
-                                f"not written for Junos yet (it takes export policies): {', '.join(missing)}")
+                                "BFD on every OSPF interface is not written for Junos yet")
 
     def bgp(self) -> None:
         bgp = self.device.bgp
@@ -510,10 +544,16 @@ class Writer:
         label = f"bgp {bgp.local_as}"
         self.report.item("bgp", label)
         self.add("routing-options", f"autonomous-system {bgp.local_as}")
-        if bgp.networks or bgp.redistribute:
-            what = ", ".join(bgp.networks + [f"redistribute {r}" for r in bgp.redistribute])
-            self.report.add("bgp", label, Severity.REVIEW, "junos-not-yet",
-                            f"Junos announces routes through export policies; not written yet: {what}")
+        if bgp.networks or bgp.redistribute or bgp.redistribute6:
+            sources = list(dict.fromkeys(bgp.redistribute + bgp.redistribute6))
+            junospolicy.export_policy(self.add, "BGP-EXPORT", sources, bgp.redistribute_maps, bgp.networks,
+                                      ospf_match=bgp.ospf_match)
+            self.add("protocols", "bgp", "export BGP-EXPORT")
+            if any(n.route_map_out or n.prefix_list_out for n in list(bgp.peer_groups.values()) + bgp.neighbors):
+                self.report.add("bgp", label, Severity.APPROX, "bgp-export",
+                                "the redistribution and network statements are the export policy BGP-EXPORT; a "
+                                "group or neighbor with its own export policy does not use it on Junos, and exports "
+                                "every route its policy accepts, whatever protocol it comes from")
         for name, group in bgp.peer_groups.items():
             members = [n for n in bgp.neighbors if n.peer_group == name]
             if not members:
@@ -525,9 +565,11 @@ class Writer:
                 kind = "internal" if remotes == {bgp.local_as} else "external"
             self.add("protocols", "bgp", f"group {name}", f"type {kind}")
         if bgp.maximum_paths or bgp.maximum_paths_ibgp:
-            self.report.add("bgp", label, Severity.REVIEW, "junos-not-yet",
-                            "maximum-paths is not written for Junos yet; add multipath to the groups and a "
-                            "load-balance policy")
+            self.add("protocols", "bgp", "multipath" + (" multiple-as" if bgp.multipath_relax else ""))
+            self.load_balance()
+            self.report.add("bgp", label, Severity.APPROX, "multipath",
+                            f"maximum-paths {bgp.maximum_paths or bgp.maximum_paths_ibgp} is written as multipath: "
+                            "Junos installs as many equal paths as the platform allows")
         bgp_text.unwritten_vrfs(bgp, self.report, "Junos")
         for neighbor in bgp.neighbors:
             nlabel = f"neighbor {neighbor.address}"
@@ -581,15 +623,21 @@ class Writer:
             for family in families:
                 words = {"ipv4": "family inet", "ipv6": "family inet6", "evpn": "family evpn"}[family]
                 self.add(*path, words, "signaling" if family == "evpn" else "unicast")
-        missing = [what for what, stated in (
-            ("next-hop-self", p.next_hop_self), ("shutdown", p.shutdown),
-            (f"route maps {p.route_map_in or '-'} in / {p.route_map_out or '-'} out",
-             bool(p.route_map_in or p.route_map_out)),
-            (f"prefix lists {p.prefix_list_in or '-'} in / {p.prefix_list_out or '-'} out",
-             bool(p.prefix_list_in or p.prefix_list_out))) if stated]
+        for direction, plist, rmap in (("import", p.prefix_list_in, p.route_map_in),
+                                       ("export", p.prefix_list_out, p.route_map_out)):
+            if plist:
+                self.add(*path, f"{direction} {junospolicy.prefix_policy(self.add, plist, self.prefix_kinds)}")
+            if rmap:
+                self.add(*path, f"{direction} {rmap}")
+        missing = [what for what, stated in (("next-hop-self", p.next_hop_self), ("shutdown", p.shutdown)) if stated]
         if missing:
             self.report.add("bgp", label, Severity.REVIEW, "junos-not-yet",
-                            f"not written for Junos yet (import and export policies): {', '.join(missing)}")
+                            f"not written for Junos yet: {', '.join(missing)}")
+
+    def load_balance(self) -> None:
+        """Junos installs one path in the forwarding table unless a policy tells it to balance."""
+        self.add("policy-options", "policy-statement LOAD-BALANCE", "then", "load-balance per-packet")
+        self.add("routing-options", "forwarding-table", "export LOAD-BALANCE")
 
     # LLDP and spanning tree --------------------------------------------------------------------------------------
 
@@ -668,7 +716,7 @@ class Writer:
     # the rest ----------------------------------------------------------------------------------------------------
 
     def not_yet(self) -> None:
-        partial.device(self.device, self.report, PLATFORM)
+        partial.device(self.device, self.report, PLATFORM, WRITTEN)
 
 
 def emit(device: Device, ports: PortMapper, report: Report) -> str:

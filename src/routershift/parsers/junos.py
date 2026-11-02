@@ -18,6 +18,7 @@ from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from .. import aaa as aaa_text
 from .. import bgp as bgp_text
+from .. import junospolicy
 from .. import ospf as ospf_text
 from .. import vrfs as vrfs_text
 from .. import vxlan as vxlan_text
@@ -86,6 +87,14 @@ class Reader:
         self.bgp_line = 0
         self.irb_vlans: Dict[str, int] = {}
         self.edge_bpdu_block = False
+        self.policy = junospolicy.Reader(self.device)
+        self.bgp_policies: Dict[Tuple[str, str], List[str]] = {}  # (group or neighbor, import|export) -> policies
+        self.bgp_export: List[str] = []
+        self.bgp_multipath_on = False
+        self.multipath = False
+        self.ospf_exports: Dict[str, List[str]] = {}  # routing instance -> export policies of its OSPF
+        self.generated: List[Statement] = []  # generate route 0.0.0.0/0 discard (for default-information always)
+        self.load_balance: List[str] = []
 
     # -------------------------------------------------------------------------------------------------------------
 
@@ -119,6 +128,8 @@ class Reader:
             "system": self.system, "routing-options": lambda s: self.routing_options(s, s.words[1:], ""),
             "routing-instances": self.routing_instance, "protocols": lambda s: self.protocols(s, s.words[1:], ""),
             "snmp": self.snmp, "chassis": self.chassis,
+            "policy-options": lambda s: self.policy.policy_options(s.line, s.words[1:]),
+            "firewall": lambda s: self.policy.firewall(s.line, s.words[1:]),
         }
         # routing instances first: their interfaces belong to them before OSPF reads them
         later.sort(key=lambda s: s.words[0] != "routing-instances" or "protocols" in s.words[:3])
@@ -259,6 +270,10 @@ class Reader:
                 return True
             if rest == ["dhcp"] and family == "inet":
                 iface.dhcp_client = True
+                return True
+            if rest[0] == "filter" and len(rest) == 3 and rest[1] in ("input", "output"):
+                attr = ("acl" if family == "inet" else "acl6") + ("_in" if rest[1] == "input" else "_out")
+                setattr(iface, attr, rest[2])
                 return True
             if rest[0] == "address" and len(rest) >= 2:
                 if rest[1] not in addresses:
@@ -449,6 +464,12 @@ class Reader:
             self.local_as = w[1]
             self.bgp_line = self.bgp_line or s.line
             return True
+        if w[:2] == ["forwarding-table", "export"] and len(w) == 3 and not vrf:
+            self.load_balance.append(w[2])
+            return True
+        if w[:3] == ["generate", "route", "0.0.0.0/0"] and w[3:] in ([], ["discard"]):
+            self.generated.append(s)
+            return True
         if w[0] == "rib" and len(w) >= 3 and w[1].endswith("inet6.0"):  # IPv6 routes: rib inet6.0 static ...
             return self.routing_options(s, w[2:], vrf)
         if w[:2] == ["static", "route"] and len(w) >= 4:
@@ -607,6 +628,9 @@ class Reader:
         if w[0] == "reference-bandwidth" and len(w) == 2:
             p.reference_bandwidth = bandwidth(w[1])
             return p.reference_bandwidth is not None
+        if w[0] == "export" and len(w) == 2:
+            self.ospf_exports.setdefault(vrf, []).append(w[1])
+            return True
         if w[0] != "area" or len(w) < 3:
             return False
         area = ospf_text.area(w[1])
@@ -638,6 +662,13 @@ class Reader:
         return False
 
     def bgp(self, w: List[str]) -> bool:
+        if w[0] == "export" and len(w) == 2:
+            self.bgp_export.append(w[1])
+            return True
+        if w[0] == "multipath" and w[1:] in ([], ["multiple-as"]):
+            self.multipath = w[1:] == ["multiple-as"]
+            self.bgp_multipath_on = True
+            return True
         if w[0] != "group" or len(w) < 3:
             return False
         group = self.bgp_groups.setdefault(w[1], BgpNeighbor(w[1]))
@@ -651,6 +682,9 @@ class Reader:
         return self.bgp_setting(group, rest)
 
     def bgp_setting(self, peer: BgpNeighbor, w: List[str]) -> bool:
+        if w[0] in ("import", "export") and len(w) == 2:
+            self.bgp_policies.setdefault((peer.address, w[0]), []).append(w[1])
+            return True
         if w[0] == "peer-as" and len(w) == 2:
             peer.remote_as = w[1]
         elif w[0] == "description" and len(w) == 2:
@@ -708,8 +742,39 @@ class Reader:
                 iface.stp_bpduguard = True
         for p in dev.ospf:
             p.router_id = self.router_ids.get(p.vrf, "")
+        self.finish_exports()
         if self.local_as:
             self.finish_bgp()
+        self.policy.finish(lambda line, text, why: dev.unparsed.append(Unparsed(line, text, why)))
+
+    def finish_exports(self) -> None:
+        """Export policies RouterShift writes for redistribution are read back as redistribution."""
+        always = False
+        for name in self.load_balance:
+            policy = self.policy.policies.get(name)
+            if policy is not None and all(t.thens == [["load-balance", "per-packet"]] and not t.froms
+                                          for t in policy.terms.values()):
+                self.policy.used_as_export[name] = "forwarding-table"
+            else:
+                self.device.unparsed.append(Unparsed(self.bgp_line, f"set routing-options forwarding-table export "
+                                                     f"{name}", "a forwarding-table policy RouterShift cannot hold"))
+        for vrf, names in self.ospf_exports.items():
+            p = next((p for p in self.device.ospf if p.vrf == vrf), None)
+            for name in names:
+                found = self.policy.export(name)
+                if p is None or found is None:
+                    self.device.unparsed.append(Unparsed(0, f"set protocols ospf export {name}",
+                                                         "an OSPF export policy RouterShift cannot read as "
+                                                         "redistribution"))
+                    continue
+                sources, maps, _, default, _, _ = found
+                p.redistribute += [x for x in sources if x not in p.redistribute]
+                p.redistribute_maps.update(maps)
+                p.default_originate = p.default_originate or default
+                always = always or default == "always"
+        if not always:
+            for s in self.generated:
+                self.unparsed(s, "a generated route")
 
     def finish_bgp(self) -> None:
         builder = bgp_text.Builder(self.local_as)
@@ -727,6 +792,30 @@ class Reader:
             stated = self.bgp_families.get(address) or self.bgp_families.get(neighbor.peer_group)
             neighbor.families = sorted(set(stated or [bgp_text.family(address)]))
             bgp.neighbors.append(neighbor)
+        for peer in list(bgp.peer_groups.values()) + bgp.neighbors:
+            for direction in ("import", "export"):
+                names = self.bgp_policies.get((peer.address, direction), [])
+                suffix = "in" if direction == "import" else "out"
+                for name in names:
+                    plist = name[len(junospolicy.PREFIX_POLICY):]
+                    if name.startswith(junospolicy.PREFIX_POLICY) and plist in self.policy.route_filters:
+                        setattr(peer, f"prefix_list_{suffix}", plist)
+                    else:
+                        setattr(peer, f"route_map_{suffix}", name)
+        for name in self.bgp_export:
+            found = self.policy.export(name)
+            if found is None:
+                self.device.unparsed.append(Unparsed(self.bgp_line, f"set protocols bgp export {name}",
+                                                     "a BGP export policy RouterShift cannot read as redistribution"))
+                continue
+            sources, maps, networks, _, _, ospf_match = found
+            bgp.redistribute += [x for x in sources if x not in bgp.redistribute]
+            bgp.redistribute_maps.update(maps)
+            bgp.networks += networks
+            bgp.ospf_match = ospf_match
+        if self.bgp_multipath_on:
+            bgp.maximum_paths = 64  # Junos installs as many equal paths as the platform allows
+            bgp.multipath_relax = self.multipath
         self.device.bgp = bgp
 
 

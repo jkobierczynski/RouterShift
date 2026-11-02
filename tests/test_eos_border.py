@@ -308,7 +308,10 @@ def test_other_targets_report_what_they_leave_out(target: str) -> None:
     out, rep = convert(EOS, "eos", target)
     text = rep.to_text()
     assert "anycast gateway 10.1.100.1/24" in text
-    assert "community-list CL-BLACKHOLE: skipped" in text
+    if target == "junos":
+        assert "community CL-BLACKHOLE {" in out
+    else:
+        assert "community-list CL-BLACKHOLE: skipped" in text
     for (kind, name), item in rep.items.items():
         if kind == "interface" and name.startswith("Vlan100 ->"):
             assert item.status in ("needs-review", "skipped"), target
