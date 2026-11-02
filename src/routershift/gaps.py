@@ -46,23 +46,6 @@ def unwritten(device: Device, report: Report, target: str, port: Callable[[str],
     def add(kind: str, item: str, what: str, severity: Severity = Severity.REVIEW) -> None:
         report.add(kind, item, severity, "not-written", f"{what} {later}")
 
-    m = device.mlag
-    if m is not None:
-        options = [w for w, v in (("the MLAG heartbeat", m.heartbeat), ("dual-primary detection", m.dual_primary_delay
-                                                                         is not None),
-                                  ("the reload delays", m.reload_delay or m.reload_delay_non_mlag),
-                                  ("StackWise Virtual", m.stack)) if v]
-        if options:
-            found.append(("interface", "multi-chassis LAG", ", ".join(options) + ":", Severity.REVIEW))
-    for vlan in device.vlans.values():
-        if vlan.trunk_groups:
-            found.append(("vlan", str(vlan.vlan_id), f"trunk group {', '.join(vlan.trunk_groups)}:", Severity.APPROX))
-    for name, info in device.vrf_info.items():
-        if info.leaks:
-            found.append(("system", f"vrf {name}", "the routes leaked from VRF " + ", ".join(info.leaks) + ":",
-                          Severity.REVIEW))
-    if device.system.router_id:
-        found.append(("system", "router ID", f"the global router ID {device.system.router_id}:", Severity.REVIEW))
     for iface in device.interfaces.values():
         label = _interface_item(report, iface, port)
         if iface.virtual_ipv4 or iface.virtual_ipv6:
@@ -156,6 +139,24 @@ def later_features(device: Device, report: Report, port: Callable[[str], str]) -
                           Severity.REVIEW))
     if device.system.router_id:
         found.append(("system", "router ID", f"the global router ID {device.system.router_id}:", Severity.REVIEW))
+    m = device.mlag
+    if m is not None:
+        options = [w for w, v in (("the MLAG heartbeat", m.heartbeat), ("dual-primary detection", m.dual_primary_delay
+                                                                         is not None),
+                                  ("the reload delays", m.reload_delay or m.reload_delay_non_mlag),
+                                  ("StackWise Virtual", m.stack)) if v]
+        if options:
+            found.append(("interface", "multi-chassis LAG", ", ".join(options) + ":", Severity.REVIEW))
+    for vlan in device.vlans.values():
+        if vlan.trunk_groups:
+            found.append(("vlan", str(vlan.vlan_id), f"trunk group {', '.join(vlan.trunk_groups)}:", Severity.APPROX))
+    for name, info in device.vrf_info.items():
+        if info.leaks:
+            found.append(("system", f"vrf {name}", "the routes leaked from VRF " + ", ".join(info.leaks) + ":",
+                          Severity.REVIEW))
+    if device.system.router_id:
+        found.append(("system", "router ID", f"the global router ID {device.system.router_id}:", Severity.REVIEW))
+    # (new device-level settings go above this line)
     for iface in device.interfaces.values():
         label = _interface_item(report, iface, port)
         options = [w for w, v in (("the EVPN ethernet segment", iface.evpn_esi),
