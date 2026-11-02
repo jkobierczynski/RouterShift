@@ -30,6 +30,7 @@ from .. import aoscxqos
 from .. import aoscxsec
 from .. import aoscxmon
 from .. import aoscxmgmt
+from .. import aoscxauto
 from .. import multicast as multicast_text
 from .. import routemap as routemap_text
 from .. import bgp as bgp_text
@@ -95,6 +96,7 @@ class _Reader:
         self._user_keys: Dict[str, List[str]] = {}  # user -> authorized-key lines
         self._user_groups: Dict[str, str] = {}  # user -> a user group of the switch's own
         self._rest_api = False
+        self._ptp = aoscxauto.PtpReader(self.device)
         self._lldp: Dict[str, int] = {}  # lldp holdtime-multiplier and management address, resolved at the end
 
     def unparsed(self, node: Node, section: str = "") -> None:
@@ -160,6 +162,8 @@ class _Reader:
             "user-group": lambda node: len(node.words) == 2 and self.policy_node(
                 node, aoscxmgmt.read_user_group(self.device, node.words[1], [c.words for c in node.children])),
             "password": self.password,
+            "ptp": lambda node: node.words == ["ptp", "profile", aoscxauto.PROFILE] and self.policy_node(
+                node, self._ptp.profile([c.words for c in node.children])),
             "track": lambda node: aoscxmon.read_track(self.device, node.words, lambda x: canonical(x)[0], node.line,
                                                       node.text),
             "no": self.no,
@@ -1294,7 +1298,7 @@ class _Reader:
             setattr(iface, f"acl{'6' if w[2] == 'ipv6' else ''}_{w[4].replace('routed-', '')}", w[3])
         elif w[:2] == ["apply", "policy"] and n == 4 and w[3] in ("in", "out", "routed-in", "routed-out"):
             setattr(iface, f"qos_policy_{w[3].replace('routed-', '')}", w[2])
-        elif aoscxsec.interface_line(self.device, iface, w):
+        elif aoscxsec.interface_line(self.device, iface, w) or aoscxauto.PtpReader.interface_line(iface, w):
             pass
         elif w[:3] == ["apply", "qos", "schedule-profile"] and n == 4:
             self._schedule[iface.name] = w[3]
@@ -1414,6 +1418,7 @@ class _Reader:
         aoscxqos.finish(self.device, self._schedule)
         aoscxmon.finish_lldp(self.device, self._lldp)
         aoscxmgmt.finish(self.device, self._user_keys, self._user_groups, self._rest_api)
+        self._ptp.finish()
         if self.device.vxlan is not None and self._vxlan_source:
             self.device.vxlan.source_interface = vxlan_text.interface_of(self.device, self._vxlan_source)
         if self._sflow_global and not monitor_text.sflow_ports(self.device):

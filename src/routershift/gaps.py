@@ -44,7 +44,7 @@ WRITES: Dict[str, Set[str]] = {
               "bgp-vrf-ipv6", "bgp-vrf-groups", "bgp-misc", "router-id", "pim-rp", "msdp", "multicast-vrf",
               "igmp-querier", "queuing", "copp", "macsec", "mac-acl", "lldp-options", "twamp", "mirror-acl",
               "sflow-options", "banners", "local-logging", "roles", "ssh-keys", "snmp-views", "apis",
-              "password-length", "syslog-transport", "trap-types", "console-login"},
+              "password-length", "syslog-transport", "trap-types", "console-login", "ptp", "event-handlers"},
 }
 
 Option = Tuple[str, str, object]  # (key, what the report calls it, whether the device has it)

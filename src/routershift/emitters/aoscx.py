@@ -22,6 +22,7 @@ from .. import aoscxqos
 from .. import aoscxsec
 from .. import aoscxmon
 from .. import aoscxmgmt
+from .. import aoscxauto
 from .. import routemap as routemap_text
 from .. import bgp as bgp_text
 from .. import dhcp as dhcp_text
@@ -192,6 +193,8 @@ class Writer:
         self.management()
         self.snmp()
         aoscxmgmt.unwritable(self.device, rep)
+        self.out += aoscxauto.ptp_lines(self.device, rep, _IND)
+        aoscxauto.events(self.device, rep)
         self.out += aoscxmgmt.role_lines(self.device, rep, _IND)
         self.users()
         self.aaa()
@@ -829,6 +832,7 @@ class Writer:
         lines += self._port_access_interface(iface, add)
         lines += self._qos_interface(iface, add)
         lines += aoscxsec.mac_acl_interface(self.device, iface, add)
+        lines += aoscxauto.ptp_interface(iface)
         lines += [f"no lldp {name}" for name, on in (("transmit", iface.lldp_tx), ("receive", iface.lldp_rx)) if not on]
         lines += self._l2sec_interface(iface, add)
         if iface.stp_portfast:
