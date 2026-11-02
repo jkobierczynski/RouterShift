@@ -32,6 +32,7 @@ from .. import nxosfabric
 from .. import nxosmcast
 from .. import nxosqos
 from .. import nxossec
+from .. import nxosmon
 from .. import evpn as evpn_text
 from .. import igp as igp_text
 from .. import routemap as routemap_text
@@ -178,6 +179,7 @@ class _Reader:
         self._inherits: List[Tuple[str, str, str]] = []  # neighbor, peer-session|peer-policy, template
         self._bgp_vrfs: Dict[str, Tuple[bgp_text.Builder, BgpVrf]] = {}
         self._fabric = nxosfabric.Reader(self.device)  # NX-OS VXLAN, EVPN and vPC
+        self._nxmon = nxosmon.Reader(self.device)  # NX-OS sFlow and NetFlow
         self._host_flap: Optional[Tuple[int, int, int]] = None  # NX-OS l2rib dup-host-mac-detection
         self._bgp_router_id = ""  # EOS: a VRF that names the same router ID needs none of its own
         self._syslog_hosts: List[Tuple[Node, str, str]] = []  # every logging host line, its address and VRF
@@ -314,7 +316,7 @@ class _Reader:
     def feature(self, node: Node) -> bool:
         """NX-OS: feature X switches a protocol on; the writer works out the features it needs."""
         w = node.words
-        if w[1:] in (["nv", "overlay"], ["fabric", "forwarding"]):
+        if w[1:] in (["nv", "overlay"], ["fabric", "forwarding"], ["sla", "sender"], ["sla", "responder"]):
             return True
         if len(w) != 2:
             return False
@@ -2011,6 +2013,11 @@ class _Reader:
         eos = self.device.platform == "eos"
         if w == ["monitor", "twamp"] and eos:
             return self._eos_twamp(node)
+        if self.nxos and w[1:2] == ["session"] and len(w) == 3:
+            for k in nxosmon.monitor_session(self.device, w[2], [c.words for c in node.children], node.line,
+                                             node.text):
+                self.unparsed(node.children[k], node.text)
+            return True
         if w[1:2] != ["session"] or len(w) < 5 or node.children:
             return False
         if (eos and w[3:5] == ["ip", "access-group"] and len(w) == 6) or \
@@ -2078,6 +2085,10 @@ class _Reader:
     def sampler(self, node: Node) -> bool:
         """IOS sampler NAME / mode random 1 out-of N."""
         w = node.words
+        if self.nxos and len(w) == 2:
+            for k in self._nxmon.sampler(w[1], [c.words for c in node.children]):
+                self.unparsed(node.children[k], node.text)
+            return True
         if len(w) != 2 or self.device.platform != "ios":
             return False
         for child in node.children:
@@ -2096,6 +2107,11 @@ class _Reader:
     def sflow(self, node: Node) -> bool:
         """EOS sflow: sample, polling-interval, [vrf V] destination A [PORT], source A, source-interface X, run."""
         w = node.words[1:]
+        if self.nxos and w and not node.children:
+            try:
+                return self._nxmon.sflow(w, node.line, node.text)
+            except (ValueError, IndexError):
+                return False
         if self.device.platform != "eos" or node.children or not w:
             return False
         vrf = ""
@@ -2128,6 +2144,11 @@ class _Reader:
     def flow(self, node: Node) -> bool:
         """IOS Flexible NetFlow: flow exporter and flow monitor (a flow record of its own is left for the report)."""
         w = node.words
+        if self.nxos:
+            bad = self._nxmon.flow(w, [c.words for c in node.children])
+            for k in bad or []:
+                self.unparsed(node.children[k], node.text)
+            return bad is not None
         if self.device.platform != "ios" or len(w) != 3:
             return False
         if w[1] == "exporter":
@@ -4061,6 +4082,8 @@ class _Reader:
             iface.pim = "sparse"
         elif w[:3] == ["ip", "igmp", "version"] and n == 4 and w[3] in ("1", "2", "3"):
             iface.igmp_version = int(w[3])
+        elif self.nxos and (w[:3] == ["ip", "flow", "monitor"] or w == ["switchport", "monitor"]):
+            return self._nxmon.interface_line(iface, w)
         elif w[:3] == ["ip", "flow", "monitor"] and n in (5, 7) and w[-1] in ("input", "output") and \
                 (n == 5 or w[4] == "sampler"):
             iface.flow = w[-1] if iface.flow in ("", w[-1]) else "both"
@@ -4243,6 +4266,8 @@ class _Reader:
                 iface.ospf_keys = dict(self._key_chains[chain])
         self._finish_vpn()
         multicast_text.finish(self.device)
+        if self.nxos:
+            self._nxmon.finish()
         self._finish_monitor()
         if self.nxos:
             self._fabric.finish()

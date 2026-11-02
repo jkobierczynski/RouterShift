@@ -27,6 +27,8 @@ from .. import nxosfabric
 from .. import nxosmcast
 from .. import nxosqos
 from .. import nxossec
+from .. import nxosmon
+from .. import tracking as tracking_text
 from .. import ospf as ospf_text
 from .. import partial
 from .. import routemap as routemap_text
@@ -46,7 +48,7 @@ HASHES = ("md5-crypt", "sha256-crypt", "sha512-crypt")
 MGMT_VRF = "management"
 PERMIT_ALL = "RS-PERMIT-ALL"  # the route map NX-OS needs for redistribution where the source had none
 WRITTEN = {"acl", "policy", "dhcp-relay", "fhrp", "speed", "storm", "stp-guards", "voice", "l2sec", "dot1x", "poe",
-           "dhcp", "aaa", "mlag", "vxlan", "multicast", "qos", "nat", "vpn"}
+           "dhcp", "aaa", "mlag", "vxlan", "multicast", "qos", "nat", "vpn", "monitor", "track"}
 _MGMT_NAMES = {"mgmt-vrf", "mgmt-intf", "management", "mgmt"}
 
 
@@ -64,6 +66,8 @@ class Writer:
         self.ospf_tags: Dict[int, str] = {}  # id of an Ospf -> the router ospf tag it is written under
         self.l3: Dict[str, int] = {}  # VRF -> the VLAN of its layer 3 VNI
         self.qos = nxosqos.Writer(device, report, IND)
+        self.track_plan = tracking_text.Plan()
+        self.mirror_ports = nxosmon.destinations(device)
 
     def vrf(self, name: str) -> str:
         return MGMT_VRF if name in self.mgmt_vrfs else name
@@ -80,6 +84,7 @@ class Writer:
         body: List[str] = []
         self.out = body
         self.l3 = nxosfabric.l3vni_vlans(self.device, self.report)
+        self.track_plan = tracking_text.plan(self.device, self.report, "nxos", PLATFORM)
         self.system()
         self.users()
         self.snmp()
@@ -87,6 +92,8 @@ class Writer:
         self.policies()
         self.qos_lines()
         self.out += nxossec.nat_lines(self.device, self.report, self.port, self.vrf, self.features)
+        tracking = nxosmon.tracking_lines(self.device, self.track_plan, self.port, self.vrf, IND, self.features)
+        self.out += tracking + (["!"] if tracking else [])
         self.vlans()
         self.spanning_tree()
         self.out += nxosfabric.vpc_lines(self.device, self.report, IND, self.vrf)
@@ -95,6 +102,7 @@ class Writer:
         for iface in self.device.interfaces.values():
             self.interface(iface)
         self.fabric()
+        self.monitoring()
         self.ospf()
         self.bgp()
         self.vty()
@@ -260,6 +268,16 @@ class Writer:
         for rm in self.device.route_maps.values():
             self.out += routemap_text.ios_route_map_lines(rm, "nxos", self.report, IND)
 
+    def monitoring(self) -> None:
+        d, rep = self.device, self.report
+        lines = nxosmon.lldp_lines(d, rep)
+        lines += nxosmon.sflow_lines(d, rep, self.port, self.vrf, self.features)
+        lines += nxosmon.netflow_lines(d, rep, self.port, self.vrf, IND, self.features)
+        lines += nxosmon.mirror_lines(d, rep, self.port, IND)
+        nxosmon.unwritable(d, rep)
+        if lines:
+            self.out += lines + ["!"]
+
     def qos_lines(self) -> None:
         lines = nxosqos.class_lines(self.device, self.report, IND)
         lines += self.qos.lines()
@@ -374,15 +392,15 @@ class Writer:
                     words.append(self.port(route.interface))
                 if route.next_hop:
                     words.append(route.next_hop)
+                track = self.track_plan.route_track(route.track) if route.track else ""
+                if track:
+                    words += ["track", track]
             if route.name:
                 words += ["name", route.name.replace(" ", "_")]
             if route.tag is not None:
                 words += ["tag", str(route.tag)]
             if route.distance is not None:
                 words.append(str(route.distance))
-            if route.track:
-                self.report.add("route", label, Severity.REVIEW, partial.CODE,
-                                f"tracking (object {route.track}) is not written for NX-OS yet; the route is always on")
             self.out.append(ind + " ".join(words))
         if routes and not ind:
             self.out.append("!")
@@ -432,6 +450,7 @@ class Writer:
         layer3 = iface.mode == SwitchportMode.ROUTED or not physical
         if layer3 and not iface.lag:
             lines += self.layer3(iface, name)
+        lines += nxosmon.interface_lines(self.device, iface, self.adder(label), self.mirror_ports)
         if not iface.lag:
             lines += nxossec.interface_lines(self.device, iface, self.adder(label))
             lines += nxosqos.interface_policy_lines(self.device, iface, self.adder(label))
@@ -532,9 +551,8 @@ class Writer:
             lines.append("hsrp version 2")
         for g in groups:
             add = fhrp.adder(self.report, name, g)
-            if g.tracks:
-                add(Severity.REVIEW, partial.CODE, "tracking is not written for NX-OS yet")
             body = self.hsrp(g) if g.protocol == "hsrp" else self.vrrp(g, add)
+            body += [f"track {t} decrement {dec}" for t, dec in self.track_plan.fhrp_tracks(g.tracks)]
             lines.append(f"{g.protocol} {g.group}")
             lines += [IND + line for line in body]
         return lines
