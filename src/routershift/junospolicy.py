@@ -310,7 +310,7 @@ def filters(device: Device, add: Add, report: Report) -> Dict[str, str]:
                            f"entry '{entry.unsupported}' not converted; add it to the filter by hand")
                 continue
             term = base + (f"term {seq}",)
-            words = _from(entry, acl.family, label, report)
+            words = from_words(entry, acl.family, label, report)
             for word in words:
                 add(*term, "from", word)
             if entry.log:
@@ -324,7 +324,7 @@ def filters(device: Device, add: Add, report: Report) -> Dict[str, str]:
     return names
 
 
-def _from(entry: AclEntry, family: int, label: str, report: Report) -> List[str]:
+def from_words(entry: AclEntry, family: int, label: str, report: Report) -> List[str]:
     out: List[str] = []
     if entry.source != "any":
         out.append(f"source-address {entry.source}")
@@ -345,6 +345,15 @@ def _from(entry: AclEntry, family: int, label: str, report: Report) -> List[str]
     if entry.established:
         out.append("tcp-established")
     return out
+
+
+_FROM_SWITCHING = {"ip-source-address": "source-address", "ip-destination-address": "destination-address",
+                   "ip-protocol": "protocol", "ip-address": "address"}
+
+
+def to_inet(words: List[str]) -> List[str]:
+    """A match of an ethernet-switching filter in the words of an inet one."""
+    return [_FROM_SWITCHING.get(words[0], words[0])] + words[1:] if words else words
 
 
 # reading ------------------------------------------------------------------------------------------------------------
@@ -379,6 +388,7 @@ class Reader:
         self.communities: Dict[str, List[str]] = {}
         self.community_lines: Dict[str, int] = {}
         self.filters: Dict[Tuple[str, str], Policy] = {}  # (family, name)
+        self.qos_filters: Dict[Tuple[str, str], Policy] = {}  # filters with QoS actions
         self.route_filters: Dict[str, str] = {}  # route-filter-list or prefix-list name -> kind
         self.used_as_export: Dict[str, str] = {}  # policy -> what exports it ("bgp", "ospf", ...)
         self.aggregates: Dict[str, List[BgpAggregate]] = {}  # export policy -> the aggregates it announces
@@ -440,7 +450,8 @@ class Reader:
             family, w = w[1], w[2:]
         else:
             family = "inet"
-        if family not in ("inet", "inet6") or len(w) < 4 or w[0] != "filter" or w[2] != "term":
+        if family not in ("inet", "inet6", "ethernet-switching") or len(w) < 4 or w[0] != "filter" or \
+                w[2] != "term":
             return False
         policy = self.filters.setdefault((family, w[1]), Policy(w[1], line))
         term = policy.term(w[3], line)
@@ -457,6 +468,16 @@ class Reader:
 
     def finish(self, unread: Callable[[int, str, str], None]) -> None:
         for (family, name), policy in self.filters.items():
+            if any(t and t[0] in ("policer", "dscp", "forwarding-class", "loss-priority")
+                   for term in policy.terms.values() for t in term.thens):
+                self.qos_filters[(family, name)] = policy  # a QoS policy: read with class of service
+                continue
+            if family == "ethernet-switching":
+                if ("inet", name) in self.filters:
+                    continue  # the same ACL, written for switch ports too
+                for term in policy.terms.values():
+                    term.froms = [to_inet(f) for f in term.froms]
+                family = "inet"
             self.acl(family, policy, unread)
         for name in self.communities:
             values = self.communities[name]

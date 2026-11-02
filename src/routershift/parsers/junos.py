@@ -22,14 +22,16 @@ from .. import dhcp as dhcp_text
 from .. import evpn as evpn_text
 from .. import fhrp as fhrp_text
 from .. import junospolicy
+from .. import junosqos
+from .. import qos as qos_text
 from .. import multicast as multicast_text
 from .. import ospf as ospf_text
 from .. import vrfs as vrfs_text
 from .. import vxlan as vxlan_text
 from ..junostext import Statement, read
-from ..model import (AaaMethod, AaaServer, Bgp, BgpAggregate, BgpNeighbor, BgpVrf, Device, DhcpPool, EvpnInstance,
+from ..model import (Acl, AaaMethod, AaaServer, Bgp, BgpAggregate, BgpNeighbor, BgpVrf, Device, DhcpPool, EvpnInstance,
                      FhrpGroup, Interface, InterfaceKind, LacpMode, LocalUser, Mlag, NtpKey, SnmpCommunity, StaticRoute,
-                     StpMode, SwitchportMode, Track, Unparsed, Vlan, Vxlan)
+                     QosClass, StpMode, SwitchportMode, Track, Unparsed, Vlan, Vxlan)
 
 _MEDIA = {"ge": "1g", "xe": "10g", "et": "100g", "mge": "2.5g", "fe": "100m"}
 _PHYSICAL = re.compile(r"^(ge|xe|et|mge|fe)-(\d+/\d+/\d+(?::\d+)?)$")
@@ -107,6 +109,8 @@ class Reader:
         self.vrf_policies: Dict[str, List[Tuple[str, str, Statement]]] = {}
         self.vni_targets: Dict[int, Dict[str, str]] = {}  # VNI -> both|import|export -> target
         self.switch_target = ""
+        self.cos = junosqos.CosReader(self.device)
+        self.filter_lists: Dict[Tuple[str, str], List[str]] = {}  # (interface, input|output) -> filters
         self.rp_ranges: Dict[Tuple[str, str], List[str]] = {}  # (VRF, RP) -> group ranges
         self.local_rp = ""
         self.local_rp_ranges: List[str] = []
@@ -180,7 +184,8 @@ class Reader:
             "routing-instances": self.routing_instance, "protocols": lambda s: self.protocols(s, s.words[1:], ""),
             "snmp": self.snmp, "chassis": self.chassis,
             "policy-options": lambda s: self.policy.policy_options(s.line, s.words[1:]),
-            "firewall": lambda s: self.policy.firewall(s.line, s.words[1:]),
+            "firewall": self.firewall,
+            "class-of-service": lambda s: self.cos.statement(s.words[1:]),
             "forwarding-options": lambda s: self.forwarding_options(s, s.words[1:], ""),
             "switch-options": self.switch_options, "poe": self.poe_line, "multi-chassis": self.multi_chassis, "access": lambda s: self.access(s.words[1:], ""),
         }
@@ -190,6 +195,11 @@ class Reader:
             self.handle(s, handlers.get(s.words[0], lambda _: False))
         self.finish()
         return self.device
+
+    def firewall(self, s: Statement) -> bool:
+        if s.words[1:2] == ["policer"] and len(s.words) >= 4:
+            return self.cos.policer(s.words[2:])
+        return self.policy.firewall(s.line, s.words[1:])
 
     def handle(self, s: Statement, handler: Callable[[Statement], bool]) -> None:
         try:
@@ -387,6 +397,10 @@ class Reader:
                 attr = ("acl" if family == "inet" else "acl6") + ("_in" if rest[1] == "input" else "_out")
                 setattr(iface, attr, rest[2])
                 return True
+            if rest[0] == "filter" and len(rest) == 3 and rest[1] in ("input-list", "output-list") and \
+                    family == "inet":
+                self.filter_lists.setdefault((iface.name, rest[1][:-5]), []).append(rest[2])
+                return True
             if rest[0] == "address" and len(rest) >= 2:
                 if rest[1] not in addresses:
                     addresses.append(rest[1])
@@ -418,6 +432,9 @@ class Reader:
             if iface.mode == SwitchportMode.ROUTED:
                 iface.mode = SwitchportMode.ACCESS
             if not rest:
+                return True
+            if rest[0] == "filter" and len(rest) == 3 and rest[1] in ("input", "output"):
+                setattr(iface, "acl_in" if rest[1] == "input" else "acl_out", rest[2])
                 return True
             if rest[0] in ("interface-mode", "port-mode") and len(rest) == 2 and rest[1] in ("access", "trunk"):
                 iface.mode = SwitchportMode(rest[1])
@@ -1320,7 +1337,33 @@ class Reader:
         self.finish_exports()
         if self.local_as:
             self.finish_bgp()
-        self.policy.finish(lambda line, text, why: dev.unparsed.append(Unparsed(line, text, why)))
+        unread = lambda line, text, why: dev.unparsed.append(Unparsed(line, text, why))  # noqa: E731
+        self.policy.finish(unread)
+        self.finish_cos(unread)
+
+    def finish_cos(self, unread: Callable[[int, str, str], None]) -> None:
+        dev = self.device
+        pending: List[Tuple[QosClass, Acl]] = []
+        for (family, _), policy in self.policy.qos_filters.items():
+            self.cos.policy(family, policy, unread, pending)
+        qos_text.adopt(dev, pending)
+        self.cos.finish(unread, self.canonical)
+        for (name, direction), filters in self.filter_lists.items():
+            iface = dev.interfaces[name]
+            for f in filters:
+                if f in dev.qos_policies:
+                    setattr(iface, f"qos_policy_{'in' if direction == 'input' else 'out'}", f)
+                elif not getattr(iface, f"acl_{'in' if direction == 'input' else 'out'}"):
+                    setattr(iface, f"acl_{'in' if direction == 'input' else 'out'}", f)
+                else:
+                    unread(0, f"set interfaces {name} family inet filter {direction}-list {f}",
+                           "RouterShift keeps one ACL and one QoS policy per direction")
+        for iface in dev.interfaces.values():
+            for way in ("in", "out"):
+                acl = getattr(iface, f"acl_{way}")
+                if acl and acl in dev.qos_policies and acl not in dev.acls:
+                    setattr(iface, f"qos_policy_{way}", acl)
+                    setattr(iface, f"acl_{way}", "")
 
     def canonical(self, unit: str) -> Optional[Interface]:
         name = self.units.get(unit) or self.units.get(f"{unit}.0") or self.ifds.get(unit)

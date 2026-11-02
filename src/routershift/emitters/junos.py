@@ -26,6 +26,7 @@ from .. import hosts as hosts_text
 from .. import l2sec as l2sec_text
 from .. import multicast as multicast_text
 from .. import junospolicy
+from .. import junosqos
 from .. import ospf as ospf_text
 from .. import partial
 from .. import snmp as snmp_text
@@ -43,10 +44,10 @@ CLASSES = [(15, "super-user"), (5, "operator"), (0, "read-only")]
 HASHES = ("md5-crypt", "sha256-crypt", "sha512-crypt", "junos")
 MGMT_INSTANCE = "mgmt_junos"
 # What partial.device need not report: the device-wide features this writer writes
-WRITTEN = {"acl", "policy", "dhcp", "l2sec", "aaa", "mlag", "vxlan", "multicast"}
+WRITTEN = {"acl", "policy", "dhcp", "l2sec", "aaa", "mlag", "vxlan", "multicast", "qos"}
 # What partial.port need not report
 PORT_WRITTEN = {"dhcp-relay", "fhrp", "voice", "speed", "l2sec", "storm", "poe", "dot1x", "stp-guards", "mlag",
-                "multicast"}
+                "multicast", "qos"}
 _NAME_CHARS = re.compile(r"[^A-Za-z0-9_.-]+")
 
 
@@ -110,6 +111,7 @@ class Writer:
         self.spanning_tree()
         self.snooping()
         self.multicast()
+        self.cos()
         self.dhcp_relay()
         self.dhcp_server()
         self.aaa()
@@ -385,6 +387,7 @@ class Writer:
                 if iface.mode == SwitchportMode.TRUNK and iface.native_vlan:
                     self.add(*top, f"native-vlan-id {iface.native_vlan}")
                 self.switching(iface, f"{ifd}.{unit}", switching)
+                self.switch_filters(iface, switching)
             else:
                 self.layer3(iface, path)
             if physical:
@@ -575,10 +578,23 @@ class Writer:
             self.add(*path, f"maximum-power {watts:g}")
 
     def interface_filters(self, iface: Interface, path: Tuple[str, ...]) -> None:
-        for family, acl, direction in (("inet", iface.acl_in, "input"), ("inet", iface.acl_out, "output"),
-                                       ("inet6", iface.acl6_in, "input"), ("inet6", iface.acl6_out, "output")):
-            if acl:
-                self.add(*path, f"family {family}", "filter", f"{direction} {self.filter_names.get(acl, acl)}")
+        for family, acl, qos, direction in (("inet", iface.acl_in, iface.qos_policy_in, "input"),
+                                            ("inet", iface.acl_out, iface.qos_policy_out, "output"),
+                                            ("inet6", iface.acl6_in, "", "input"),
+                                            ("inet6", iface.acl6_out, "", "output")):
+            names = [self.filter_names.get(acl, acl)] if acl else []
+            names += [qos] if qos else []
+            if len(names) == 1:
+                self.add(*path, f"family {family}", "filter", f"{direction} {names[0]}")
+            elif len(names) > 1:  # an ACL and a QoS policy: Junos runs the filters of a list in turn
+                for name in names:
+                    self.add(*path, f"family {family}", "filter", f"{direction}-list {name}")
+
+    def switch_filters(self, iface: Interface, switching: Tuple[str, ...]) -> None:
+        """QoS policies of a switch port, as ethernet-switching filters."""
+        for qos, direction in ((iface.qos_policy_in, "input"), (iface.qos_policy_out, "output")):
+            if qos:
+                self.add(*switching, "filter", f"{direction} {qos}")
 
     def leftovers(self, iface: Interface) -> None:
         """What a port carries that this writer does not write yet."""
@@ -1227,6 +1243,19 @@ class Writer:
             if low.isdigit():
                 vids += [v for v in range(int(low), int(high or low) + 1) if v in self.vlan_names]
         return vids
+
+    # class of service --------------------------------------------------------------------------------------------
+
+    def cos(self) -> None:
+        dev = self.device
+        families: Dict[str, Set[str]] = {}
+        for iface in dev.interfaces.values():
+            switch = iface.mode != SwitchportMode.ROUTED and iface.kind in (InterfaceKind.ETHERNET, InterfaceKind.LAG)
+            for name in (iface.qos_policy_in, iface.qos_policy_out):
+                if name:
+                    families.setdefault(name, set()).add("ethernet-switching" if switch else "inet")
+        junosqos.policy_filters(dev, self.add, self.report, families)
+        junosqos.CosWriter(dev, self.add, self.report, self.port).write()
 
     # multicast ---------------------------------------------------------------------------------------------------
 
