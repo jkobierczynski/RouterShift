@@ -33,7 +33,8 @@ WRITES: Dict[str, Set[str]] = {
               "dot1x-fail-vlan", "option82", "evpn-instances", "vxlan-mcast", "evpn-domain", "mlag-options",
               "stackwise", "trunk-groups", "leaks", "evpn-vrf", "evpn-es", "bgp-options", "bgp-vrf-ipv6",
               "bgp-vrf-groups", "bgp-misc", "router-id", "pim-rp", "msdp", "multicast-vrf", "igmp-querier",
-              "queuing", "qos-burst", "copp", "macsec", "mac-acl", "coa"},
+              "queuing", "qos-burst", "copp", "macsec", "mac-acl", "coa",
+              "lldp-options", "twamp", "mirror-acl", "sflow-options", "netflow-sampling"},
 }
 
 Option = Tuple[str, str, object]  # (key, what the report calls it, whether the device has it)

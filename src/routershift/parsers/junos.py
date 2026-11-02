@@ -24,6 +24,8 @@ from .. import fhrp as fhrp_text
 from .. import junospolicy
 from .. import junosqos
 from .. import junossec
+from .. import junosmon
+from .. import monitor as monitor_text
 from .. import qos as qos_text
 from .. import security as security_text
 from .. import multicast as multicast_text
@@ -114,6 +116,9 @@ class Reader:
         self.cos = junosqos.CosReader(self.device)
         self.filter_lists: Dict[Tuple[str, str], List[str]] = {}  # (interface, input|output) -> filters
         self.macsec_ports: Dict[str, str] = {}  # port -> connectivity association
+        self.mon = junosmon.MonitorReader(self.device)
+        self.lldp_timers: Dict[str, int] = {}
+        self.lldp_address = ""
         self.rp_ranges: Dict[Tuple[str, str], List[str]] = {}  # (VRF, RP) -> group ranges
         self.local_rp = ""
         self.local_rp_ranges: List[str] = []
@@ -189,6 +194,7 @@ class Reader:
             "policy-options": lambda s: self.policy.policy_options(s.line, s.words[1:]),
             "firewall": self.firewall,
             "class-of-service": lambda s: self.cos.statement(s.words[1:]),
+            "services": self.services,
             "security": lambda s: s.words[1:2] == ["macsec"] and len(s.words) > 3 and
             junossec.read_macsec(self.device, s.words[2:], self.macsec_ports),
             "forwarding-options": lambda s: self.forwarding_options(s, s.words[1:], ""),
@@ -200,6 +206,14 @@ class Reader:
             self.handle(s, handlers.get(s.words[0], lambda _: False))
         self.finish()
         return self.device
+
+    def services(self, s: Statement) -> bool:
+        w = s.words[1:]
+        if w[0] == "rpm" and len(w) >= 3:
+            return self.mon.rpm(w[1:])
+        # the template inline J-Flow exports with: J-Flow's own IPv4 template
+        return w[:1] == ["flow-monitoring"] and len(w) == 5 and w[1] in ("version9", "version-ipfix") and \
+            w[2] == "template" and w[4] == "ipv4-template"
 
     def firewall(self, s: Statement) -> bool:
         if s.words[1:2] == ["policer"] and len(s.words) >= 4:
@@ -401,6 +415,9 @@ class Reader:
             if rest[0] == "filter" and len(rest) == 3 and rest[1] in ("input", "output"):
                 attr = ("acl" if family == "inet" else "acl6") + ("_in" if rest[1] == "input" else "_out")
                 setattr(iface, attr, rest[2])
+                return True
+            if rest[0] == "sampling" and len(rest) == 2 and rest[1] in ("input", "output") and family == "inet":
+                junosmon.MonitorReader.flow_port(iface, rest[1])
                 return True
             if rest[0] == "filter" and len(rest) == 3 and rest[1] in ("input-list", "output-list") and \
                     family == "inet":
@@ -664,6 +681,10 @@ class Reader:
     # forwarding options, switch options, PoE, access ----------------------------------------------------------------
 
     def forwarding_options(self, s: Statement, w: List[str], vrf: str) -> bool:
+        if w[:2] == ["sampling", "instance"] and len(w) >= 5 and not vrf:
+            return self.mon.sampling(w[3:])
+        if w[0] == "analyzer" and len(w) >= 4 and not vrf:
+            return self.mon.analyzer(w[1:])
         if w[0] == "storm-control-profiles" and len(w) >= 4 and w[2] == "all":
             profile = self.storm_profiles.setdefault(w[1], {})
             rest = w[3:]
@@ -808,6 +829,8 @@ class Reader:
         return True
 
     def chassis(self, s: Statement) -> bool:
+        if s.words[1:3] == ["fpc", "0"] and len(s.words) == 5 and s.words[3] == "sampling-instance":
+            return True  # the J-Flow sampling instance bound to the line card
         # the number of aggregates the chassis allows: written again from the aggregates there are
         return s.words[1:4] == ["aggregated-devices", "ethernet", "device-count"] and len(s.words) == 5
 
@@ -1031,6 +1054,8 @@ class Reader:
             return self.bgp(w[1:], vrf)
         if w[0] in ("pim", "igmp", "msdp", "igmp-snooping"):
             return self.multicast(w, vrf)
+        if w[0] == "sflow" and len(w) >= 2 and not vrf:
+            return self.mon.sflow(w[1:])
         if w[0] == "lldp":
             m = self.device.management
             if w[1:] in ([], ["interface", "all"]):
@@ -1038,6 +1063,12 @@ class Reader:
                 return True
             if w[1:] == ["disable"]:
                 m.lldp = False
+                return True
+            if w[1] in ("advertisement-interval", "hold-multiplier") and len(w) == 3:
+                self.lldp_timers[w[1]] = int(w[2])
+                return True
+            if w[1] == "management-address" and len(w) == 3:
+                self.lldp_address = w[2]
                 return True
             if len(w) == 4 and w[1] == "interface" and w[3] == "disable":
                 iface = self.stp_port(w[2])
@@ -1368,6 +1399,18 @@ class Reader:
                 else:
                     unread(0, f"set interfaces {name} family inet filter {direction}-list {f}",
                            "RouterShift keeps one ACL and one QoS policy per direction")
+        self.mon.finish(self.canonical, lambda a: vxlan_text.interface_of(dev, a), unread)
+        monitor_text.finish(dev)
+        m = dev.management
+        if "advertisement-interval" in self.lldp_timers:
+            m.lldp_timer = self.lldp_timers["advertisement-interval"]
+        if "hold-multiplier" in self.lldp_timers:
+            m.lldp_holdtime = (m.lldp_timer or 30) * self.lldp_timers["hold-multiplier"]
+        if self.lldp_address:
+            m.lldp_mgmt_interface = vxlan_text.interface_of(dev, self.lldp_address)
+            if not m.lldp_mgmt_interface:
+                unread(0, f"set protocols lldp management-address {self.lldp_address}",
+                       "an address no interface of the switch holds")
         for name, policy in self.policy.mac_filters.items():
             junossec.read_mac_filter(dev, policy, unread)
         for iface in dev.interfaces.values():

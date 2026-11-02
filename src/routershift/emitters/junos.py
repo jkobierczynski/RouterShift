@@ -28,6 +28,7 @@ from .. import multicast as multicast_text
 from .. import junospolicy
 from .. import junosqos
 from .. import junossec
+from .. import junosmon
 from .. import ospf as ospf_text
 from .. import partial
 from .. import snmp as snmp_text
@@ -45,10 +46,10 @@ CLASSES = [(15, "super-user"), (5, "operator"), (0, "read-only")]
 HASHES = ("md5-crypt", "sha256-crypt", "sha512-crypt", "junos")
 MGMT_INSTANCE = "mgmt_junos"
 # What partial.device need not report: the device-wide features this writer writes
-WRITTEN = {"acl", "policy", "dhcp", "l2sec", "aaa", "mlag", "vxlan", "multicast", "qos"}
+WRITTEN = {"acl", "policy", "dhcp", "l2sec", "aaa", "mlag", "vxlan", "multicast", "qos", "monitor", "track"}
 # What partial.port need not report
 PORT_WRITTEN = {"dhcp-relay", "fhrp", "voice", "speed", "l2sec", "storm", "poe", "dot1x", "stp-guards", "mlag",
-                "multicast", "qos"}
+                "multicast", "qos", "monitor"}
 _NAME_CHARS = re.compile(r"[^A-Za-z0-9_.-]+")
 
 
@@ -114,6 +115,7 @@ class Writer:
         self.multicast()
         self.cos()
         self.security()
+        junosmon.MonitorWriter(self.device, self.add, self.report, self.port, self.unit_name, self.instance).write()
         self.dhcp_relay()
         self.dhcp_server()
         self.aaa()
@@ -515,7 +517,10 @@ class Writer:
         for track, decrement in g.tracks.items():
             target = self.device.tracks.get(track)
             if target is not None and target.interface:
-                self.add(*path, "track", f"interface {self.unit_name(target.interface)}", f"priority-cost {decrement}")
+                tracked = self.device.interfaces.get(target.interface)
+                name = self.port(target.interface) if tracked is not None and tracked.lag else \
+                    self.unit_name(target.interface)  # a LAG member has no unit of its own
+                self.add(*path, "track", f"interface {name}", f"priority-cost {decrement}")
             else:
                 add(Severity.REVIEW, "fhrp-track", f"tracking object {track} is not written: Junos VRRP tracks "
                     "interfaces and routes; add it by hand")
@@ -761,8 +766,9 @@ class Writer:
                 self.report.add("route", label, Severity.APPROX, "route-name",
                                 f"the route's name '{route.name}' has no place on Junos and is left out")
             if route.track:
-                self.report.add("route", label, Severity.REVIEW, "junos-not-yet",
-                                f"tracking (object {route.track}) is not written for Junos yet; the route is always on")
+                self.report.add("route", label, Severity.REVIEW, "route-track",
+                                f"Junos does not track static routes (object {route.track}); the route is always on. "
+                                "IP monitoring (services ip-monitoring) can swap its next hop on a failed RPM probe")
 
     def router_id(self) -> str:
         if self.rid is not None:
