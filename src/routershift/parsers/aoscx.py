@@ -82,6 +82,8 @@ class _Reader:
         self._auth_mode: Dict[str, str] = {}
         self._vxlan_source = ""  # interface vxlan: source ip, resolved to its interface at the end
         self._sflow_global = False  # sflow: every port samples unless ports name themselves
+        self._icmp_off: List[str] = []
+        self._gateways6: Dict[str, List[str]] = {}  # interface -> active-gateway ipv6 addresses  # no ip icmp redirect|unreachable: said of every routed interface
 
     def unparsed(self, node: Node, section: str = "") -> None:
         self.device.unparsed.append(Unparsed(node.line, node.text, section))
@@ -121,7 +123,8 @@ class _Reader:
             "aaa": self.aaa,
             "class": self.qos_class,
             "policy": self.qos_policy,
-            "dhcpv4-snooping": lambda node: node.words == ["dhcpv4-snooping"] and self._snooping(),
+            "dhcpv4-snooping": self.snooping,
+            "radius": lambda node: node.words == ["radius", "dyn-authorization", "enable"] and self._coa(),
             "vsx": self.vsx,
             "mirror": self.mirror,
             "evpn": self.evpn,
@@ -130,7 +133,7 @@ class _Reader:
             "https-server": self.server,
             "cli-session": self.cli_session,
             "lldp": lambda node: node.words == ["lldp"] and self._set_lldp(True),
-            "no": lambda node: node.words == ["no", "lldp"] and self._set_lldp(False),
+            "no": self.no,
         }
         for node in roots:
             if node.text.startswith(_NOISE):
@@ -440,6 +443,31 @@ class _Reader:
                 self.unparsed(child, node.text)
         return True
 
+    def no(self, node: Node) -> bool:
+        w = node.words
+        if w == ["no", "lldp"]:
+            return self._set_lldp(False)
+        if w[1:3] == ["ip", "icmp"] and len(w) == 4 and w[3] in ("redirect", "unreachable"):
+            self._icmp_off.append(w[3])
+            return True
+        if w[1:] == ["dhcpv4-snooping", "option", "82"]:
+            self.device.dhcp_option82 = False
+            return True
+        return False
+
+    def snooping(self, node: Node) -> bool:
+        w = node.words
+        if w == ["dhcpv4-snooping"]:
+            return self._snooping()
+        if w == ["dhcpv4-snooping", "option", "82"]:
+            self.device.dhcp_option82 = True
+            return True
+        return False
+
+    def _coa(self) -> bool:
+        self.device.aaa.coa = True
+        return True
+
     def _snooping(self) -> bool:
         self.device.dhcp_snooping = True
         return True
@@ -666,11 +694,17 @@ class _Reader:
         s = monitor_text.session(self.device, w[2], node.line, node.text)
         for child in node.children:
             c = child.words
-            if c[:2] == ["source", "interface"] and len(c) in (3, 4) and \
-                    (len(c) == 3 or monitor_text.direction(c[3]) is not None):
-                s.sources[canonical(c[2])[0]] = monitor_text.direction(c[3]) or "both" if len(c) == 4 else "both"
-            elif c[:2] == ["destination", "interface"] and len(c) == 3:
-                s.destination = canonical(c[2])[0]
+            if c[:2] in (["source", "interface"], ["destination", "interface"]) and len(c) >= 3:
+                rest = c[2:]
+                way = monitor_text.direction(rest[-1]) if c[0] == "source" and len(rest) > 1 else None
+                name = " ".join(rest[:-1] if way is not None else rest)  # "1/1/1", or "lag 30"
+                if len(name.split()) > 2 or c[0] == "source" and len(rest) > 1 and way is None and \
+                        not name.startswith("lag"):
+                    self.unparsed(child, node.text)
+                elif c[0] == "source":
+                    s.sources[canonical(name)[0]] = way or "both"
+                else:
+                    s.destination = canonical(name)[0]
             elif c in (["enable"], ["comment"]) or c[0] == "comment":
                 pass
             else:
@@ -983,6 +1017,9 @@ class _Reader:
         if w[:1] == ["client-limit"] and len(w) == 2:
             self._client_limit[iface.name] = int(w[1])
             return True
+        if w[:1] == ["reject-vlan"] and len(w) == 2:
+            iface.dot1x_fail_vlan = int(w[1])
+            return True
         if w[:1] == ["auth-mode"] and len(w) == 2 and w[1] in ("client-mode", "device-mode", "multi-domain"):
             self._auth_mode[iface.name] = w[1]
             return True
@@ -1052,6 +1089,15 @@ class _Reader:
             return True
         return len(w) == 1
 
+    def _active_gateway6(self, iface: Interface, w: List[str]) -> bool:
+        if w[0] == "mac" and len(w) == 2:
+            self.device.anycast_mac = self.device.anycast_mac or fhrp.mac(w[1])
+            return True
+        if len(w) == 1:
+            self._gateways6.setdefault(iface.name, []).append(str(ipaddress.ip_address(w[0])))
+            return True
+        return False
+
     def interface_line(self, iface: Interface, w: List[str]) -> bool:
         n = len(w)
         if w[0] == "description":
@@ -1119,8 +1165,13 @@ class _Reader:
         elif w[:2] == ["ip", "helper-address"] and n >= 3:
             iface.helper_addresses.append(w[2])
             if n == 5 and w[3] == "vrf":
-                return False  # relay through another VRF: not in the model
+                iface.helper_vrf = w[4]
+                return True
             return n == 3
+        elif w == ["ip", "proxy-arp"]:
+            iface.proxy_arp = True
+        elif w[:2] == ["active-gateway", "ipv6"] and n >= 3:
+            return self._active_gateway6(iface, w[2:])
         elif w[0] == "default-gateway" and n == 2:  # mgmt
             self.device.static_routes.append(StaticRoute("0.0.0.0/0" if ":" not in w[1] else "::/0",
                                                          next_hop=w[1], vrf=iface.vrf or MGMT_VRF))
@@ -1183,7 +1234,34 @@ class _Reader:
         iface.duplex = duplex
         return True
 
+    def _anycast(self) -> None:
+        """An active gateway on the interface's own address is the anycast gateway (EOS ip address virtual)."""
+        d = self.device
+        for iface in d.interfaces.values():
+            for g in [g for g in iface.fhrp if g.protocol == "anycast"]:
+                own = [a for a in iface.ipv4 if str(ipaddress.ip_interface(a).ip) in [g.address] + g.secondary]
+                if not own or len(own) != len([g.address] + g.secondary):
+                    continue
+                iface.fhrp.remove(g)
+                iface.virtual_ipv4 = own
+                iface.ipv4 = [a for a in iface.ipv4 if a not in own]
+                if g.mac:
+                    d.anycast_mac = d.anycast_mac or g.mac
+            gateways = self._gateways6.get(iface.name, [])
+            own6 = [a for a in iface.ipv6 if str(ipaddress.ip_interface(a).ip) in gateways]
+            if own6:
+                iface.virtual_ipv6 = own6
+                iface.ipv6 = [a for a in iface.ipv6 if a not in own6]
+            for address in gateways:
+                if not any(str(ipaddress.ip_interface(a).ip) == address for a in own6):
+                    d.unparsed.append(Unparsed(iface.origin.line, f"active-gateway ipv6 {address}",
+                                               "an IPv6 active gateway the interface does not hold"))
+            for word in self._icmp_off:
+                if iface.ipv4 or iface.virtual_ipv4:
+                    setattr(iface, "ip_redirects" if word == "redirect" else "ip_unreachables", False)
+
     def _finish(self) -> None:
+        self._anycast()
         qos_text.adopt(self.device, self._class_acls)
         if self.device.vxlan is not None and self._vxlan_source:
             self.device.vxlan.source_interface = vxlan_text.interface_of(self.device, self._vxlan_source)

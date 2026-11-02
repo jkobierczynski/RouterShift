@@ -79,6 +79,7 @@ class Writer:
         self.ospf_areas: Dict[str, List[Tuple[str, str]]] = {}  # interface -> [(process, area)]
         for p in self.device.ospf:
             self.ospf(p)
+        self._icmp_globals()
         # a LAG exists before the ports that join it
         order = {InterfaceKind.MANAGEMENT: 0, InterfaceKind.LAG: 1}
         for iface in sorted(self.device.interfaces.values(), key=lambda i: order.get(i.kind, 2)):
@@ -97,6 +98,13 @@ class Writer:
             self.bgp()
         self.report.unparsed(self.device.unparsed)
         return "\n".join(self.out) + "\n"
+
+    def _icmp_globals(self) -> None:
+        """AOS-CX switches ICMP redirects and unreachables for the whole switch: off when a routed interface turns
+        them off."""
+        for attr, word in (("ip_redirects", "redirect"), ("ip_unreachables", "unreachable")):
+            if any(getattr(i, attr) is False for i in self.device.interfaces.values()):
+                self.out.append(f"no ip icmp {word}")
 
     def _plan_vrfs(self) -> None:
         for iface in self.device.interfaces.values():
@@ -338,6 +346,12 @@ class Writer:
             self.out += ["aaa authentication port-access dot1x authenticator"] + group_lines + [f"{_IND}enable"]
         if any(i.mab for i in self.device.interfaces.values()):
             self.out += ["aaa authentication port-access mac-auth"] + group_lines + [f"{_IND}enable"]
+        if a.coa:
+            rep.item("management", "RADIUS change of authorization")
+            self.out.append("radius dyn-authorization enable")
+            rep.add("management", "RADIUS change of authorization", Severity.REVIEW, "coa-clients",
+                    "add the RADIUS servers that may send changes as 'radius dyn-authorization client ADDRESS "
+                    "secret-key plaintext KEY'")
 
     def _port_access_interface(self, iface: Interface, add: Callable[[Severity, str, str], None]) -> List[str]:
         if not (iface.dot1x or iface.mab):
@@ -360,6 +374,8 @@ class Writer:
             lines.append(f"{_IND}enable")
         if iface.mab:
             lines += [f"{prefix} mac-auth", f"{_IND}enable"]
+        if iface.dot1x_fail_vlan is not None:
+            lines.append(f"{prefix} reject-vlan {iface.dot1x_fail_vlan}")
         return lines
 
     _SNMP_AUTH = ["md5", "sha"]
@@ -572,6 +588,8 @@ class Writer:
         if self.device.dhcp_snooping or snooped:
             self.out.append("dhcpv4-snooping")
             self.report.item("vlan", "DHCP snooping")
+            if self.device.dhcp_option82 is not None:
+                self.out.append(("" if self.device.dhcp_option82 else "no ") + "dhcpv4-snooping option 82")
         if l2sec_text.inspection_vlans(self.device):
             self.report.item("vlan", "ARP inspection")
         for vlan in sorted(self.device.vlans.values(), key=lambda v: v.vlan_id):
@@ -966,12 +984,32 @@ class Writer:
             lines.append(f"vlan trunk allowed {iface.allowed_vlans or 'all'}")
         return lines
 
+    def _anycast(self, iface: Interface, add: _Add) -> List[str]:
+        """The anycast gateway (EOS ip address virtual) as the active gateway, with the shared MAC."""
+        lines: List[str] = []
+        mac = self.device.anycast_mac
+        for family, virtual in (("ip", iface.virtual_ipv4), ("ipv6", iface.virtual_ipv6)):
+            if not virtual:
+                continue
+            if mac:
+                lines.append(f"active-gateway {family} mac {mac}")
+            else:
+                add(Severity.REVIEW, "anycast-mac",
+                    f"the source names no shared MAC; add 'active-gateway {family} mac' with the fabric's MAC")
+            lines += [f"active-gateway {family} {ipaddress.ip_interface(v).ip}" for v in virtual]
+        if iface.virtual_ipv4 or iface.virtual_ipv6:
+            add(Severity.APPROX, "anycast",
+                "the anycast gateway is the AOS-CX active gateway; where the source had no address of its own the "
+                "interface takes the gateway address too, as in the AOS-CX EVPN design")
+        return lines
+
     def _addresses(self, iface: Interface, add: _Add) -> List[str]:
         lines: List[str] = []
         mgmt = iface.kind == InterfaceKind.MANAGEMENT
         if iface.dhcp_client:
             lines.append("ip dhcp")
-        for n, cidr in enumerate(iface.ipv4):
+        own = iface.ipv4 or iface.virtual_ipv4
+        for n, cidr in enumerate(own if not mgmt else iface.ipv4):
             if mgmt:
                 if n == 0:
                     lines.append(f"ip static {cidr}")
@@ -979,10 +1017,32 @@ class Writer:
                     add(Severity.REVIEW, "mgmt-secondary", f"the management port takes one address; {cidr} left out")
             else:
                 lines.append(f"ip address {cidr}" + (" secondary" if n else ""))
-        for cidr in iface.ipv6:
+        for cidr in iface.ipv6 or iface.virtual_ipv6:
             lines.append(f"ipv6 address {cidr}")
+        if iface.proxy_arp:
+            lines.append("ip proxy-arp")
+        if iface.urpf:
+            add(Severity.APPROX, "urpf", f"AOS-CX has no unicast RPF check on an interface ({iface.urpf}); left out")
+        for attr, word in (("ip_redirects", "redirects"), ("ip_unreachables", "unreachables")):
+            if getattr(iface, attr) is False:
+                add(Severity.APPROX, "icmp", f"ICMP {word} are switched off for the whole switch: AOS-CX has no "
+                                             "per-interface setting")
+        if iface.mac_address:
+            add(Severity.APPROX, "svi-mac", f"AOS-CX routes with the switch's own MAC; {iface.mac_address} is left "
+                                            "out (the active gateway MAC is the shared one)")
+        if iface.autostate is False:
+            add(Severity.APPROX, "autostate", "AOS-CX has no autostate switch: a VLAN interface follows its VLAN")
+        if iface.unnumbered:
+            add(Severity.REVIEW, "unnumbered", f"AOS-CX takes no unnumbered address (from {iface.unnumbered}); give "
+                                               "the interface an address of its own")
         for helper in iface.helper_addresses:
-            lines.append(f"ip helper-address {helper}")
+            lines.append(f"ip helper-address {helper}" + (f" vrf {self.vrf(iface.helper_vrf)}"
+                                                          if iface.helper_vrf else ""))
+        if iface.helper_addresses and iface.helper_source:
+            add(Severity.REVIEW, "relay-source",
+                f"AOS-CX relays from the address of the interface the request came in on; the source interface "
+                f"{iface.helper_source} is left out")
+        lines += self._anycast(iface, add)
         if mgmt:
             for route in self.mgmt_gateways:
                 if (":" in route.prefix) == (":" in route.next_hop):

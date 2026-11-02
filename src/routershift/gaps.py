@@ -38,6 +38,8 @@ WRITES: Dict[str, Set[str]] = {
               "roles", "ssh-keys", "snmp-views", "apis", "password-length", "syslog-transport", "trap-types",
               "console-login", "ptp", "event-handlers", "ospf-auth", "route-tag", "ospf-options", "bfd-global",
               "ecmp-hash"},
+    "aoscx": {"anycast-gateway", "relay-vrf", "hardening", "svi-mac", "autostate", "unnumbered", "dot1x-fail-vlan",
+              "option82", "coa"},
 }
 
 Option = Tuple[str, str, object]  # (key, what the report calls it, whether the device has it)

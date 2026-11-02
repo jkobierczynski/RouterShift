@@ -310,6 +310,8 @@ def test_other_targets_report_what_they_leave_out(target: str) -> None:
     if target == "junos":
         assert "community CL-BLACKHOLE {" in out and "virtual-gateway-v4-mac" not in out
         assert "mac 00:1c:73:00:dc:01;" in out  # the anycast gateway: one address and MAC on every leaf
+    elif target == "aoscx":
+        assert "    active-gateway ip 10.1.100.1\n" in out and "    ip address 10.1.100.1/24\n" in out
     else:
         assert "anycast gateway 10.1.100.1/24" in text
         assert "community-list CL-BLACKHOLE: skipped" in text
