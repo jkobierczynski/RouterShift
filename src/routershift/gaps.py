@@ -198,6 +198,10 @@ def later_features(device: Device, report: Report, port: Callable[[str], str]) -
                       Severity.REVIEW))
     if m_.password_min_length is not None:
         found.append(("management", "password length", "the minimum password length:", Severity.APPROX))
+    if device.ptp is not None:
+        found.append(("system", "PTP", "PTP:", Severity.REVIEW))
+    for name in device.event_handlers:
+        found.append(("system", f"event handler {name}", "event handlers and EEM applets:", Severity.REVIEW))
     # (new device-level settings go above this line)
     for iface in device.interfaces.values():
         label = _interface_item(report, iface, port)
@@ -211,6 +215,7 @@ def later_features(device: Device, report: Report, port: Callable[[str], str]) -
                                   ("the 802.1X fail VLAN", iface.dot1x_fail_vlan),
                                   ("the MAC access groups", iface.mac_acl_in or iface.mac_acl_out),
                                   ("the MACsec profile", iface.macsec_profile),
+                                  ("PTP", iface.ptp is not None or iface.ptp_announce_interval is not None),
                                   ("the StackWise Virtual link", iface.svl_link is not None or iface.svl_dad)) if v]
         if options:
             found.append(("interface", label, ", ".join(options) + ":", Severity.REVIEW))

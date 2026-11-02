@@ -303,6 +303,12 @@ class Interface:
     mac_acl_in: str = ""  # MacAcl names
     mac_acl_out: str = ""
     macsec_profile: str = ""  # MacsecProfile name
+    ptp: Optional[bool] = None  # PTP runs on the port (None: not stated)
+    ptp_announce_interval: Optional[int] = None  # log2 seconds
+    ptp_sync_interval: Optional[int] = None  # log2 seconds
+    ptp_delay_req_interval: Optional[int] = None  # log2 seconds
+    ptp_delay_mechanism: str = ""  # "e2e" or "p2p"
+    ptp_transport: str = ""  # "ipv4", "ipv6" or "layer2"
     origin: Origin = field(default_factory=Origin)
 
 
@@ -1096,6 +1102,44 @@ class Track:
 
 
 @dataclass
+class Ptp:
+    """Precision Time Protocol: the clock's role and dataset."""
+
+    mode: str = ""  # boundary, e2etransparent, p2ptransparent, gptp, disabled
+    domain: Optional[int] = None
+    priority1: Optional[int] = None
+    priority2: Optional[int] = None
+    clock_identity: str = ""
+    source_ip: str = ""  # EOS: the source address of PTP messages
+    dscp_general: Optional[int] = None
+    dscp_event: Optional[int] = None
+    origin: Origin = field(default_factory=Origin)
+
+
+@dataclass
+class EventAction:
+    kind: str  # "syslog" (a message at a severity), "cli" (a CLI command), "script" (a shell command line)
+    text: str
+    level: Optional[int] = None  # syslog: severity 0-7
+
+
+@dataclass
+class EventHandler:
+    """Run actions when something happens: an EOS event handler, an IOS EEM applet."""
+
+    name: str
+    trigger: str  # startup-config, boot, interface, cpu, logging, track, timer, other
+    interface: str = ""  # interface: the canonical port whose state changes
+    pattern: str = ""  # logging: the regular expression a syslog message matches; cpu: the comparison ("> 85")
+    poll_interval: Optional[int] = None  # cpu: seconds between checks
+    track: str = ""  # track: the tracked object, and its state in pattern ("up" / "down")
+    delay: Optional[int] = None  # seconds between the trigger and the actions
+    actions: List[EventAction] = field(default_factory=list)
+    description: str = ""
+    origin: Origin = field(default_factory=Origin)
+
+
+@dataclass
 class Unparsed:
     """A line or block of the source no parser section claimed."""
 
@@ -1174,6 +1218,8 @@ class Device:
     snmp: Snmp = field(default_factory=Snmp)
     users: List[LocalUser] = field(default_factory=list)
     roles: Dict[str, Role] = field(default_factory=dict)
+    ptp: Optional[Ptp] = None
+    event_handlers: Dict[str, EventHandler] = field(default_factory=dict)
     aaa: Aaa = field(default_factory=Aaa)
     unparsed: List[Unparsed] = field(default_factory=list)
 

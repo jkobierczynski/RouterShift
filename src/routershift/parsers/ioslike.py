@@ -39,6 +39,7 @@ from .. import dhcp as dhcp_text
 from .. import vpn as vpn_text
 from .. import aaa as aaa_text
 from .. import access as access_text
+from .. import automation as automation_text
 from ..confparse import Node
 from ..errors import ParseError
 from ..model import (Role, IpSla, Netflow, Sflow, AaaGroup, AaaMethod, AaaServer, Acl, Device, LocalUser, DhcpPool, FhrpGroup, IkePolicy, IpsecPeer, IpsecTransform, NtpKey, PreSharedKey,
@@ -150,6 +151,7 @@ class _Reader:
         self._wlan_tags: Dict[str, str] = {}  # WLAN -> policy profile, from the policy tags
         self._flow_exporters: Dict[str, Netflow] = {}  # IOS flow exporter -> its collector, version and source
         self._flow_monitors: Dict[str, Tuple[List[str], str]] = {}  # IOS flow monitor -> exporters, record
+        self._ptp_mechanism = ""  # IOS: ptp mode boundary delay-req (e2e) | pdelay-req (p2p)
         self._samplers: Dict[str, int] = {}  # IOS sampler -> one packet in N
         self._port_samplers: List[str] = []  # IOS: the samplers the ports' flow monitors use
         self._sflow_run = False  # EOS: sflow run
@@ -231,6 +233,9 @@ class _Reader:
             "dhcp": self.eos_dhcp,
             "service": self.service,
             "role": self.eos_role,
+            "ptp": self.ptp,
+            "event-handler": self.eos_event_handler,
+            "event": self.eem_applet,
             "parser": self.parser_view,
             "netconf-yang": self.ios_api,
             "restconf": self.ios_api,
@@ -473,6 +478,63 @@ class _Reader:
                 self.device.system.logging_timestamp = "msec"
             return set(w[4:]) <= {"msec", "localtime", "show-timezone", "year"}
         return False
+
+    def ptp(self, node: Node) -> bool:
+        """ptp mode, domain, priority1/2 (both); EOS clock-identity, source ip, message-type dscp."""
+        if node.children or len(node.words) < 3:
+            return False
+        mechanism = automation_text.global_line(self.device, node.words, self.device.platform == "eos")
+        if mechanism is None:
+            return False
+        self._ptp_mechanism = mechanism or self._ptp_mechanism
+        return True
+
+    def eos_event_handler(self, node: Node) -> bool:
+        """EOS event-handler NAME / trigger, action bash (one line or a block ending in EOF), delay."""
+        w = node.words
+        if len(w) != 2 or self.device.platform != "eos":
+            return False
+        h = automation_text.handler(self.device, w[1])
+        h.origin = Origin(node.line, node.text)
+        for child in node.children:
+            c = child.words
+            if c[0] == "trigger" and automation_text.eos_trigger(
+                    h, c, [g.words for g in child.children], lambda name: names.canonical(name)[0]):
+                continue
+            if c[:2] == ["action", "bash"] and len(c) > 2 and not child.children:
+                h.actions.append(automation_text.eos_action(child.text.strip().split(None, 2)[2]))
+            elif c == ["action", "bash"] and child.children:
+                h.actions += [automation_text.eos_action(g.text.strip()) for g in child.children
+                              if g.words != ["EOF"]]
+            elif c[0] == "delay" and len(c) == 2 and c[1].isdigit():
+                h.delay = int(c[1])
+            else:
+                self.unparsed(child, node.text)
+        if not h.trigger:
+            h.trigger = "other"
+        return True
+
+    def eem_applet(self, node: Node) -> bool:
+        """IOS event manager applet NAME / description, event, action (environment variables are not converted)."""
+        w = node.words
+        if w[1:3] != ["manager", "applet"] or len(w) < 4 or w[4:] not in ([], ["authorization", "bypass"]):
+            return False
+        h = automation_text.handler(self.device, w[3])
+        h.origin = Origin(node.line, node.text)
+        for child in node.children:
+            c = automation_text.split(child.text.strip())
+            if c[0] == "description":
+                h.description = child.text.strip().split(None, 1)[1] if len(c) > 1 else ""
+            elif c[0] == "event" and not h.trigger and automation_text.ios_event(
+                    h, c, lambda name: names.canonical(name)[0]):
+                pass
+            elif c[0] == "action" and len(c) >= 3 and automation_text.ios_action(h, c):
+                pass
+            else:
+                self.unparsed(child, node.text)
+        if not h.trigger:
+            h.trigger = "other"
+        return True
 
     def eos_role(self, node: Node) -> bool:
         """EOS role NAME / [SEQ] permit|deny [mode M] command REGEX."""
@@ -3758,6 +3820,8 @@ class _Reader:
         elif w[:2] == ["ip", "flow"] and n == 3 and w[2] in ("ingress", "egress"):
             way = "input" if w[2] == "ingress" else "output"
             iface.flow = way if iface.flow in ("", way) else "both"
+        elif w[0] == "ptp" or w[:2] == ["no", "ptp"]:
+            return automation_text.port_line(iface, w)
         elif w == ["no", "sflow", "enable"] and self.device.platform == "eos":
             self._sflow_off.append(iface.name)
         elif w == ["sflow", "enable"] and self.device.platform == "eos":
@@ -3908,6 +3972,10 @@ class _Reader:
         self._finish_copp()
         self._finish_qos()
         self._finish_macsec()
+        if self._ptp_mechanism:
+            for port_ in self.device.interfaces.values():
+                if port_.ptp and not port_.ptp_delay_mechanism:
+                    port_.ptp_delay_mechanism = self._ptp_mechanism
         for port, chain in self._ospf_chains.items():
             iface = self.device.interfaces.get(port)
             if iface is not None and chain in self._key_chains:

@@ -23,6 +23,7 @@ from .. import snmp as snmp_text
 from .. import stp as stp_text
 from .. import aaa as aaa_text
 from .. import access as access_text
+from .. import automation as automation_text
 from .. import vpn as vpn_text
 from .. import vrfs as vrfs_text
 from .. import multicast as multicast_text
@@ -116,6 +117,9 @@ class Writer:
         self.out[mark:mark] = self.key_chains
         self.mirrors()
         self.twamp()
+        self.out += automation_text.ptp_lines(self.device, self.report, self.ios)
+        self.out += automation_text.ios_lines(self.device, self.report, self.port) if self.ios else \
+            automation_text.eos_lines(self.device, self.report, self.ind, self.port)
         self.vxlan()
         self.policies()
         self.routing()
@@ -320,6 +324,7 @@ class Writer:
         lines += self._isis_interface(iface)
         lines += self._multicast_interface(iface, add)
         lines += self._flow_interface(iface)
+        lines += automation_text.ptp_port_lines(iface, self.ios)
         lines += self._poe(iface, add)
         lines += bfd_text.joined_line(iface, "ios" if self.ios else "eos", self.report, label)
         if iface.pbr and not (self.device.route_maps.get(iface.pbr) and self.device.route_maps[iface.pbr].entries):
