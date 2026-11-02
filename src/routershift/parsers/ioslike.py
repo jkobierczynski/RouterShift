@@ -4059,6 +4059,8 @@ class _Reader:
             iface.virtual_ipv4.append(str(ipaddress.IPv4Interface(w[3])))
         elif w[:3] == ["ipv6", "address", "virtual"] and n == 4:
             iface.virtual_ipv6.append(str(ipaddress.IPv6Interface(w[3])))
+        elif w[:3] == ["ip", "address", "unnumbered"] and n == 4:  # EOS
+            iface.unnumbered = names.canonical(w[3])[0]
         elif w[:2] == ["ip", "address"] and n >= 3:
             return self._ip_address(iface, w[2:])
         elif w[:2] == ["ipv6", "address"] and n >= 3:
