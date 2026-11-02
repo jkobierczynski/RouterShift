@@ -34,7 +34,7 @@ from .. import igp as igp_text
 from .. import bfd as bfd_text
 from .. import routemap as routemap_text
 from .. import wlan as wlan_text
-from ..model import (AaaMethod, AaaServer, LocalUser, AclAction, Bgp, BgpAggregate, BgpNeighbor, BgpVrf, Device, DhcpPool, IkePolicy, IpsecPeer, NatRule, SnmpGroup, FhrpGroup, Interface, InterfaceKind, LacpMode, Ospf,
+from ..model import (Mlag, AaaMethod, AaaServer, LocalUser, AclAction, Bgp, BgpAggregate, BgpNeighbor, BgpVrf, Device, DhcpPool, IkePolicy, IpsecPeer, NatRule, SnmpGroup, FhrpGroup, Interface, InterfaceKind, LacpMode, Ospf,
                      StaticRoute, StpMode, SwitchportMode)
 from ..names import PortMapper
 from ..report import Report, Severity
@@ -84,6 +84,7 @@ class Writer:
             for name in nat_text.outside(self.device, rule):
                 self.nat_outside.setdefault(name, []).append(rule)
         self.key_chains: List[str] = []  # IOS: key chains the interfaces' OSPF authentication uses
+        self.svl_lags = vrfs_text.svl_lags(self.device) if not self.ios else {}
         # IOS: the VLAN that carries each layer 3 VNI; EOS: the VLANs and SVIs an IOS source used for them, left out
         self.l3vni_vlans: Dict[str, int] = evpn_text.ios_l3vni_vlans(self.device, self.report) if self.ios else {}
         self.skip_vlans = set(self.device.vxlan.vrf_vlans.values()) if self.device.vxlan and not self.ios else set()
@@ -210,6 +211,13 @@ class Writer:
                     self.out += [f"  route-target {d} {v}{stitching}" for d, v in vrfs_text.targets(info)]
                     if info.export_map:
                         self.out.append(f"  export map {info.export_map}")
+                    for source, rm in info.leaks.items():
+                        self.out.append(f"  route-replicate from vrf {self.vrf(source)} unicast all" +
+                                        (f" route-map {rm}" if rm else ""))
+                        self.report.add("system", f"vrf {name}", Severity.APPROX, "vrf-leak",
+                                        f"routes of VRF {source} leaked into it with route-replicate" +
+                                        (f" through route map {rm}" if rm else "") + "; check the platform supports "
+                                        "it, otherwise import the route target of " + source + " with an import map")
                     if info.rt_evpn and (info.rt_import or info.rt_export):
                         self.report.add("system", f"vrf {name}", Severity.APPROX, "vrf-evpn-rt",
                                         "EVPN route targets written with 'stitching', as IOS XE EVPN takes them; "
@@ -250,8 +258,14 @@ class Writer:
                 self.out.append(f"{self.ind}name {vlan.name}")
             if vlan.shutdown:
                 self.out.append(f"{self.ind}state suspend")
-            self.out.append("!")
             self.report.item("vlan", str(vlan.vlan_id))
+            if vlan.trunk_groups and self.ios:
+                self.report.add("vlan", str(vlan.vlan_id), Severity.APPROX, "trunk-group",
+                                f"trunk group {', '.join(vlan.trunk_groups)} left out: IOS has no trunk groups, so the "
+                                "VLAN rides every trunk that allows it; limit it with 'switchport trunk allowed vlan'")
+            elif vlan.trunk_groups:
+                self.out += [f"{self.ind}trunk group {g}" for g in vlan.trunk_groups]
+            self.out.append("!")
 
     # interfaces ------------------------------------------------------------------------------------------------------
 
@@ -269,9 +283,16 @@ class Writer:
         is_l2_capable = iface.kind in (InterfaceKind.ETHERNET, InterfaceKind.LAG)
         if is_l2_capable:
             lines += self._switchport(iface, add)
-        if iface.lag:
+        if iface.lag and self.ios and self.device.mlag and not self.device.mlag.stack and \
+                iface.lag == self.device.mlag.peer_link:
+            lines.append("stackwise-virtual link 1")  # the MLAG peer link becomes the StackWise Virtual link
+        elif iface.lag:
             word = {LacpMode.ACTIVE: "active", LacpMode.PASSIVE: "passive"}.get(iface.lacp_mode or LacpMode.STATIC, "on")
             lines.append(f"channel-group {iface.lag[len('Port-channel'):]} mode {word}")
+        if iface.svl_link is not None and self.ios:
+            lines.append(f"stackwise-virtual link {iface.svl_link}")
+        if iface.svl_dad and self.ios:
+            lines.append("stackwise-virtual dual-active-detection")
         if iface.kind == InterfaceKind.SUBINTERFACE and iface.encapsulation_vlan is not None:
             vid = iface.encapsulation_vlan
             lines.append(f"encapsulation dot1Q {vid}" if self.ios else f"encapsulation dot1q vlan {vid}")
@@ -315,6 +336,15 @@ class Writer:
         lines += self._l2sec_interface(iface, add, label)
         if iface.mlag_id is not None and not self.ios:
             lines.append(f"mlag {iface.mlag_id}")
+        elif not self.ios and iface.name in self.svl_lags:
+            lines.append(f"mlag {self.svl_lags[iface.name]}")
+            add(Severity.APPROX, "mlag-from-svl", "its members are on both switches of the StackWise Virtual pair: "
+                                                  f"written as MLAG {self.svl_lags[iface.name]}")
+        if iface.trunk_groups and not self.ios:
+            lines += [f"switchport trunk group {g}" for g in iface.trunk_groups]
+        elif iface.trunk_groups:
+            add(Severity.APPROX, "trunk-group", f"trunk group {', '.join(iface.trunk_groups)} left out: IOS has no "
+                                                "trunk groups; the port carries the VLANs it allows")
         lines += self._evpn_interface(iface, add)
         if iface.cdp is not None and self.ios:
             lines.append("cdp enable" if iface.cdp else "no cdp enable")
@@ -1055,6 +1085,33 @@ class Writer:
         self.isis()
         if self.device.bgp is not None:
             self.bgp(self.device.bgp)
+        self._router_general()
+
+    def _router_general(self) -> None:
+        """EOS router general: the global router ID and routes leaked between VRFs without route targets. IOS XE
+        leaks them with route-replicate in the VRF (see vrfs)."""
+        d = self.device
+        rid = d.system.router_id
+        if rid and self.ios:
+            set_ids = {p.router_id for p in d.ospf} | ({d.bgp.router_id} if d.bgp else set())
+            if set_ids - {rid} or not set_ids:
+                self.report.add("system", "router ID", Severity.REVIEW, "router-id",
+                                f"IOS has no global router ID ({rid}); set it in each routing protocol")
+            else:
+                self.report.item("system", "router ID")
+        leaks = {name: info.leaks for name, info in d.vrf_info.items() if info.leaks}
+        if self.ios or not (rid or leaks):
+            return
+        lines = ["router general"]
+        if rid:
+            self.report.item("system", "router ID")
+            lines.append(f"{self.ind}router-id ipv4 {rid}")
+        for name, sources in leaks.items():
+            lines.append(f"{self.ind}vrf {self.vrf(name)}")
+            for source, rm in sources.items():
+                lines.append(f"{self.ind * 2}leak routes source-vrf {self.vrf(source)}" +
+                             (f" subscribe-policy {rm}" if rm else ""))
+        self.out += lines + ["!"]
 
     def rip(self) -> None:
         rip = self.device.rip
@@ -1923,18 +1980,30 @@ class Writer:
                 "the WLANs are mapped in policy tag RS-POLICY-TAG; assign it to the access points")
 
     def mlag(self) -> None:
-        """EOS: mlag configuration; IOS has no multi-chassis LAG (reported)."""
+        """EOS: mlag configuration. IOS has no multi-chassis LAG: the nearest is StackWise Virtual, which makes one
+        switch of the two (and NX-OS has vPC)."""
         d = self.device
-        if self.ios:
-            vrfs_text.mlag_unsupported(d, self.report, "IOS", "IOS has no multi-chassis LAG (StackWise Virtual makes "
-                                                              "one switch of two instead)")
-            return
         m = d.mlag
-        if m is None:
-            return
         rep = self.report
         label = "multi-chassis LAG"
+        if m is None:
+            if self.ios:
+                vrfs_text.mlag_unsupported(d, rep, "IOS", "IOS has no multi-chassis LAG (StackWise Virtual makes "
+                                                          "one switch of two instead)")
+            return
         rep.item("interface", label)
+        if self.ios:
+            self._ios_stackwise(m, label)
+            return
+        if m.stack:
+            links = [self.port(i.name) for i in d.interfaces.values() if i.svl_link is not None]
+            rep.add("interface", label, Severity.REVIEW, "mlag-from-svl",
+                    "StackWise Virtual makes one switch of two; EOS pairs two switches with MLAG instead. "
+                    f"Written: domain-id {m.domain or '1'}. Still to do on both switches: a peer-link port-channel of "
+                    f"the StackWise Virtual links ({', '.join(links) or 'none'}), an SVI on it for local-interface and "
+                    "peer-address, and the port numbers of the second switch (they become a switch of their own)")
+            self.out += ["mlag configuration", f"{self.ind}domain-id SVL{m.domain or '1'}", "!"]
+            return
         lines = [f"domain-id {m.domain or 'MLAG'}"]
         if not m.domain:
             rep.add("interface", label, Severity.REVIEW, "mlag-domain",
@@ -1943,8 +2012,18 @@ class Writer:
             lines.append(f"local-interface {self.port(m.local_interface)}")
         if m.peer_address:
             lines.append(f"peer-address {m.peer_address}")
+        if m.heartbeat:
+            lines.append(f"peer-address heartbeat {m.heartbeat}" + (f" vrf {self.vrf(m.heartbeat_vrf)}"
+                                                                    if m.heartbeat_vrf else ""))
         if m.peer_link:
             lines.append(f"peer-link {self.port(m.peer_link)}")
+        if m.dual_primary_delay is not None:
+            lines.append(f"dual-primary detection delay {m.dual_primary_delay}" +
+                         (f" action {m.dual_primary_action}" if m.dual_primary_action else ""))
+        if m.reload_delay is not None:
+            lines.append(f"reload-delay mlag {m.reload_delay}")
+        if m.reload_delay_non_mlag is not None:
+            lines.append(f"reload-delay non-mlag {m.reload_delay_non_mlag}")
         if d.platform == "aoscx":
             rep.add("interface", label, Severity.REVIEW, "mlag-keepalive",
                     "VSX keepalive peer and source are written as MLAG peer-address and local-interface: EOS expects "
@@ -1952,6 +2031,31 @@ class Writer:
         if m.role:
             rep.add("interface", label, Severity.APPROX, "mlag-role", f"EOS elects the primary itself (was {m.role})")
         self.out += ["mlag configuration"] + [self.ind + line for line in lines] + ["!"]
+
+    def _ios_stackwise(self, m: Mlag, label: str) -> None:
+        """IOS: stackwise-virtual with a domain; the MLAG peer link's ports become the StackWise Virtual link."""
+        rep = self.report
+        domain = m.domain if m.domain.isdigit() and 1 <= int(m.domain) <= 255 else "1"
+        self.out += ["stackwise-virtual", f" domain {domain}", "!"]
+        if m.stack:
+            return
+        members = ", ".join(vrfs_text.mlag_members(self.device)) or "none"
+        dropped = [w for w, v in (("the peer address and local interface (" + (m.peer_address or "-") + ", " +
+                                   (m.local_interface or "-") + ")", m.peer_address or m.local_interface),
+                                  ("the heartbeat " + m.heartbeat, m.heartbeat),
+                                  ("dual-primary detection (StackWise Virtual detects a dual-active pair on a "
+                                   "dedicated link: stackwise-virtual dual-active-detection)", m.dual_primary_delay),
+                                  ("the reload delays", m.reload_delay or m.reload_delay_non_mlag)) if v]
+        rep.add("interface", label, Severity.REVIEW, "mlag-to-svl",
+                "IOS has no multi-chassis LAG; written as StackWise Virtual, the nearest Catalyst feature, which "
+                f"makes one switch of the pair (domain {domain}"
+                + (f", was {m.domain}" if domain != m.domain else "") + "). The peer link "
+                f"{m.peer_link or '-'} becomes the StackWise Virtual link (its ports take 'stackwise-virtual link 1' "
+                "instead of the channel-group; the port-channel stays, without members), "
+                f"and the shared LAGs ({members}) become ordinary port-channels with members on both switches. "
+                "Both switches need a reload, and the second one's ports are numbered 2/x/y. "
+                + ("Left out: " + "; ".join(dropped) + ". " if dropped else "")
+                + "On NX-OS the same pair would be a vPC domain")
 
     def l2sec(self) -> None:
         """DHCP snooping and ARP inspection per VLAN (EOS snooping only adds option 82 and has no trusted ports)."""

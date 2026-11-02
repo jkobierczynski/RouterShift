@@ -288,6 +288,8 @@ def test_converts_and_reads_back(source: str, target: str) -> None:
         assert len(vrfs_text.mlag_members(back)) == len(vrfs_text.mlag_members(first))
         if back.mlag.peer_address:
             assert back.mlag.peer_address == first.mlag.peer_address
+    elif first.mlag is not None and target == "ios":  # StackWise Virtual, the nearest it has
+        assert back.mlag is not None and back.mlag.stack and "StackWise Virtual" in report.to_text()
     elif first.mlag is not None:
         assert back.mlag is None and "multi-chassis LAG" in report.to_text()
     # prefix lists and route maps keep every entry (AOS-CX route maps match no ACL), and BGP neighbors and

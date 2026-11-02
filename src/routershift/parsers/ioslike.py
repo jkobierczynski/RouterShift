@@ -237,6 +237,7 @@ class _Reader:
             "no": self.no_global,
             "management": self.management,
             "mlag": self.mlag,
+            "stackwise-virtual": self.stackwise,
             "route-map": self.route_map,
             "monitor": self.monitor_session,
             "sflow": self.sflow,
@@ -1673,6 +1674,8 @@ class _Reader:
             return self._eos_multicast(node)
         if w[1:] == ["pim", "sparse-mode"] and self.device.platform == "eos":
             return self._eos_pim(node)
+        if w[1:] == ["general"] and self.device.platform == "eos":
+            return self._router_general(node)
         if w[1:] == ["rip"] and self.device.rip is None:
             rip = self.device.rip = Rip(origin=Origin(node.line, node.text))
             return self._igp_children(node, lambda c: igp_text.ios_rip_line(rip, c))
@@ -1692,6 +1695,24 @@ class _Reader:
                         self.device.multicast_routing = True
                     else:
                         self.unparsed(line, f"{node.text} / {child.text}")
+            else:
+                self.unparsed(child, node.text)
+        return True
+
+    def _router_general(self, node: Node) -> bool:
+        """EOS: router general with router-id ipv4 X and vrf V / leak routes source-vrf S [subscribe-policy RM]."""
+        for child in node.children:
+            c = child.words
+            if c[:2] == ["router-id", "ipv4"] and len(c) == 3:
+                self.device.system.router_id = str(ipaddress.IPv4Address(c[2]))
+            elif c[0] == "vrf" and len(c) == 2:
+                for grand in child.children:
+                    g = grand.words
+                    if g[:3] == ["leak", "routes", "source-vrf"] and len(g) in (4, 6) and \
+                            (len(g) == 4 or g[4] == "subscribe-policy"):
+                        vrfs_text.info(self.device, c[1]).leaks[g[3]] = g[5] if len(g) == 6 else ""
+                    else:
+                        self.unparsed(grand, f"{node.text} / {child.text}")
             else:
                 self.unparsed(child, node.text)
         return True
@@ -2319,6 +2340,11 @@ class _Reader:
                     if gw[:2] == ["export", "map"] and len(gw) == 3:
                         info.export_map = gw[2]
                         continue
+                    # IOS XE: route-replicate from vrf S unicast all [route-map RM] (routes leaked without targets)
+                    if gw[:3] == ["route-replicate", "from", "vrf"] and len(gw) in (6, 8) and \
+                            gw[4:6] == ["unicast", "all"] and (len(gw) == 6 or gw[6] == "route-map"):
+                        info.leaks[gw[3]] = gw[7] if len(gw) == 8 else ""
+                        continue
                     self.unparsed(g, child.text)
             elif c[0] in ("description", "exit-address-family") or c[0] == "address-family" and not child.children:
                 pass
@@ -2447,10 +2473,35 @@ class _Reader:
         m = self.device.mlag = Mlag()
         for child in node.children:
             c = child.words
-            if len(c) == 2 and c[0] in ("domain-id", "peer-address"):
+            n = len(c)
+            if n == 2 and c[0] in ("domain-id", "peer-address"):
                 setattr(m, "domain" if c[0] == "domain-id" else "peer_address", c[1])
-            elif len(c) == 2 and c[0] in ("local-interface", "peer-link"):
+            elif n == 2 and c[0] in ("local-interface", "peer-link"):
                 setattr(m, c[0].replace("-", "_"), names.canonical(c[1])[0])
+            elif c[:2] == ["peer-address", "heartbeat"] and n in (3, 5) and (n == 3 or c[3] == "vrf"):
+                m.heartbeat = str(ipaddress.ip_address(c[2]))
+                m.heartbeat_vrf = c[4] if n == 5 else ""
+            elif c[:3] == ["dual-primary", "detection", "delay"] and n in (4, 7) and \
+                    (n == 4 or c[4:] == ["action", "errdisable", "all-interfaces"]):
+                m.dual_primary_delay = int(c[3])
+                m.dual_primary_action = "errdisable all-interfaces" if n == 7 else ""
+            elif c[0] == "reload-delay" and n == 3 and c[1] in ("mlag", "non-mlag"):
+                setattr(m, "reload_delay" if c[1] == "mlag" else "reload_delay_non_mlag", int(c[2]))
+            elif c[0] == "reload-delay" and n == 2:
+                m.reload_delay = int(c[1])
+            else:
+                self.unparsed(child, node.text)
+        return True
+
+    def stackwise(self, node: Node) -> bool:
+        """IOS: stackwise-virtual / domain N (StackWise Virtual: two switches that act as one)."""
+        if node.words != ["stackwise-virtual"]:
+            return False
+        m = self.device.mlag = self.device.mlag or Mlag()
+        m.stack = True
+        for child in node.children:
+            if child.words[0] == "domain" and len(child.words) == 2 and child.words[1].isdigit():
+                m.domain = child.words[1]
             else:
                 self.unparsed(child, node.text)
         return True
@@ -2580,6 +2631,8 @@ class _Reader:
                     vlan.name = " ".join(child.words[1:])
                 elif child.text in ("shutdown", "state suspend"):
                     vlan.shutdown = True
+                elif child.words[:2] == ["trunk", "group"] and len(child.words) == 3:
+                    vlan.trunk_groups.append(child.words[2])
                 elif vid == ids[0]:
                     self.unparsed(child, node.text)
         return True
@@ -3101,6 +3154,12 @@ class _Reader:
             iface.mlag_id = int(w[1])
         elif w[:2] == ["evpn", "ethernet-segment"] and n == 3 and w[2].isdigit():
             self._ios_es_ports[iface.name] = int(w[2])  # IOS: the segment is defined under l2vpn evpn
+        elif w[:3] == ["switchport", "trunk", "group"] and n == 4:
+            iface.trunk_groups.append(w[3])
+        elif w[:2] == ["stackwise-virtual", "link"] and n == 3 and w[2].isdigit():
+            iface.svl_link = int(w[2])
+        elif w == ["stackwise-virtual", "dual-active-detection"]:
+            iface.svl_dad = True
         elif w[:2] == ["lacp", "system-id"] and n == 3:
             iface.lacp_system_id = w[2].lower()
         elif w == ["no", "autostate"]:

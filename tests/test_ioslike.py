@@ -79,9 +79,10 @@ def test_eos_to_ios() -> None:
     assert " ip address 10.255.0.1 255.255.255.254\n" in out
     assert "ntp server vrf Mgmt-vrf 10.0.0.123 key 3 prefer\n" in out
     assert " mtu 9198\n" in out
-    # members of a port-channel are configured like it on IOS
+    # members of a port-channel are configured like it on IOS; those of the MLAG peer link become the StackWise
+    # Virtual link
     member = out.split("description spine-02\n", 1)[1].split("!", 1)[0]
-    assert " switchport mode trunk\n" in member and " channel-group 10 mode active\n" in member
+    assert " switchport mode trunk\n" in member and " stackwise-virtual link 1\n" in member
     assert "vrf MGMT" in report.to_text()
 
 

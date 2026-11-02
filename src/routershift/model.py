@@ -89,6 +89,7 @@ class System:
     syslog_servers: List[str] = field(default_factory=list)
     # VRF through which the device reaches its DNS, NTP and syslog servers ("" = the default VRF).
     service_vrf: str = ""
+    router_id: str = ""  # EOS router general: the router ID every routing protocol takes unless it sets its own
     ntp_prefer: str = ""  # the preferred NTP server
     ntp_server_keys: Dict[str, int] = field(default_factory=dict)  # NTP server -> authentication key number
     ntp_keys: Dict[int, "NtpKey"] = field(default_factory=dict)
@@ -123,6 +124,13 @@ class Mlag:
     peer_address: str = ""  # the peer's address on the peer link (EOS) or keepalive (AOS-CX)
     local_interface: str = ""  # the SVI on the peer link (EOS) or the keepalive source (AOS-CX)
     role: str = ""  # primary or secondary (AOS-CX)
+    stack: bool = False  # IOS StackWise Virtual: two switches that act as one (links: Interface.svl_link)
+    heartbeat: str = ""  # EOS peer-address heartbeat: the peer's address on another path (management)
+    heartbeat_vrf: str = ""
+    dual_primary_delay: Optional[int] = None  # EOS dual-primary detection delay, seconds
+    dual_primary_action: str = ""  # "errdisable all-interfaces" or "" (none)
+    reload_delay: Optional[int] = None  # seconds the MLAG ports stay down after a reload
+    reload_delay_non_mlag: Optional[int] = None  # the same for the other ports
 
 
 @dataclass
@@ -158,6 +166,7 @@ class Vlan:
     arp_inspection: bool = False  # dynamic ARP inspection on the VLAN
     igmp_snooping: Optional[bool] = None  # IGMP snooping switched on or off for the VLAN; None = not stated
     igmp_querier: bool = False  # the switch sends IGMP queries in the VLAN
+    trunk_groups: List[str] = field(default_factory=list)  # EOS: the VLAN only rides trunks of these groups
     origin: Origin = field(default_factory=Origin)
 
 
@@ -231,6 +240,9 @@ class Interface:
     evpn_single_active: bool = False  # single-active redundancy instead of all-active
     lacp_system_id: str = ""  # the LACP system ID the LAG uses (EOS form 0021.0022.0020)
     mac_address: str = ""  # SVI: the MAC it routes with ("" = the switch's own), xx:xx:xx:xx:xx:xx
+    trunk_groups: List[str] = field(default_factory=list)  # EOS switchport trunk group: VLANs of these groups ride it
+    svl_link: Optional[int] = None  # IOS: the port is a StackWise Virtual link (stackwise-virtual link N)
+    svl_dad: bool = False  # IOS: the port detects a dual-active StackWise Virtual pair
     autostate: Optional[bool] = None  # SVI: down while no port of its VLAN is up; None = the default (on)
     unnumbered: str = ""  # borrows the address of this interface (canonical name)
     fhrp: List["FhrpGroup"] = field(default_factory=list)

@@ -62,7 +62,7 @@ def test_mlag_to_vsx_and_back() -> None:
 
 
 def test_mlag_where_the_target_has_none() -> None:
-    for target, words in (("ios", "StackWise Virtual"), ("aoss", "distributed trunking"), ("comware", "IRF or DRNI")):
+    for target, words in (("aoss", "distributed trunking"), ("comware", "IRF or DRNI")):
         out, report = convert(sample("eos_leaf.cfg"), "eos", target)
         text = report.to_text()
         assert words in text and "peer link Port-channel10, shared LAGs Port-channel20" in text
