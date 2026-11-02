@@ -178,8 +178,9 @@ platform converts to and from all the others.
 * Areas are kept in dotted form; IOS shows them as numbers (`area 0`), AOS-S calls the backbone `backbone`.
 * AOS-S runs one process in one routing table, without NSSA, default-route origination or reference bandwidth;
   what it can't hold is flagged. Its router ID is the global `ip router-id`.
-* Authentication, timers, summaries, virtual links and redistribution through route maps are listed under "Not
-  understood" for now.
+* IOS and EOS also write the distribute-list route map, the SPF and LSA timers, max-lsa, graceful restart (IOS `nsf
+  ietf`) and interface authentication (keys as placeholders; SHA keys go through a key chain on IOS). The other
+  targets list them for review. Summaries and virtual links are listed under "Not understood" for now.
 
 ## BGP
 
@@ -191,8 +192,15 @@ platform converts to and from all the others.
 * AOS-CX has no peer groups here: a group's settings are written on each member, and the report says so. Comware
   groups are `group NAME internal|external`.
 * AOS-S is not written: its BGP depends on the model and release, and the report asks a person to configure it.
-* Passwords, timers, route maps, prefix lists, communities other than standard, and BGP in VRFs are listed under
-  "Not understood" for now (secrets masked).
+* IOS and EOS write aggregates, `timers bgp`, graceful restart, `distance bgp` and multipath-relax; neighbors keep
+  local-as, TTL security (EOS `ttl maximum-hops`), the maximum-prefix warning threshold and `remove-private-as all
+  replace-as`. In a VRF they write the IPv6 address family and the VRF's own peer groups (IOS writes each group's
+  settings on its neighbors). The other targets list what they leave out.
+* Community lists (standard and expanded) and AS-path lists are written on IOS and EOS, with `match community`,
+  `match as-path`, `set extcommunity rt` and `set metric-type` in route maps; IOS XE numbers AS-path lists, so a named
+  list gets a number. `match origin-as validity` (EOS) becomes `match rpki` (IOS), with the RPKI servers flagged.
+* A route-map entry whose match clause cannot be converted is left out (commented) and flagged: written without its
+  match it would apply to every route.
 
 ## DHCP server
 

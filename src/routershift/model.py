@@ -97,6 +97,8 @@ class System:
     transfer_source: Dict[str, str] = field(default_factory=dict)  # "tftp" / "ftp" -> canonical source interface
     logging_level: Optional[int] = None  # severity sent to the syslog servers, 0 (emergencies) to 7 (debugging)
     logging_source: str = ""  # canonical name of the interface syslog packets leave from
+    # Syslog servers that do not use UDP port 514: address -> (protocol "udp", "tcp" or "tls", port)
+    syslog_transport: Dict[str, Tuple[str, int]] = field(default_factory=dict)
 
 
 @dataclass
@@ -105,6 +107,11 @@ class VrfInfo:
     rd: str = ""
     rt_import: List[str] = field(default_factory=list)
     rt_export: List[str] = field(default_factory=list)
+    rt_evpn: bool = False  # the route targets are those of EVPN (EOS route-target import evpn), not of an MPLS VPN
+    export_map: str = ""  # route map that filters (and tags) the routes exported
+    # Routes leaked into this VRF from another without route targets (EOS router general leak routes): source VRF ->
+    # the route map that picks them ("" = all)
+    leaks: Dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -129,6 +136,7 @@ class Management:
     vrf: str = ""  # the VRF the SSH and HTTPS servers listen in, where the platform names one
     vty_acl: str = ""  # IPv4 ACL that limits who may log in remotely
     exec_timeout: Optional[int] = None  # idle timeout of remote sessions, in minutes (0 = never)
+    console_login: str = ""  # the login method list the console uses (EOS: aaa authentication login console)
     lldp: Optional[bool] = None
     cdp: Optional[bool] = None
 
@@ -180,6 +188,16 @@ class Interface:
     ipv6: List[str] = field(default_factory=list)
     dhcp_client: bool = False
     helper_addresses: List[str] = field(default_factory=list)
+    helper_vrf: str = ""  # the VRF the DHCP servers of helper_addresses are in ("" = the interface's own)
+    helper_source: str = ""  # canonical name of the interface relayed requests leave from
+    # Anycast gateway addresses that are the interface's own address on every switch of a fabric (EOS ip address
+    # virtual), with the shared MAC of Device.anycast_mac; CIDR
+    virtual_ipv4: List[str] = field(default_factory=list)
+    virtual_ipv6: List[str] = field(default_factory=list)
+    urpf: str = ""  # unicast reverse-path forwarding: "", "strict" (reachable via rx) or "loose" (via any)
+    ip_redirects: Optional[bool] = None  # ICMP redirects sent; None = the platform default
+    ip_unreachables: Optional[bool] = None  # ICMP unreachables sent; None = the platform default
+    proxy_arp: Optional[bool] = None  # proxy ARP; None = the platform default
     acl_in: str = ""  # IPv4 ACLs applied to the interface
     acl_out: str = ""
     acl6_in: str = ""  # IPv6 ACLs
@@ -210,6 +228,8 @@ class Interface:
     ospf_cost: Optional[int] = None
     ospf_network: str = ""  # "", "point-to-point", "broadcast"
     ospf_bfd: bool = False  # OSPF neighbors on this interface are watched by BFD
+    ospf_auth: str = ""  # OSPF authentication: "", "message-digest" (keyed: md5 or sha), "simple"
+    ospf_keys: Dict[int, str] = field(default_factory=dict)  # message-digest key id -> algorithm (md5, sha1, sha256..)
     bfd_interval: Optional[int] = None  # BFD transmit interval, ms
     bfd_min_rx: Optional[int] = None  # BFD receive interval, ms
     bfd_multiplier: Optional[int] = None  # BFD detection multiplier
@@ -273,6 +293,7 @@ class StaticRoute:
     name: str = ""
     discard: bool = False  # null route
     track: str = ""  # the route stays while this tracked object is up
+    tag: Optional[int] = None  # route tag, for route maps that match it
     origin: Origin = field(default_factory=Origin)
 
 
@@ -300,6 +321,12 @@ class Ospf:
     default_originate: str = ""  # "", "on", "always"
     bfd_all: bool = False  # BFD on every OSPF interface (IOS bfd all-interfaces, EOS bfd default)
     reference_bandwidth: Optional[int] = None  # Mbit/s
+    distribute_list_in: str = ""  # route map that filters the routes OSPF installs
+    spf_timers: Optional[Tuple[int, int, int]] = None  # SPF throttle: initial, hold, maximum wait (ms)
+    lsa_arrival: Optional[int] = None  # the least time between two copies of an LSA accepted (ms)
+    max_lsa: str = ""  # the LSA limit and its options as IOS and EOS write them ("12000 75 ignore-time 5 ...")
+    graceful_restart: bool = False
+    log_adjacency: str = ""  # "", "on" or "detail"
     origin: Origin = field(default_factory=Origin)
 
     def passive(self, interface: str) -> bool:
@@ -363,7 +390,19 @@ class BgpNeighbor:
     route_reflector_client: bool = False
     maximum_prefix: Optional[int] = None  # the most prefixes accepted from the neighbor
     remove_private_as: bool = False  # private AS numbers are taken out of the AS path sent to the neighbor
+    remove_private_as_mode: str = ""  # "", "all" or "all replace-as" (IOS and EOS spelling)
+    maximum_prefix_warning: Optional[int] = None  # percent of maximum_prefix at which a warning is logged
+    local_as: str = ""  # the AS number shown to the neighbor instead of the own
+    local_as_options: str = ""  # "no-prepend", "no-prepend replace-as" (IOS and EOS spelling)
+    ttl_security: Optional[int] = None  # GTSM: the neighbor is at most this many hops away (IOS ttl-security hops)
     allowas_in: Optional[int] = None  # accept routes with the own AS in the path this many times (0: the default)
+
+
+@dataclass
+class BgpAggregate:
+    prefix: str  # CIDR
+    summary_only: bool = False  # the more specific routes are not advertised
+    as_set: bool = False
 
 
 @dataclass
@@ -372,10 +411,13 @@ class BgpVrf:
     redistribution. The RD and route targets are in Device.vrf_info."""
 
     neighbors: List[BgpNeighbor] = field(default_factory=list)
-    networks: List[str] = field(default_factory=list)
+    networks: List[str] = field(default_factory=list)  # IPv4 and IPv6 prefixes
     redistribute: List[str] = field(default_factory=list)  # IPv4
     redistribute_maps: Dict[str, str] = field(default_factory=dict)
     maximum_paths: Optional[int] = None
+    peer_groups: Dict[str, BgpNeighbor] = field(default_factory=dict)  # defined in the VRF (EOS)
+    aggregates: List[BgpAggregate] = field(default_factory=list)
+    redistribute6: List[str] = field(default_factory=list)  # IPv6
 
 
 @dataclass
@@ -390,6 +432,13 @@ class Bgp:
     redistribute_maps: Dict[str, str] = field(default_factory=dict)  # IPv4 source -> route map that filters it
     maximum_paths: Optional[int] = None  # equal-cost paths installed (eBGP, or all where the platform has one knob)
     maximum_paths_ibgp: Optional[int] = None
+    aggregates: List[BgpAggregate] = field(default_factory=list)
+    keepalive: Optional[int] = None  # timers of every neighbor, seconds; None = the platform default
+    hold: Optional[int] = None
+    graceful_restart: bool = False
+    graceful_restart_time: Optional[int] = None  # seconds
+    distance: Optional[Tuple[int, int, int]] = None  # administrative distance of external, internal, local routes
+    multipath_relax: bool = False  # equal-cost paths through different neighbor ASes (bestpath as-path multipath-relax)
     vrfs: Dict[str, BgpVrf] = field(default_factory=dict)
     origin: Origin = field(default_factory=Origin)
 
@@ -422,9 +471,36 @@ class RouteMapEntry:
     match_prefix_lists6: List[str] = field(default_factory=list)  # IPv6
     match_acls: List[str] = field(default_factory=list)
     match_tags: List[int] = field(default_factory=list)
+    match_as_paths: List[str] = field(default_factory=list)  # AsPathList names
+    match_communities: List[str] = field(default_factory=list)  # CommunityList names
+    match_rpki: str = ""  # RPKI origin validation state: "", "valid", "invalid", "not-found"
+    # Sets also use: extcommunity-rt (route targets, space separated), metric-type (type-1, type-2)
     sets: Dict[str, str] = field(default_factory=dict)
     community_additive: bool = False  # the communities are added to the ones the route has
+    extcommunity_additive: bool = False
     description: str = ""
+    # Match and set clauses of the source that could not be read; an entry with a match among them is not written, as
+    # it would apply to every route
+    unconverted: List[str] = field(default_factory=list)
+
+
+@dataclass
+class CommunityList:
+    """A BGP community list: standard (community values) or expanded (regular expressions)."""
+
+    name: str
+    expanded: bool = False
+    entries: List[Tuple[str, str]] = field(default_factory=list)  # (permit|deny, values or expression)
+    origin: Origin = field(default_factory=Origin)
+
+
+@dataclass
+class AsPathList:
+    """A BGP AS-path access list: regular expressions over the AS path."""
+
+    name: str
+    entries: List[Tuple[str, str]] = field(default_factory=list)  # (permit|deny, expression)
+    origin: Origin = field(default_factory=Origin)
 
 
 @dataclass
@@ -565,6 +641,8 @@ class Snmp:
     contact: str = ""
     hosts: List["SnmpHost"] = field(default_factory=list)  # where notifications go
     traps: bool = False  # notifications switched on
+    trap_types: List[str] = field(default_factory=list)  # the notifications switched on, as the source names them;
+    # empty = all
     groups: Dict[str, "SnmpGroup"] = field(default_factory=dict)
     users: List["SnmpUser"] = field(default_factory=list)
     source: str = ""  # canonical name of the interface SNMP packets leave from
@@ -693,6 +771,7 @@ class QosAction:
     qos_class: str  # QosClass name; "class-default" = everything else
     set_dscp: Optional[int] = None
     police_kbps: Optional[int] = None  # committed rate; traffic above it is dropped
+    burst_bytes: Optional[int] = None  # committed burst; None = the platform default
 
 
 @dataclass
@@ -846,6 +925,8 @@ class Device:
     acls: Dict[str, Acl] = field(default_factory=dict)
     prefix_lists: Dict[str, PrefixList] = field(default_factory=dict)
     route_maps: Dict[str, RouteMap] = field(default_factory=dict)
+    community_lists: Dict[str, CommunityList] = field(default_factory=dict)
+    as_path_lists: Dict[str, AsPathList] = field(default_factory=dict)
     dhcp_pools: List[DhcpPool] = field(default_factory=list)
     nat_pools: Dict[str, NatPool] = field(default_factory=dict)
     nat_rules: List[NatRule] = field(default_factory=list)
@@ -861,6 +942,7 @@ class Device:
     dhcp_snooping: bool = False  # DHCP snooping switched on
     igmp_snooping: Optional[bool] = None  # IGMP snooping for every VLAN; None = not stated
     igmp_querier: bool = False  # IGMP querier in every VLAN that snoops (IOS ip igmp snooping querier)
+    anycast_mac: str = ""  # the MAC every switch of a fabric answers on for Interface.virtual_ipv4 (EOS VARP MAC)
     multicast_routing: bool = False
     pim_rps: List[str] = field(default_factory=list)  # static PIM rendezvous point addresses
     mlag: Optional[Mlag] = None
