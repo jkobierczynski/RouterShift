@@ -49,9 +49,8 @@ def test_writers() -> None:
 
 
 def test_reported_limits() -> None:
-    out, report = convert(sample("eos_leaf.cfg"), "eos", "aoscx")
-    assert "AOS-CX: policy-based routing with route map PBR-BACKUP is not written" in report.to_text()
-    assert "PBR-BACKUP" not in out
+    out, report = convert(sample("eos_leaf.cfg"), "eos", "aoscx")  # AOS-CX: a classifier policy (test_aoscx_routing)
+    assert "route-map PBR-BACKUP" not in out and "policy PBR-BACKUP\n" in out
     out, report = convert(sample("ios_access.cfg"), "ios", "aoss")
     assert "bfd" not in out.lower()
     assert "AOS-S: BFD is not written" in report.to_text()

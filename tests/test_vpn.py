@@ -90,7 +90,8 @@ def test_aos_switches_report_every_connection() -> None:
         out, report = convert(sample("ios_vpn.cfg"), "ios", target)
         assert "crypto" not in out and "ipsec" not in out
         assert report.to_text().count(f"{name} switches do not terminate IPsec") == 2
-        assert "tunnel interfaces are not converted" in report.to_text()
+        assert ("an IPsec tunnel interface has no AOS-CX form" if target == "aoscx"
+                else "tunnel interfaces are not converted") in report.to_text()
 
 
 def test_keys_are_masked() -> None:

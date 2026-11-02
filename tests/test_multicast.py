@@ -44,7 +44,7 @@ def test_reported_limits() -> None:
     _, report = convert(sample("aoss_edge.cfg"), "aoss", "ios")
     assert "IOS sets the querier for every snooping VLAN" in report.to_text()
     _, report = convert(sample("comware_access.cfg"), "comware", "aoscx")
-    assert "AOS-CX: the IGMP querier is set on the VLAN interface" in report.to_text()
+    assert "AOS-CX runs the IGMP querier on the VLAN interface" in report.to_text()
     out, report = convert(sample("ios_access.cfg"), "ios", "aoss")
     assert "pim" not in out and "AOS-S: multicast routing" in report.to_text()
     text = "interface Vlan10\n ip address 10.0.0.1 255.255.255.0\n ip pim sparse-dense-mode\n"

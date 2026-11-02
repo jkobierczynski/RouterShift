@@ -103,5 +103,5 @@ def test_ios_monitoring_to_eos() -> None:
 
 
 def test_monitoring_on_other_targets() -> None:
-    _, report = convert(EOS, "eos", "junos")
+    _, report = convert(EOS, "eos", "comware")
     assert "the TWAMP reflector" in report.to_text()

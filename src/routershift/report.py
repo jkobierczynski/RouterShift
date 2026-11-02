@@ -89,6 +89,7 @@ _KIND_TITLES = [
     ("mpls", "MPLS"),
     ("bgp", "BGP"),
     ("acl", "Access lists"),
+    ("security", "Device security (CoPP, MACsec)"),
     ("policy", "Prefix lists and route maps"),
     ("dhcp", "DHCP server"),
     ("nat", "NAT"),
@@ -179,7 +180,9 @@ class Report:
         counts = self.counts()
         lines.append(", ".join(f"{counts[s]} {s}" for s in ("exact", "approximated", "needs-review", "skipped")
                                if s in counts) or "nothing converted")
-        for kind, title in _KIND_TITLES:
+        known = {k for k, _ in _KIND_TITLES}
+        others = sorted({i.kind for i in self.items.values()} - known)
+        for kind, title in _KIND_TITLES + [(k, k.capitalize()) for k in others]:
             items = [i for i in self.items.values() if i.kind == kind]
             if not items:
                 continue

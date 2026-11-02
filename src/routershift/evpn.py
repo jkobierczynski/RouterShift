@@ -317,3 +317,42 @@ def ios_segments(device: Device, ind: str) -> List[str]:
             lines.append(f"{ind}df-election preference {iface.evpn_df_preference}")
         lines.append("!")
     return lines
+
+
+# Junos -----------------------------------------------------------------------------------------------------------------
+
+def junos_domains(bgp: Bgp, report: Report) -> None:
+    label = f"bgp {bgp.local_as}"
+    if bgp.evpn_domain or bgp.evpn_remote_domain or bgp.evpn_remote_peers or bgp.evpn_inter_domain_nhs:
+        report.add("bgp", label, Severity.REVIEW, "evpn-domains",
+                   "Junos has no EVPN domain gateway (EOS domain identifier "
+                   f"{bgp.evpn_domain or '-'}, remote {bgp.evpn_remote_domain or '-'}, remote-domain neighbors "
+                   f"{', '.join(bgp.evpn_remote_peers) or '-'}); the nearest is a data-centre interconnect "
+                   "(protocols evpn interconnect in a MAC-VRF), which is not written. The neighbors are written as "
+                   "ordinary EVPN peers")
+    if bgp.evpn_import_discard:
+        report.add("bgp", label, Severity.APPROX, "evpn-import-discard",
+                   "'route import match-failure action discard' is left out: Junos keeps the EVPN routes no instance "
+                   "imports in bgp.evpn.0 only")
+
+
+def junos_esi(esi: str) -> str:
+    """The ESI of the model (EOS 0000:0000:0021:0022:0020) in Junos' colon form, ten bytes."""
+    digits = esi.replace(":", "").replace(".", "")
+    return ":".join(digits[i:i + 2] for i in range(0, 20, 2))
+
+
+def esi_from_junos(text: str) -> str:
+    digits = text.replace(":", "")
+    return ":".join(digits[i:i + 4] for i in range(0, 20, 4))
+
+
+def junos_mac(lacp_id: str) -> str:
+    """0021.0022.0020 as 00:21:00:22:00:20."""
+    digits = lacp_id.replace(".", "").replace(":", "")
+    return ":".join(digits[i:i + 2] for i in range(0, 12, 2))
+
+
+def lacp_from_junos(mac: str) -> str:
+    digits = mac.replace(":", "")
+    return ".".join(digits[i:i + 4] for i in range(0, 12, 4))

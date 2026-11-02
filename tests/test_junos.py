@@ -7,7 +7,8 @@ from routershift import bgp as bgp_text
 from routershift import ospf as ospf_text
 from routershift.convert import convert, parse
 from routershift.junostext import Tree, read
-from routershift.model import Device, InterfaceKind, LacpMode, StpMode, SwitchportMode
+from routershift.acl import safe_name
+from routershift.model import AclAction, Device, InterfaceKind, LacpMode, StpMode, SwitchportMode
 
 JUNOS = sample("junos_core.cfg")
 SAMPLES = {"ios": "ios_access.cfg", "eos": "eos_leaf.cfg", "aoscx": "aoscx_access.cfg", "aoss": "aoss_edge.cfg",
@@ -39,13 +40,13 @@ def test_braces_and_set_lines_read_the_same() -> None:
 
 def test_reads_the_sample() -> None:
     d = parse(JUNOS, "junos")
-    assert [u.text.split()[:3] for u in d.unparsed] == [["set", "system", "root-authentication"],
-                                                         ["set", "system", "services"]]
+    assert [u.text.split()[:3] for u in d.unparsed] == [["set", "system", "root-authentication"]]
+    assert d.management.apis == {"netconf": ""}
     assert d.system.hostname == "core-01" and d.system.timezone == "Europe/Brussels"
     assert d.system.ntp_servers == ["10.0.0.123", "10.0.0.124"] and d.system.ntp_prefer == "10.0.0.123"
     assert d.system.ntp_keys[1].trusted and d.system.ntp_source == "Loopback0"
     assert d.system.syslog_servers == ["10.0.5.14"] and d.system.logging_level == 4
-    assert d.system.banner_motd == "Authorised access only."
+    assert d.system.banner_login == "Authorised access only."  # login message: shown before the login prompt
     assert [(u.name, u.privilege, u.hash_type) for u in d.users] == [("netops", 15, "sha512-crypt"),
                                                                     ("viewer", 1, "md5-crypt")]
     assert {v.vlan_id: v.name for v in d.vlans.values()} == {99: "MGMT", 10: "USERS", 20: "VOICE", 1: "default"}
@@ -119,9 +120,10 @@ def test_every_sample_to_junos(source: str) -> None:
         assert back.bgp is not None
         pairs = lambda b: sorted((n.address, bgp_text.remote_as(b, n)) for n in b.neighbors)  # noqa: E731
         assert pairs(back.bgp) == pairs(first.bgp)
-    # what is not written yet is listed, not dropped
-    for name in first.acls:
-        assert report.items[("acl", name)].skipped
+    # every ACL arrives as a firewall filter with its convertible entries
+    for name, acl in first.acls.items():
+        rules = lambda a: [e for e in a.entries if e.action != AclAction.REMARK and not e.unsupported]  # noqa: E731
+        assert len(rules(back.acls[safe_name(name)])) >= len(rules(acl)), name
 
 
 def mgmt(device: Device) -> set:

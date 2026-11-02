@@ -307,10 +307,20 @@ def test_reads_back(target: str) -> None:
 def test_other_targets_report_what_they_leave_out(target: str) -> None:
     out, rep = convert(EOS, "eos", target)
     text = rep.to_text()
-    assert "anycast gateway 10.1.100.1/24" in text
-    assert "community-list CL-BLACKHOLE: skipped" in text
+    if target == "junos":
+        assert "community CL-BLACKHOLE {" in out and "virtual-gateway-v4-mac" not in out
+        assert "mac 00:1c:73:00:dc:01;" in out  # the anycast gateway: one address and MAC on every leaf
+    elif target == "aoscx":
+        assert "    active-gateway ip 10.1.100.1\n" in out and "    ip address 10.1.100.1/24\n" in out
+    elif target == "nxos":
+        assert "ip community-list standard CL-BLACKHOLE seq 10 permit 65535:666\n" in out
+        assert "  ip address 10.1.100.1/24\n  ipv6 address 2001:db8:1:100::1/64\n" \
+               "  fabric forwarding mode anycast-gateway\n" in out
+    else:
+        assert "anycast gateway 10.1.100.1/24" in text
+        assert "community-list CL-BLACKHOLE: skipped" in text
     for (kind, name), item in rep.items.items():
-        if kind == "interface" and name.startswith("Vlan100 ->"):
+        if kind == "interface" and name.startswith("Vlan100 ->") and target != "nxos":  # NX-OS writes it all
             assert item.status in ("needs-review", "skipped"), target
 
 

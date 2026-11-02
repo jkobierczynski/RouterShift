@@ -49,8 +49,9 @@ pip install .
 | `aoss` | HPE Aruba AOS-S / ProCurve (16.x) | `show running-config` |
 | `comware` | HPE Comware 7 | `display current-configuration` |
 
-Every platform converts to every other one. Junos and NX-OS write the core of a configuration so far (see
-[What converts](#what-converts)); the others write everything the model holds that the platform can express.
+Every platform converts to every other one. IOS, EOS, Junos, NX-OS and AOS-CX write every area the model holds,
+using the nearest construct where the target has another shape; AOS-S and Comware write everything the model holds
+that the platform can express (see [What converts](#what-converts)).
 
 ## Converting a configuration
 
@@ -195,8 +196,8 @@ in [`src/routershift/model.py`](../src/routershift/model.py).
   and timeout, LLDP and CDP, NetFlow, wireless networks on controllers.
 
 What a target platform cannot do is reported, never guessed: an AOS-S switch gets no NAT, and the report says to
-move those rules to a router. Junos and NX-OS do not write every area yet; what they leave out is listed as
-"not written for Junos yet" or "not written for NX-OS yet".
+move those rules to a router. Where a target has a near equivalent only, the item is marked approximated and the
+report says what differs; nothing is marked exact that is not.
 
 ## Secrets
 

@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 import ipaddress
-from typing import Callable, Dict, List, Tuple
+from typing import Callable, Dict, List, Sequence, Tuple
 
 from .. import acl as acl_text
 from .. import multicast as multicast_text
@@ -17,6 +17,13 @@ from .. import tracking as tracking_text
 from .. import hosts as hosts_text
 from .. import bfd as bfd_text
 from .. import igp as igp_text
+from .. import aoscxfabric as fabric
+from .. import aoscxqos
+from .. import aoscxsec
+from .. import aoscxmon
+from .. import aoscxmgmt
+from .. import aoscxauto
+from .. import aoscxrouting
 from .. import routemap as routemap_text
 from .. import bgp as bgp_text
 from .. import dhcp as dhcp_text
@@ -34,7 +41,7 @@ from .. import stp as stp_text
 from .. import qos as qos_text
 from .. import aaa as aaa_text
 from ..parsers.aoscx import AOSCX_ROLES
-from ..model import BgpNeighbor, Device, Interface, Ospf, InterfaceKind, LacpMode, StaticRoute, StpMode, SwitchportMode
+from ..model import BgpAggregate, BgpNeighbor, Device, Interface, Ospf, InterfaceKind, LacpMode, StaticRoute, StpMode, SwitchportMode
 from ..names import PortMapper
 from ..report import Report, Severity
 
@@ -65,11 +72,16 @@ class Writer:
         self.vrfs()
         self.spanning_tree()
         self.acls()
+        self.security()
         self.policies()
         if bfd_text.uses_bfd(self.device):
             self.out.append("bfd")
-        bfd_text.pbr_unsupported(self.device, self.report, "AOS-CX")
-        igp_text.unsupported(self.device, self.report, "AOS-CX")
+        aoscxrouting.bfd_ecmp(self.device, self.report)
+        if self.device.rip is not None:
+            self.report.skip("rip", igp_text.RIP_LABEL, "rip-unsupported", "AOS-CX has no RIP; left out")
+        if self.device.isis is not None:
+            self.report.skip("isis", igp_text.isis_label(self.device.isis), "isis-unsupported",
+                             "AOS-CX has no IS-IS; left out")
         self.qos()
         self.vlans()
         self.groups = {i.name: fhrp.plan(i, "aoscx", self.report, self.port(i.name))
@@ -79,6 +91,9 @@ class Writer:
         self.ospf_areas: Dict[str, List[Tuple[str, str]]] = {}  # interface -> [(process, area)]
         for p in self.device.ospf:
             self.ospf(p)
+        self._icmp_globals()
+        self.track_plan = tracking_text.plan(self.device, self.report, "aoscx", "AOS-CX")
+        self.out += aoscxmon.track_lines(self.device, self.report, self.track_plan, self.port)
         # a LAG exists before the ports that join it
         order = {InterfaceKind.MANAGEMENT: 0, InterfaceKind.LAG: 1}
         for iface in sorted(self.device.interfaces.values(), key=lambda i: order.get(i.kind, 2)):
@@ -86,7 +101,6 @@ class Writer:
         self.vsx()
         self.vxlan()
         self.monitor()
-        tracking_text.plan(self.device, self.report, "aoscx", "AOS-CX")
         self.routes()
         self.dhcp()
         nat_text.skip_all(self.device, self.report, "AOS-CX")
@@ -97,6 +111,13 @@ class Writer:
             self.bgp()
         self.report.unparsed(self.device.unparsed)
         return "\n".join(self.out) + "\n"
+
+    def _icmp_globals(self) -> None:
+        """AOS-CX switches ICMP redirects and unreachables for the whole switch: off when a routed interface turns
+        them off."""
+        for attr, word in (("ip_redirects", "redirect"), ("ip_unreachables", "unreachable")):
+            if any(getattr(i, attr) is False for i in self.device.interfaces.values()):
+                self.out.append(f"no ip icmp {word}")
 
     def _plan_vrfs(self) -> None:
         for iface in self.device.interfaces.values():
@@ -124,10 +145,7 @@ class Writer:
                 rep.add("system", "time zone", Severity.REVIEW, "timezone",
                         f"time zone '{s.timezone}' is a name with an offset; AOS-CX takes a zone of the tz database "
                         "(clock timezone europe/brussels); set it by hand")
-        if s.banner_motd:
-            delim = "^" if "^" not in s.banner_motd else "%"
-            self.out += [f"banner motd {delim}", s.banner_motd, delim]
-            rep.item("system", "banner motd")
+        self.out += aoscxmgmt.banner_lines(self.device, rep)
         via = f" vrf {self.vrf(s.service_vrf)}" if s.service_vrf else ""
         for key in s.ntp_keys.values():
             rep.item("system", f"ntp key {key.number}")
@@ -162,7 +180,11 @@ class Writer:
         self.out += [f"ip dns host {name} {address}" for name, address in s.dns_hosts.items()]
         severity = f" severity {mgmt_text.SHORT[s.logging_level]}" if s.logging_level is not None else ""
         for host in s.syslog_servers:
-            self.out.append(f"logging {host}{severity}{via}")
+            self.out.append(f"logging {host}{aoscxmgmt.syslog_transport(self.device, host)}{severity}{via}")
+        for host, (protocol, _) in s.syslog_transport.items():
+            if protocol == "tls":
+                rep.add("system", "syslog servers", Severity.APPROX, "syslog-tls",
+                        f"TLS to {host} also needs the server's CA certificate on the switch (crypto pki ta-profile)")
         if s.syslog_servers:
             rep.item("system", "syslog servers")
         if s.logging_level is not None:
@@ -175,6 +197,10 @@ class Writer:
             rep.item("system", "syslog source")
         self.management()
         self.snmp()
+        aoscxmgmt.unwritable(self.device, rep)
+        self.out += aoscxauto.ptp_lines(self.device, rep, _IND)
+        aoscxauto.events(self.device, rep)
+        self.out += aoscxmgmt.role_lines(self.device, rep, _IND)
         self.users()
         self.aaa()
         self.out.append("!")
@@ -212,8 +238,10 @@ class Writer:
         vrf = self.vrf(m.vrf) if m.vrf else MGMT_VRF if mgmt else "default"
         if m.ssh:
             self.out.append(f"ssh server vrf {vrf}")
-        if m.https:
+        if m.https or "http" in m.apis:
             self.out.append(f"https-server vrf {vrf}")
+        self.out += aoscxmgmt.api_lines(d, rep, vrf)
+        self.out += aoscxmgmt.password_lines(d, rep, _IND)
         mgmt_text.no_server(rep, "telnet server", "AOS-CX", m.telnet)
         mgmt_text.no_server(rep, "http server", "AOS-CX", m.http)
         if m.vty_acl:
@@ -224,6 +252,7 @@ class Writer:
             self.out += ["cli-session", f"    timeout {m.exec_timeout}"]
         if m.lldp is False:
             self.out.append("no lldp")
+        self.out += aoscxmon.lldp_lines(self.device, rep, self.port)
         if m.cdp:
             rep.add("management", "CDP", Severity.APPROX, "cdp-lldp", "AOS-CX has no CDP; LLDP announces the switch")
 
@@ -235,19 +264,24 @@ class Writer:
             label = aaa_text.user_label(u)
             found = aaa_text.password(u, ("aoscx-ciphertext",), self.report)
             if found is None:
+                left = [w for w, v in ((f"its role {u.role}", u.role), ("its SSH public keys", u.ssh_keys)) if v]
+                if left:
+                    self.report.add("management", label, Severity.REVIEW, "user-left-out",
+                                    f"{' and '.join(left)} go with it")
                 continue
             form, value = found
             if form == "none":
                 self.report.skip("management", label, "no-password",
                                  "the user has no password in the source; AOS-CX needs one, create it by hand")
                 continue
-            group = aaa_text.role(u.privilege, AOSCX_ROLES)
+            group = aoscxmgmt.user_group(self.device, u) or aaa_text.role(u.privilege, AOSCX_ROLES)
             self.report.item("management", label)
-            if u.privilege not in (None, 1, 15):
+            if u.privilege not in (None, 1, 15) and not aoscxmgmt.user_group(self.device, u):
                 self.report.add("management", label, Severity.APPROX, "privilege",
                                 f"privilege {u.privilege} becomes group {group}; AOS-CX has no levels in between")
             self.out.append(f"user {u.name} group {group} password "
                             f"{'plaintext' if form == 'plain' else 'ciphertext'} {value}")
+            self.out += aoscxmgmt.ssh_key_lines(u)
 
     def aaa(self) -> None:
         a = self.device.aaa
@@ -310,7 +344,14 @@ class Writer:
             service = {"login": "login", "commands": "commands", "exec": "all-mgmt"}[m.service]
             if m.kind == "accounting":
                 service, accounting_written = "all-mgmt", True
-            words = [f"aaa {m.kind} {service} {m.name}"] + ([m.record] if m.record else [])
+            name = m.name
+            console = self.device.management.console_login
+            if m.kind == "authentication" and m.service == "login" and console and m.name == console:
+                name = "console"  # AOS-CX names the list by the channel it serves
+                if console != "console":
+                    rep.add("management", label, Severity.APPROX, "console-login",
+                            f"the console's list {console} is written as the AOS-CX console list")
+            words = [f"aaa {m.kind} {service} {name}"] + ([m.record] if m.record else [])
             if groups:
                 words.append("group " + " ".join(groups + rest))
             else:
@@ -338,6 +379,12 @@ class Writer:
             self.out += ["aaa authentication port-access dot1x authenticator"] + group_lines + [f"{_IND}enable"]
         if any(i.mab for i in self.device.interfaces.values()):
             self.out += ["aaa authentication port-access mac-auth"] + group_lines + [f"{_IND}enable"]
+        if a.coa:
+            rep.item("management", "RADIUS change of authorization")
+            self.out.append("radius dyn-authorization enable")
+            rep.add("management", "RADIUS change of authorization", Severity.REVIEW, "coa-clients",
+                    "add the RADIUS servers that may send changes as 'radius dyn-authorization client ADDRESS "
+                    "secret-key plaintext KEY'")
 
     def _port_access_interface(self, iface: Interface, add: Callable[[Severity, str, str], None]) -> List[str]:
         if not (iface.dot1x or iface.mab):
@@ -360,6 +407,8 @@ class Writer:
             lines.append(f"{_IND}enable")
         if iface.mab:
             lines += [f"{prefix} mac-auth", f"{_IND}enable"]
+        if iface.dot1x_fail_vlan is not None:
+            lines.append(f"{prefix} reject-vlan {iface.dot1x_fail_vlan}")
         return lines
 
     _SNMP_AUTH = ["md5", "sha"]
@@ -419,6 +468,9 @@ class Writer:
         m = d.mlag
         if m is None:
             return
+        if m.stack:
+            self.out += fabric.vsf_lines(d, self.report, _IND, self.port)
+            return
         rep = self.report
         label = "multi-chassis LAG"
         rep.item("interface", label)
@@ -432,7 +484,10 @@ class Writer:
         if not m.role:
             rep.add("interface", label, Severity.REVIEW, "mlag-role", "role primary is written; make the peer secondary")
         source = d.interfaces.get(m.local_interface)
-        if m.peer_address and source is not None and source.ipv4:
+        heartbeat = fabric.heartbeat_keepalive(d, rep, label, self.vrf)
+        if heartbeat:
+            lines.append(heartbeat)
+        elif m.peer_address and source is not None and source.ipv4:
             vrf = f" vrf {self.vrf(source.vrf)}" if source.vrf else ""
             lines.append(f"keepalive peer {m.peer_address} source {source.ipv4[0].split('/')[0]}{vrf}")
             if d.platform == "eos":
@@ -444,6 +499,7 @@ class Writer:
                     f"keepalive source {m.local_interface or '?'} has no address; set the VSX keepalive by hand")
         if m.domain:
             rep.add("interface", label, Severity.APPROX, "mlag-domain", f"VSX has no domain name (was {m.domain})")
+        lines += fabric.vsx_options(d, rep, label, self.vrf)
         self.out += ["vsx"] + [_IND + line for line in lines]
 
     def vrfs(self) -> None:
@@ -458,9 +514,10 @@ class Writer:
             self.out.append(f"vrf {name}")
             if info and info.rd:
                 self.out.append(f"{_IND}rd {info.rd}")
-            if info and (info.rt_import or info.rt_export):
+            targets = fabric.vrf_targets(self.device, name, info, self.report) if info else []
+            if targets:
                 self.out.append(f"{_IND}address-family ipv4 unicast")
-                self.out += [f"{_IND * 2}route-target {d} {v}" for d, v in vrfs_text.targets(info)]
+                self.out += [_IND * 2 + line for line in targets]
             self.report.item("system", f"vrf {name}")
 
     def spanning_tree(self) -> None:
@@ -497,6 +554,13 @@ class Writer:
         if instances or vlans:
             self.report.item("system", "bridge priority")
 
+    def security(self) -> None:
+        """MAC ACLs, MACsec policies, and the control plane's ACLs and policing."""
+        for mac_acl in self.device.mac_acls.values():
+            self.out += aoscxsec.mac_acl_lines(mac_acl, self.report, _IND)
+        self.out += aoscxsec.macsec(self.device, self.report, _IND)
+        self.out += aoscxsec.control_plane(self.device, self.report, self.vrf, _IND)
+
     def acls(self) -> None:
         for acl in self.device.acls.values():
             name = acl_text.safe_name(acl.name)
@@ -509,8 +573,11 @@ class Writer:
             self.out += [_IND + line for line in lines]
 
     def qos(self) -> None:
-        """Classes hold their own entries (match/ignore): DSCP values, and the entries of the ACL a class used."""
+        """Classes hold their own entries (match/ignore): DSCP values, and the entries of the ACL a class used; the DSCP
+        map and the schedule profiles."""
         rep = self.report
+        self.queuing = aoscxqos.Writer(self.device, rep, _IND)
+        self.out += self.queuing.lines()
         for c in self.device.qos_classes.values():
             label = f"class {c.name}"
             rep.item("qos", label)
@@ -560,7 +627,7 @@ class Writer:
                 add(Severity.REVIEW, "qos-policy", f"policy {name} is applied but not defined; left out")
         if iface.qos_trust:
             lines.append(f"qos trust {iface.qos_trust}")
-        return lines
+        return lines + self.queuing.interface(iface, add)
 
     def vlans(self) -> None:
         voice = {i.voice_vlan for i in self.device.interfaces.values() if i.voice_vlan is not None}
@@ -568,10 +635,11 @@ class Writer:
         igmp = multicast_text.snooped(self.device)
         if multicast_text.stated(self.device):
             self.report.item("vlan", multicast_text.LABEL)
-            multicast_text.querier_unsupported(self.device, self.report, "AOS-CX")
         if self.device.dhcp_snooping or snooped:
             self.out.append("dhcpv4-snooping")
             self.report.item("vlan", "DHCP snooping")
+            if self.device.dhcp_option82 is not None:
+                self.out.append(("" if self.device.dhcp_option82 else "no ") + "dhcpv4-snooping option 82")
         if l2sec_text.inspection_vlans(self.device):
             self.report.item("vlan", "ARP inspection")
         for vlan in sorted(self.device.vlans.values(), key=lambda v: v.vlan_id):
@@ -589,10 +657,58 @@ class Writer:
             if vlan.vlan_id in igmp:
                 self.out.append(f"{_IND}ip igmp snooping enable")
             self.report.item("vlan", str(vlan.vlan_id))
+        fabric.trunk_groups(self.device, self.report, self.port)
+        self.multicast()
+
+    def _rp_lines(self, rps: List[str], rp_groups: Dict[str, str]) -> List[str]:
+        lines = []
+        for rp in rps:
+            groups = rp_groups.get(rp, "")
+            if groups.startswith("acl "):
+                self.report.add("system", "multicast routing", Severity.REVIEW, "pim-rp-acl",
+                                f"RP {rp} serves the groups of ACL {groups[4:]}; AOS-CX takes a group prefix, so the "
+                                "RP is written for every group: add the prefix")
+                groups = ""
+            lines.append(f"{_IND}rp-address {rp}" + (f" {groups}" if groups else ""))
+        return lines
+
+    def multicast(self) -> None:
+        """router pim per VRF with its rendezvous points, router msdp; an anycast RP is shared through MSDP."""
         d = self.device
-        if d.multicast_routing or d.pim_rps:
-            self.report.item("system", "multicast routing")
-            self.out += ["router pim", f"{_IND}enable"] + [f"{_IND}rp-address {rp}" for rp in d.pim_rps]
+        rep = self.report
+        vrf_pim = {name: m for name, m in d.multicast_vrfs.items() if m.routing or m.rps}
+        if d.multicast_routing or d.pim_rps or vrf_pim or d.msdp_peers or d.pim_anycast:
+            rep.item("system", "multicast routing")
+        if d.multicast_routing or d.pim_rps or d.pim_anycast:
+            self.out += ["router pim", f"{_IND}enable"] + self._rp_lines(d.pim_rps, d.pim_rp_groups)
+        for name, m in vrf_pim.items():
+            self.out += [f"router pim vrf {self.vrf(name)}", f"{_IND}enable"] + self._rp_lines(m.rps, m.rp_groups)
+            if not m.routing:
+                rep.add("system", "multicast routing", Severity.APPROX, "pim-vrf",
+                        f"VRF {name} has rendezvous points but no multicast routing: AOS-CX enables PIM with them")
+        msdp = dict(d.msdp_peers)
+        for anycast, peers in d.pim_anycast.items():
+            for peer in peers:
+                msdp.setdefault(peer, "")
+            rep.add("system", "multicast routing", Severity.REVIEW, "anycast-rp",
+                    f"anycast RP {anycast} (shared with {', '.join(peers)}): AOS-CX shares an anycast RP through MSDP, "
+                    "so the other RPs are written as MSDP peers; give them a connect-source (the loopback with this "
+                    "switch's own address), and only the RPs need it")
+        if msdp:
+            self.out += ["router msdp", f"{_IND}enable"]
+            for peer, src in msdp.items():
+                self.out.append(f"{_IND}ip msdp peer {peer}")
+                if src:
+                    self.out.append(f"{_IND * 2}connect-source {self.port(src)}")
+                self.out.append(f"{_IND * 2}enable")
+        queriers = multicast_text.queriers(d)
+        if queriers:
+            address = d.igmp_querier_address or next(
+                (d.vlans[v].igmp_querier_address for v in queriers if d.vlans[v].igmp_querier_address), "")
+            rep.add("vlan", multicast_text.LABEL, Severity.REVIEW, "igmp-querier",
+                    "AOS-CX runs the IGMP querier on the VLAN interface (ip igmp querier): the querier of VLANs "
+                    + ", ".join(str(v) for v in queriers) + (f" (address {address})" if address else "")
+                    + " is not written")
 
     def vxlan(self) -> None:
         """interface vxlan 1 with its VNIs, and the evpn block for the VLANs EVPN advertises."""
@@ -615,11 +731,8 @@ class Writer:
                 self.out += [f"{_IND * 2}vtep-peer {a}" for a in vx.flood_vteps]
         for vrf, vni in vx.vrf_vnis.items():
             self.out += [f"{_IND}vni {vni}", f"{_IND * 2}vrf {self.vrf(vrf)}"]
-        if vx.evpn_vlans:
-            self.out.append("evpn")
-            for vid in vx.evpn_vlans:
-                self.out += [f"{_IND}vlan {vid}", f"{_IND * 2}rd auto", f"{_IND * 2}route-target export auto",
-                             f"{_IND * 2}route-target import auto"]
+        self.out += fabric.evpn_lines(d, self.report, _IND, vxlan_text.LABEL)
+        fabric.evpn_domain(d, self.report)
 
     def monitor(self) -> None:
         """Mirror sessions and sFlow; AOS-CX NetFlow (IPFIX) is not written."""
@@ -638,9 +751,10 @@ class Writer:
             rep.item(monitor_text.KIND, monitor_text.SFLOW)
             if monitor_text.sflow_ports(d):
                 self.out.append("sflow")
+            source_vrf = aoscxmon.sflow_vrf(d, rep)
             for c in sf.collectors:
                 port = f" port {c.port}" if c.port is not None else ""
-                vrf = f" vrf {self.vrf(c.vrf)}" if c.vrf else ""
+                vrf = f" vrf {self.vrf(c.vrf or source_vrf)}" if c.vrf or source_vrf else ""
                 self.out.append(f"sflow collector {c.address}{port}{vrf}")
             agent = monitor_text.agent(d, sf, rep, "AOS-CX")
             if agent:
@@ -649,6 +763,7 @@ class Writer:
                 self.out.append(f"sflow sampling {sf.sample_rate}")
             if sf.polling_interval is not None:
                 self.out.append(f"sflow polling {sf.polling_interval}")
+        aoscxmon.unwritable(d, rep)
         monitor_text.netflow_unsupported(d, rep, "AOS-CX")
 
     # interfaces ------------------------------------------------------------------------------------------------------
@@ -661,11 +776,17 @@ class Writer:
         def add(severity: Severity, code: str, message: str) -> None:
             self.report.add("interface", label, severity, code, message)
 
+        tunnel: List[str] = []
         if iface.kind == InterfaceKind.TUNNEL:
-            self.report.skip("interface", label, "tunnel",
-                             "tunnel interfaces are not converted for AOS-CX yet; configure it by hand")
-            return
-        lines: List[str] = ["shutdown" if iface.shutdown else "no shutdown"]
+            found = aoscxrouting.tunnel_lines(self.device, iface, add,
+                                              lambda i: i.ipv4[0].split("/")[0] if i.ipv4 else "")
+            if found is None:
+                self.report.skip("interface", label, "tunnel",
+                                 "an IPsec tunnel interface has no AOS-CX form (AOS-CX terminates no VPNs); move it "
+                                 "to a router or firewall")
+                return
+            tunnel = found
+        lines: List[str] = tunnel + ["shutdown" if iface.shutdown else "no shutdown"]
         if iface.description:
             lines.append(f"description {iface.description}")
         if iface.mtu is not None:
@@ -680,6 +801,7 @@ class Writer:
             lines.append(f"encapsulation dot1q {iface.encapsulation_vlan}")
         if iface.kind in (InterfaceKind.ETHERNET, InterfaceKind.LAG):
             lines += self._layer2(iface, add)
+        fabric.interface_notes(iface, add)
         if iface.kind == InterfaceKind.LAG:
             lacp = {m.lacp_mode for m in self.device.interfaces.values() if m.lag == iface.name}
             mode = LacpMode.ACTIVE if LacpMode.ACTIVE in lacp else LacpMode.PASSIVE if lacp == {LacpMode.PASSIVE} \
@@ -720,6 +842,9 @@ class Writer:
                 hosts_text.poe_limit(iface, add, "AOS-CX", False)
         lines += self._port_access_interface(iface, add)
         lines += self._qos_interface(iface, add)
+        lines += aoscxsec.mac_acl_interface(self.device, iface, add)
+        lines += aoscxauto.ptp_interface(iface)
+        lines += self.pbr.interface(iface, add)
         lines += [f"no lldp {name}" for name, on in (("transmit", iface.lldp_tx), ("receive", iface.lldp_rx)) if not on]
         lines += self._l2sec_interface(iface, add)
         if iface.stp_portfast:
@@ -762,6 +887,12 @@ class Writer:
                 body.append("version 3")
             if g.hello_ms is not None:
                 body.append(f"timers advertise {fhrp.interval(g.hello_ms, 1, add, 100, 40950)}")
+            tracks = self.track_plan.fhrp_tracks(g.tracks)
+            body += [f"track {t}" for t, _ in tracks]
+            if tracks:
+                add(Severity.APPROX, "fhrp-track",
+                    "AOS-CX takes the group down while a tracked object is down, instead of lowering its priority by "
+                    + ", ".join(str(dec) for _, dec in tracks))
             if g.name:
                 add(Severity.APPROX, "fhrp-name", f"description '{g.name}' left out: AOS-CX has none for a group")
             body.append("shutdown" if g.shutdown else "no shutdown")
@@ -782,6 +913,11 @@ class Writer:
         lines: List[str] = []
         if p.router_id:
             lines.append(f"router-id {p.router_id}")
+        elif self.device.system.router_id:
+            lines.append(f"router-id {self.device.system.router_id}")
+            self.report.add("ospf", label, Severity.APPROX, "router-id",
+                            f"AOS-CX has no global router ID: {self.device.system.router_id} is written as the OSPF "
+                            "router ID")
         if p.reference_bandwidth is not None:
             lines.append(f"reference-bandwidth {p.reference_bandwidth}")
         if p.passive_default:
@@ -791,6 +927,7 @@ class Writer:
             lines.append(f"redistribute {source}" + (f" route-map {rm}" if rm else ""))
         if p.bfd_all:
             lines.append("bfd all-interfaces")
+        lines += aoscxrouting.ospf_option_lines(p, self.report, label)
         if p.default_originate:
             lines.append("default-information originate" + (" always" if p.default_originate == "always" else ""))
         for dotted in sorted(set(areas.values()) | set(p.area_types), key=ospf_text.area_number):
@@ -830,10 +967,13 @@ class Writer:
         routemap_text.items(self.device, self.report)
         for pl in self.device.prefix_lists.values():
             self.out += routemap_text.ios_prefix_lines(pl, "aoscx")
-        skip = bfd_text.pbr_only(self.device)  # reported with the interface
+        self.out += routemap_text.ios_list_lines(self.device, "aoscx", self.report)
+        skip = bfd_text.pbr_only(self.device)  # written as classifier policies
         for rm in self.device.route_maps.values():
             if rm.name not in skip:
                 self.out += routemap_text.ios_route_map_lines(rm, "aoscx", self.report, _IND)
+        self.pbr = aoscxrouting.PbrWriter(self.device, self.report, _IND)
+        self.out += self.pbr.lines()
 
     def bgp(self) -> None:
         bgp = self.device.bgp
@@ -846,15 +986,16 @@ class Writer:
         lines: List[str] = []
         if bgp.router_id:
             lines.append(f"bgp router-id {bgp.router_id}")
+        lines += fabric.bgp_globals(self.device, bgp, self.report)
         neighbors = bgp_text.flat(bgp)
         lines += self._bgp_body(neighbors, bgp.networks, bgp.redistribute, bgp.redistribute6, bgp.redistribute_maps,
-                                "")
+                                "", bgp.aggregates)
         if bgp.maximum_paths or bgp.maximum_paths_ibgp:
             most = max(bgp.maximum_paths or 0, bgp.maximum_paths_ibgp or 0)
             if bgp.maximum_paths and bgp.maximum_paths_ibgp and bgp.maximum_paths != bgp.maximum_paths_ibgp:
                 self.report.add("bgp", label, Severity.APPROX, "maximum-paths",
                                 f"AOS-CX has one maximum-paths for eBGP and iBGP; {most} is written for both")
-            lines.insert(1 if bgp.router_id else 0, f"maximum-paths {most}")
+            lines.insert(1 if lines and lines[0].startswith("bgp router-id") else 0, f"maximum-paths {most}")
         evpn = [p for p in neighbors if "evpn" in p.families]
         if evpn:
             lines.append("address-family l2vpn evpn")
@@ -866,21 +1007,28 @@ class Writer:
             lines.append(f"vrf {name}")
             if v.maximum_paths:
                 lines.append(f"{_IND}maximum-paths {v.maximum_paths}")
-            lines += [_IND + line for line in self._bgp_body(v.neighbors, v.networks, v.redistribute, [],
-                                                              v.redistribute_maps, f" (vrf {name})")]
+            if v.peer_groups:
+                self.report.add("bgp", f"bgp vrf {name}", Severity.APPROX, "bgp-peer-group",
+                                f"peer groups {', '.join(v.peer_groups)} written out on each member")
+            peers = [bgp_text.effective(bgp, n, v) for n in v.neighbors]
+            lines += [_IND + line for line in self._bgp_body(peers, v.networks, v.redistribute, v.redistribute6,
+                                                              v.redistribute_maps, f" (vrf {name})", v.aggregates)]
             lines.append(f"{_IND}exit-vrf")
         self.out.append(f"router bgp {bgp.local_as}")
         self.out += [_IND + line for line in lines]
 
     def _bgp_body(self, neighbors: List[BgpNeighbor], networks: List[str], redistribute: List[str],
-                  redistribute6: List[str], maps: Dict[str, str], where: str) -> List[str]:
+                  redistribute6: List[str], maps: Dict[str, str], where: str,
+                  aggregates: Sequence[BgpAggregate] = ()) -> List[str]:
         """Neighbors and address families, of the default VRF or of one VRF."""
         lines: List[str] = []
         for peer in neighbors:
             label = f"neighbor {peer.address}{where}"
             self.report.item("bgp", label)
             bgp_text.unwritten(peer, {"password", "timers", "route_reflector_client", "remove_private_as",
-                                      "allowas_in"}, self.report, label, "AOS-CX")
+                                      "remove_private_as_mode", "allowas_in", "maximum_prefix",
+                                      "maximum_prefix_warning", "local_as", "ttl_security"}, self.report, label,
+                               "AOS-CX")
             pre = f"neighbor {peer.address}"
             if peer.remote_as:
                 lines.append(f"{pre} remote-as {peer.remote_as}")
@@ -901,6 +1049,15 @@ class Writer:
                              f"{peer.hold if peer.hold is not None else 180}")
             if peer.remove_private_as:
                 lines.append(f"{pre} remove-private-as")
+                if peer.remove_private_as_mode:
+                    self.report.add("bgp", label, Severity.APPROX, "bgp-remove-private",
+                                    f"remove-private-as {peer.remove_private_as_mode} is written as remove-private-as: "
+                                    "AOS-CX takes out the private AS numbers at the start of the path only")
+            if peer.local_as:
+                lines.append(f"{pre} local-as {peer.local_as}" +
+                             (f" {peer.local_as_options}" if peer.local_as_options else ""))
+            if peer.ttl_security is not None:
+                lines.append(f"{pre} ttl-security-hops {peer.ttl_security}")
         for af in ("ipv4", "ipv6"):
             body: List[str] = []
             for peer in neighbors:
@@ -912,6 +1069,9 @@ class Writer:
                         body.append(f"neighbor {peer.address} send-community standard")
                     if peer.route_reflector_client:
                         body.append(f"neighbor {peer.address} route-reflector-client")
+                    if peer.maximum_prefix:
+                        body.append(f"neighbor {peer.address} maximum-prefix {peer.maximum_prefix}" +
+                                    (f" {peer.maximum_prefix_warning}" if peer.maximum_prefix_warning else ""))
                     if peer.allowas_in is not None:
                         body.append(f"neighbor {peer.address} allowas-in" +
                                     (f" {peer.allowas_in}" if peer.allowas_in else ""))
@@ -921,6 +1081,7 @@ class Writer:
                             if name:
                                 body.append(f"neighbor {peer.address} {kind} {name} {direction}")
             body += [f"network {p}" for p in networks if (":" in p) == (af == "ipv6")]
+            body += fabric.aggregate_lines(list(aggregates), af)
             for r in redistribute6 if af == "ipv6" else redistribute:
                 rm = maps.get(r) if af == "ipv4" else None
                 body.append(f"redistribute {r}" + (f" route-map {rm}" if rm else ""))
@@ -943,6 +1104,9 @@ class Writer:
             lines.append(f"ip ospf network {iface.ospf_network}")
         if iface.ospf_bfd and not any(p.bfd_all for p in self.device.ospf):
             lines.append("ip ospf bfd")
+        label = f"{iface.source_name or iface.name} -> {self.port(iface.name)}"
+        lines += aoscxrouting.ospf_auth_lines(
+            iface, lambda severity, code, message: self.report.add("interface", label, severity, code, message))
         return lines + bfd_text.separate_lines(iface)
 
     def _layer2(self, iface: Interface, add: _Add) -> List[str]:
@@ -966,12 +1130,32 @@ class Writer:
             lines.append(f"vlan trunk allowed {iface.allowed_vlans or 'all'}")
         return lines
 
+    def _anycast(self, iface: Interface, add: _Add) -> List[str]:
+        """The anycast gateway (EOS ip address virtual) as the active gateway, with the shared MAC."""
+        lines: List[str] = []
+        mac = self.device.anycast_mac
+        for family, virtual in (("ip", iface.virtual_ipv4), ("ipv6", iface.virtual_ipv6)):
+            if not virtual:
+                continue
+            if mac:
+                lines.append(f"active-gateway {family} mac {mac}")
+            else:
+                add(Severity.REVIEW, "anycast-mac",
+                    f"the source names no shared MAC; add 'active-gateway {family} mac' with the fabric's MAC")
+            lines += [f"active-gateway {family} {ipaddress.ip_interface(v).ip}" for v in virtual]
+        if iface.virtual_ipv4 or iface.virtual_ipv6:
+            add(Severity.APPROX, "anycast",
+                "the anycast gateway is the AOS-CX active gateway; where the source had no address of its own the "
+                "interface takes the gateway address too, as in the AOS-CX EVPN design")
+        return lines
+
     def _addresses(self, iface: Interface, add: _Add) -> List[str]:
         lines: List[str] = []
         mgmt = iface.kind == InterfaceKind.MANAGEMENT
         if iface.dhcp_client:
             lines.append("ip dhcp")
-        for n, cidr in enumerate(iface.ipv4):
+        own = iface.ipv4 or iface.virtual_ipv4
+        for n, cidr in enumerate(own if not mgmt else iface.ipv4):
             if mgmt:
                 if n == 0:
                     lines.append(f"ip static {cidr}")
@@ -979,10 +1163,32 @@ class Writer:
                     add(Severity.REVIEW, "mgmt-secondary", f"the management port takes one address; {cidr} left out")
             else:
                 lines.append(f"ip address {cidr}" + (" secondary" if n else ""))
-        for cidr in iface.ipv6:
+        for cidr in iface.ipv6 or iface.virtual_ipv6:
             lines.append(f"ipv6 address {cidr}")
+        if iface.proxy_arp:
+            lines.append("ip proxy-arp")
+        if iface.urpf:
+            add(Severity.APPROX, "urpf", f"AOS-CX has no unicast RPF check on an interface ({iface.urpf}); left out")
+        for attr, word in (("ip_redirects", "redirects"), ("ip_unreachables", "unreachables")):
+            if getattr(iface, attr) is False:
+                add(Severity.APPROX, "icmp", f"ICMP {word} are switched off for the whole switch: AOS-CX has no "
+                                             "per-interface setting")
+        if iface.mac_address:
+            add(Severity.APPROX, "svi-mac", f"AOS-CX routes with the switch's own MAC; {iface.mac_address} is left "
+                                            "out (the active gateway MAC is the shared one)")
+        if iface.autostate is False:
+            add(Severity.APPROX, "autostate", "AOS-CX has no autostate switch: a VLAN interface follows its VLAN")
+        if iface.unnumbered:
+            add(Severity.REVIEW, "unnumbered", f"AOS-CX takes no unnumbered address (from {iface.unnumbered}); give "
+                                               "the interface an address of its own")
         for helper in iface.helper_addresses:
-            lines.append(f"ip helper-address {helper}")
+            lines.append(f"ip helper-address {helper}" + (f" vrf {self.vrf(iface.helper_vrf)}"
+                                                          if iface.helper_vrf else ""))
+        if iface.helper_addresses and iface.helper_source:
+            add(Severity.REVIEW, "relay-source",
+                f"AOS-CX relays from the address of the interface the request came in on; the source interface "
+                f"{iface.helper_source} is left out")
+        lines += self._anycast(iface, add)
         if mgmt:
             for route in self.mgmt_gateways:
                 if (":" in route.prefix) == (":" in route.next_hop):
@@ -1008,6 +1214,8 @@ class Writer:
                     words.append(self.port(route.interface))
             if route.distance is not None:
                 words += ["distance", str(route.distance)]
+            if route.tag is not None:
+                words += ["tag", str(route.tag)]
             if route.vrf:
                 words += ["vrf", self.vrf(route.vrf)]
             if route.name:

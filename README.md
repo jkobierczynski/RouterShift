@@ -52,18 +52,30 @@ The DNS client (lookup switch, search domains, source interface, static hosts) a
 (on/off, priority, power limit) convert as far as each platform has the setting.
 VXLAN (VTEP source, VLAN and VRF VNIs, static flood lists) and BGP EVPN (neighbors, advertised VLANs)
 convert between IOS, EOS and AOS-CX, and are flagged on AOS-S and Comware.
-Juniper Junos reads and writes the core of a switch or router configuration, in either the curly-brace
-form or `display set` lines: system settings (hostname, DNS, NTP with keys, syslog, time zone, banner, SSH,
-local users), SNMP communities, VLANs, ports and aggregates with LACP, access and trunk ports, irb, loopback and
-management interfaces, subinterfaces, IPv4/IPv6 addresses, VRFs (routing instances with RD and route targets),
-static routes, OSPF, BGP (groups, EVPN family), LLDP and spanning tree (RSTP, MSTP, VSTP). Every other feature
-read from another platform is listed in the report as "not written for Junos yet".
-Cisco NX-OS reads through the IOS reader (with its own blocks: features, vrf context, neighbor blocks, hsrp and
-vrrp blocks, use-vrf) and writes the system settings, users, SNMP communities, VLANs, ports, port-channels, SVIs,
-the management port in VRF management, VRFs and their static routes, ACLs, prefix lists and route maps, HSRP and
-VRRP, DHCP relay, storm control, OSPF (interface-based, VRFs in the process), BGP (neighbor blocks, EVPN family),
-spanning tree (rapid PVST+, MST), LLDP and the vty settings. Everything else is reported as "not written for
-NX-OS yet".
+Juniper Junos reads and writes a switch or router configuration to the same depth as IOS and EOS, in either the
+curly-brace form or `display set` lines: besides the core (system, users, SNMP, VLANs, ports and aggregates,
+irb/loopback/management units, VRFs, static routes, OSPF, BGP, LLDP, spanning tree) it covers firewall filters and
+policy statements, VRRP and anycast gateways, DHCP relay and server, layer 2 security, AAA and 802.1X, EVPN/VXLAN,
+MC-LAG, route leaking, multicast, class of service, control-plane protection and MACsec, sFlow, J-Flow and
+analyzers, SNMPv3 and login classes, PTP and event policies, BFD, ECMP hashing, OSPF options, filter-based
+forwarding for PBR, RIP, IS-IS, MPLS/LDP and GRE tunnels. What Junos has no form for (an EOS route distinguisher
+per EVPN instance, a BFD slow timer, NAT and IPsec on a switch, ...) is written as the nearest construct or left
+out, and the report says which.
+HPE Aruba AOS-CX reads and writes to the same depth as well: besides the switch core it covers anycast gateways
+(active gateway), DHCP relay to another VRF, community and AS-path lists, EVPN instances with their route targets,
+VSX options and VSF stacks, VRF route targets for EVPN and route leaking, BGP options (timers, graceful restart,
+distance, best-path, aggregates, prefix limits), rendezvous points per VRF and MSDP, the DSCP map and schedule
+profiles, control-plane ACLs and CoPP classes, MACsec and MKA policies, MAC ACLs, LLDP options, tracked objects,
+banners, user groups and SSH keys, the REST API, syslog over TLS, PTP, OSPF authentication and timers, GRE tunnels
+and policy-based routing as classifier policies. What AOS-CX has no form for (RIP, IS-IS, MPLS, NAT, IPsec, event
+handlers, TWAMP, SNMP views, ...) is left out and reported, and the nearest construct is flagged as approximated.
+Cisco NX-OS reads and writes to the same depth too: AAA servers and lists, 802.1X, DHCP snooping, port security,
+SNMPv3, community and AS-path lists, VXLAN and EVPN with the anycast gateway, vPC and ethernet segments, VRF route
+targets and leaking, BGP templates and options, IGMP snooping, PIM rendezvous points, anycast RP and MSDP, QoS and
+queuing policies, CoPP, MACsec, MAC ACLs, NAT, SPAN, sFlow, NetFlow, IP SLA and tracking, banners, local logging,
+syslog over TLS, roles, SSH keys, NX-API, PTP, EEM applets, OSPF authentication and options, BFD, ECMP hashing, RIP,
+IS-IS, MPLS/LDP, GRE tunnels and PBR. What NX-OS has no form for (the DHCP server, PoE, IPsec, TWAMP, ...) is left
+out and reported, and the nearest construct is flagged as approximated.
 BGP covers IOS XE peer templates (written into each neighbor), BGP inside VRFs (IOS `address-family ipv4 vrf`, EOS,
 NX-OS and AOS-CX `vrf`, Comware `ip vpn-instance`), session passwords, timers, route-reflector clients, prefix
 limits, allowas-in, remove-private-as and maximum-paths.

@@ -104,7 +104,12 @@ class PortMapper:
         self._assign()
 
     def __call__(self, canonical_name: str) -> str:
-        return self._names.get(canonical_name, canonical_name)
+        found = self._names.get(canonical_name)
+        if found is None and self.target == "nxos":  # an interface the device does not define, named all the same
+            _, kind, _ = canonical(canonical_name)
+            if kind in (InterfaceKind.LAG, InterfaceKind.LOOPBACK, InterfaceKind.MANAGEMENT):
+                return self._nxos_logical(Interface(canonical_name, kind))
+        return found if found is not None else canonical_name
 
     def _override(self, iface: Interface) -> Optional[str]:
         for key in (iface.source_name, iface.name):
@@ -221,7 +226,7 @@ class PortMapper:
 
     def _aoscx_logical(self, iface: Interface) -> str:
         name = iface.name
-        for prefix, word in (("Port-channel", "lag"), ("Vlan", "vlan"), ("Loopback", "loopback")):
+        for prefix, word in (("Port-channel", "lag"), ("Vlan", "vlan"), ("Loopback", "loopback"), ("Tunnel", "tunnel")):
             if name.startswith(prefix) and iface.kind != InterfaceKind.SUBINTERFACE:
                 return f"{word} {name[len(prefix):]}"
         if iface.kind == InterfaceKind.MANAGEMENT:
@@ -241,6 +246,8 @@ class PortMapper:
             return f"lo0.{name[len('Loopback'):]}"
         if iface.kind == InterfaceKind.MANAGEMENT:
             return "me0"
+        if iface.kind == InterfaceKind.TUNNEL and name[len("Tunnel"):].isdigit():
+            return f"{'st0' if iface.tunnel_mode == 'ipsec' or iface.tunnel_profile else 'gr-0/0/0'}.{name[len('Tunnel'):]}"
         if iface.kind == InterfaceKind.SUBINTERFACE and iface.parent:
             return f"{self(iface.parent)}.{name.rsplit('.', 1)[1]}"
         return name

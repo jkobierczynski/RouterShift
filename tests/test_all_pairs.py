@@ -200,7 +200,8 @@ def test_converts_and_reads_back(source: str, target: str) -> None:
                                                                          and target not in ("ios", "comware"))
     assert m2.http == (None if target in ("aoscx", "eos") else m1.http)
     # RESTCONF, the IOS stand-in for the EOS eAPI, runs on the HTTPS server
-    assert m2.https == (None if target == "eos" else True if target == "ios" and "http" in m1.apis else m1.https)
+    assert m2.https == (None if target == "eos" else
+                        True if target in ("ios", "aoscx") and "http" in m1.apis else m1.https)
     assert m2.vty_acl == (safe_name(m1.vty_acl) if target in ("ios", "eos") else "")
     assert m2.lldp == (None if target == "aoscx" and m1.lldp else m1.lldp)
     assert m2.cdp == (m1.cdp if target in ("ios", "aoss") else None)
@@ -411,11 +412,12 @@ def test_converts_and_reads_back(source: str, target: str) -> None:
                               for s in dev.ip_slas.values())
     assert slas(back) == (slas(first) if target in ("ios", "comware") else [])
     kept = {t.name for t in first.tracks.values()
-            if target in ("ios", "comware") or target == "eos" and t.interface}
+            if target in ("ios", "comware") or target in ("eos", "aoscx") and t.interface}
+    delays = target not in ("eos", "aoscx")
     tracks = lambda ts, delays: sorted((t.sla != "", t.delay_up if delays else None,  # noqa: E731
                                         t.delay_down if delays else None) for t in ts)
-    assert tracks(back.tracks.values(), target != "eos") == \
-        tracks([t for t in first.tracks.values() if t.name in kept], target != "eos")
+    assert tracks(back.tracks.values(), delays) == \
+        tracks([t for t in first.tracks.values() if t.name in kept], delays)
     routed = lambda dev: sum(1 for r in dev.static_routes if r.track)  # noqa: E731
     if target in ("ios", "comware"):
         assert routed(back) == sum(1 for r in first.static_routes if r.track in kept)
@@ -423,7 +425,10 @@ def test_converts_and_reads_back(source: str, target: str) -> None:
         assert routed(back) == 0
     decrements = lambda dev, names=None: sorted(dec for i in dev.interfaces.values() for g in i.fhrp  # noqa: E731
                                                 for t, dec in g.tracks.items() if names is None or t in names)
-    assert decrements(back) == decrements(first, kept)
+    if target == "aoscx":  # AOS-CX takes a group down instead of lowering its priority
+        assert len(decrements(back)) == len(decrements(first, kept))
+    else:
+        assert decrements(back) == decrements(first, kept)
     # the DNS client keeps lookup off (IOS), search domains (not AOS-S), source interface (IOS, EOS, Comware) and static
     # hosts (not AOS-S); PoE ports keep off (Comware: off by default), priority (the nearest the target has) and limit
     # (IOS, EOS, Comware)

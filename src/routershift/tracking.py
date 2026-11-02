@@ -13,10 +13,10 @@ from .model import Device, IpSla, Track
 from .report import Report, Severity
 
 KIND = "track"
-SLA_PLATFORMS = ("ios", "comware")  # IP SLA / NQA
-TRACK_PLATFORMS = ("ios", "eos", "comware")
-ROUTE_TRACK_PLATFORMS = ("ios", "comware")
-NUMBERED = ("ios", "comware")  # the others name their tracked objects
+SLA_PLATFORMS = ("ios", "comware", "nxos")  # IP SLA / NQA
+TRACK_PLATFORMS = ("ios", "eos", "comware", "aoscx", "nxos")
+ROUTE_TRACK_PLATFORMS = ("ios", "comware", "nxos")
+NUMBERED = ("ios", "comware", "aoscx", "nxos")  # the others name their tracked objects
 DEFAULT_DECREMENT = 10
 
 
@@ -67,7 +67,7 @@ def plan(device: Device, report: Report, platform: str, label: str) -> Plan:
         if platform not in SLA_PLATFORMS:
             report.skip(KIND, sla_label(sla), "sla-unsupported", f"{label} has no IP SLA probes; left out")
             continue
-        out.slas[sla.name] = sla_numbers[sla.name] if platform == "ios" else sla.name
+        out.slas[sla.name] = sla_numbers[sla.name] if platform in ("ios", "nxos") else sla.name
         if out.slas[sla.name] != sla.name:
             report.add(KIND, sla_label(sla), Severity.APPROX, "sla-number", f"written as {out.slas[sla.name]}")
     track_numbers = _numbers(device.tracks, 1000)

@@ -25,6 +25,14 @@ from .. import monitor as monitor_text
 from .. import vxlan as vxlan_text
 from .. import acl as acl_text
 from .. import bfd as bfd_text
+from .. import aoscxfabric as fabric
+from .. import aoscxqos
+from .. import aoscxsec
+from .. import aoscxmon
+from .. import aoscxmgmt
+from .. import aoscxauto
+from .. import aoscxrouting
+from .. import multicast as multicast_text
 from .. import routemap as routemap_text
 from .. import bgp as bgp_text
 from .. import dhcp as dhcp_text
@@ -38,7 +46,7 @@ from .. import confparse
 from ..confparse import Node
 from ..errors import ParseError
 from ..model import (BgpVrf, Sflow, AaaGroup, AaaMethod, AaaServer, Acl, Device, LocalUser, DhcpPool, FhrpGroup, NtpKey, SnmpCommunity, SnmpHost, SnmpUser, Interface, InterfaceKind, LacpMode, Origin, Ospf, QosAction, QosClass,
-                     QosPolicy, StaticRoute, StpMode, SwitchportMode, Unparsed, Vlan, Mlag)
+                     QosPolicy, QosProfile, MacAcl, StaticRoute, StpMode, SwitchportMode, Unparsed, Vlan, Mlag)
 from .ioslike import _is_address, _vlan_ids
 
 MGMT_VRF = "mgmt"
@@ -82,6 +90,16 @@ class _Reader:
         self._auth_mode: Dict[str, str] = {}
         self._vxlan_source = ""  # interface vxlan: source ip, resolved to its interface at the end
         self._sflow_global = False  # sflow: every port samples unless ports name themselves
+        self._icmp_off: List[str] = []  # no ip icmp redirect|unreachable: said of every routed interface
+        self._gateways6: Dict[str, List[str]] = {}  # interface -> active-gateway ipv6 addresses
+        self._vsf_links: Dict[str, int] = {}  # vsf member link ports -> link number
+        self._schedule: Dict[str, str] = {}  # port -> the schedule profile it applies
+        self._user_keys: Dict[str, List[str]] = {}  # user -> authorized-key lines
+        self._user_groups: Dict[str, str] = {}  # user -> a user group of the switch's own
+        self._rest_api = False
+        self._ptp = aoscxauto.PtpReader(self.device)
+        self._pbr = aoscxrouting.PbrReader(self.device)
+        self._lldp: Dict[str, int] = {}  # lldp holdtime-multiplier and management address, resolved at the end
 
     def unparsed(self, node: Node, section: str = "") -> None:
         self.device.unparsed.append(Unparsed(node.line, node.text, section))
@@ -95,6 +113,8 @@ class _Reader:
         for banner in banners:
             if banner.kind == "motd":
                 self.device.system.banner_motd = banner.text
+            elif banner.kind == "exec":
+                self.device.system.banner_exec = banner.text
             else:
                 self.device.unparsed.append(Unparsed(banner.line, f"banner {banner.kind}", "banner"))
         handlers: Dict[str, Callable[[Node], bool]] = {
@@ -121,16 +141,36 @@ class _Reader:
             "aaa": self.aaa,
             "class": self.qos_class,
             "policy": self.qos_policy,
-            "dhcpv4-snooping": lambda node: node.words == ["dhcpv4-snooping"] and self._snooping(),
+            "dhcpv4-snooping": self.snooping,
+            "radius": lambda node: node.words == ["radius", "dyn-authorization", "enable"] and self._coa(),
             "vsx": self.vsx,
+            "vsf": self.vsf,
+            "qos": self.qos,
+            "apply": lambda node: aoscxsec.control_plane_acl(self.device, node.words),
+            "copp-policy": lambda node: len(node.words) == 2 and self.policy_node(
+                node, aoscxsec.copp_policy(self.device, [c.words for c in node.children])),
+            "macsec": lambda node: node.words[:2] == ["macsec", "policy"] and len(node.words) == 3 and
+            self.policy_node(node, aoscxsec.macsec_policy(self.device, node.words[2], [c.words for c in node.children])),
+            "mka": lambda node: node.words[:2] == ["mka", "policy"] and len(node.words) == 3 and
+            self.policy_node(node, aoscxsec.mka_policy(self.device, node.words[2], [c.words for c in node.children])),
             "mirror": self.mirror,
             "evpn": self.evpn,
             "sflow": self.sflow,
             "ssh": self.server,
             "https-server": self.server,
             "cli-session": self.cli_session,
-            "lldp": lambda node: node.words == ["lldp"] and self._set_lldp(True),
-            "no": lambda node: node.words == ["no", "lldp"] and self._set_lldp(False),
+            "lldp": lambda node: node.words == ["lldp"] and self._set_lldp(True) or
+            aoscxmon.read_lldp(self.device, node.words, self._lldp),
+            "user-group": lambda node: len(node.words) == 2 and self.policy_node(
+                node, aoscxmgmt.read_user_group(self.device, node.words[1], [c.words for c in node.children])),
+            "password": self.password,
+            "pbr-action-list": lambda node: len(node.words) == 2 and self.policy_node(
+                node, self._pbr.action_list(node.words[1], [c.words for c in node.children])),
+            "ptp": lambda node: node.words == ["ptp", "profile", aoscxauto.PROFILE] and self.policy_node(
+                node, self._ptp.profile([c.words for c in node.children])),
+            "track": lambda node: aoscxmon.read_track(self.device, node.words, lambda x: canonical(x)[0], node.line,
+                                                      node.text),
+            "no": self.no,
         }
         for node in roots:
             if node.text.startswith(_NOISE):
@@ -211,6 +251,8 @@ class _Reader:
             return True
         if w[1:2] == ["route"]:
             return self.route(node, w[2:])
+        if w[1] in ("community-list", "aspath-list"):
+            return routemap_text.aoscx_list(self.device, w)
         return False
 
     def ipv6(self, node: Node) -> bool:
@@ -302,16 +344,20 @@ class _Reader:
     def user(self, node: Node) -> bool:
         """user U group G password plaintext|ciphertext X"""
         w = node.words
+        if aoscxmgmt.read_user_line(self.device, w, self._user_keys):
+            return True
         if len(w) != 7 or w[2] != "group" or w[4] != "password" or w[5] not in ("plaintext", "ciphertext"):
             return False
         privilege = aaa_text.privilege(w[3], AOSCX_ROLES)
+        if privilege is None:  # a user group of the switch's own
+            self._user_groups[w[1]] = w[3]
         user = LocalUser(w[1], privilege, origin=Origin(node.line, node.text))
         if w[5] == "plaintext":
             user.password = w[6]
         else:
             user.password_hash, user.hash_type = w[6], "aoscx-ciphertext"
         self.device.users.append(user)
-        return privilege is not None
+        return True
 
     def _key(self, args: List[str]) -> str:
         """key plaintext|ciphertext K: the key, '' when encrypted."""
@@ -396,6 +442,8 @@ class _Reader:
             else:
                 a.methods.append(AaaMethod(w[1], w[2], methods, w[3], 15 if w[2] == "commands" else None,
                                            origin=origin))
+                if w[1:4] == ["authentication", "login", "console"]:
+                    self.device.management.console_login = "console"  # the console's own list
             return True
         return False
 
@@ -422,6 +470,9 @@ class _Reader:
     def server(self, node: Node) -> bool:
         """ssh server vrf V, https-server vrf V."""
         w = node.words
+        if w == ["https-server", "rest", "access-mode", "read-write"]:
+            self._rest_api = True
+            return True
         args = w[2:] if w[:2] == ["ssh", "server"] else w[1:] if w[0] == "https-server" else []
         if len(args) != 2 or args[0] != "vrf":
             return False
@@ -431,6 +482,18 @@ class _Reader:
             m.vrf = "" if args[1] == "default" else args[1]
         return True
 
+    def password(self, node: Node) -> bool:
+        """password complexity / minimum-length N / enable."""
+        if node.words != ["password", "complexity"]:
+            return False
+        for child in node.children:
+            c = child.words
+            if c[0] == "minimum-length" and len(c) == 2 and c[1].isdigit():
+                self.device.management.password_min_length = int(c[1])
+            elif c != ["enable"]:
+                self.unparsed(child, node.text)
+        return True
+
     def cli_session(self, node: Node) -> bool:
         """cli-session with 'timeout M' (minutes)."""
         for child in node.children:
@@ -438,6 +501,31 @@ class _Reader:
                 self.device.management.exec_timeout = int(child.words[1])
             else:
                 self.unparsed(child, node.text)
+        return True
+
+    def no(self, node: Node) -> bool:
+        w = node.words
+        if w == ["no", "lldp"]:
+            return self._set_lldp(False)
+        if w[1:3] == ["ip", "icmp"] and len(w) == 4 and w[3] in ("redirect", "unreachable"):
+            self._icmp_off.append(w[3])
+            return True
+        if w[1:] == ["dhcpv4-snooping", "option", "82"]:
+            self.device.dhcp_option82 = False
+            return True
+        return False
+
+    def snooping(self, node: Node) -> bool:
+        w = node.words
+        if w == ["dhcpv4-snooping"]:
+            return self._snooping()
+        if w == ["dhcpv4-snooping", "option", "82"]:
+            self.device.dhcp_option82 = True
+            return True
+        return False
+
+    def _coa(self) -> bool:
+        self.device.aaa.coa = True
         return True
 
     def _snooping(self) -> bool:
@@ -450,8 +538,14 @@ class _Reader:
 
     def logging(self, node: Node) -> bool:
         args = self._service_vrf(node.words[1:])
-        if len(args) == 3 and args[1] == "severity" and mgmt_text.level(args[2]) is not None:
-            self.device.system.logging_level = mgmt_text.level(args[2])
+        if len(args) >= 3 and args[-2] == "severity" and mgmt_text.level(args[-1]) is not None:
+            self.device.system.logging_level = mgmt_text.level(args[-1])
+            args = args[:-2]
+        if len(args) in (2, 3) and args[1] in ("udp", "tcp", "tls") and _is_address(args[0]):
+            default = {"udp": 514, "tcp": 1470, "tls": 6514}[args[1]]
+            port = int(args[2]) if len(args) == 3 else default
+            if args[1] != "udp" or port != default:
+                self.device.system.syslog_transport[args[0]] = (args[1], port)
             args = args[:1]
         if len(args) == 1 and _is_address(args[0]):
             self.device.system.syslog_servers.append(args[0])
@@ -471,6 +565,8 @@ class _Reader:
             elif c[:2] == ["address-family", "ipv4"]:
                 for g in child.children:
                     gw = g.words[:-1] if g.words[-1:] == ["evpn"] else g.words
+                    if g.words[-1:] == ["evpn"]:
+                        vrfs_text.info(self.device, name).rt_evpn = True
                     if not (gw[0] == "route-target" and len(gw) == 3
                             and vrfs_text.route_target(vrfs_text.info(self.device, name), gw[1], gw[2])):
                         self.unparsed(g, child.text)
@@ -545,9 +641,8 @@ class _Reader:
                 route.vrf = rest.pop(0)
             elif word == "distance" and rest:
                 route.distance = int(rest.pop(0))
-            elif word == "tag" and rest:
-                rest.pop(0)
-                ok = False
+            elif word == "tag" and rest and rest[0].isdigit():
+                route.tag = int(rest.pop(0))
             elif word in ("blackhole", "reject", "nullroute"):
                 route.discard = True
             elif _is_address(word) and not route.next_hop:
@@ -564,6 +659,16 @@ class _Reader:
     def acl(self, node: Node) -> bool:
         """access-list ip NAME / access-list ipv6 NAME, entries "10 permit tcp 10.0.0.0/255.255.255.0 any eq 443"."""
         w = node.words
+        if len(w) == 3 and w[1] == "mac":
+            mac_acl = self.device.mac_acls.setdefault(w[2], MacAcl(w[2], origin=Origin(node.line, node.text)))
+            for child in node.children:
+                try:
+                    ok = aoscxsec.mac_acl_line(mac_acl, child.words)
+                except (ValueError, KeyError, IndexError):
+                    ok = False
+                if not ok:
+                    self.unparsed(child, node.text)
+            return True
         if len(w) != 3 or w[1] not in ("ip", "ipv6"):
             return False
         family = 6 if w[1] == "ipv6" else 4
@@ -593,6 +698,8 @@ class _Reader:
         self.device.qos_policies[policy.name] = policy
         for child in node.children:
             c = child.words
+            if self._pbr.policy_entry(policy.name, c):
+                continue
             action = QosAction(c[3]) if len(c) >= 4 and c[0].isdigit() and c[1:3] == ["class", "ip"] else None
             args = c[4:]
             while action is not None and args:
@@ -666,11 +773,17 @@ class _Reader:
         s = monitor_text.session(self.device, w[2], node.line, node.text)
         for child in node.children:
             c = child.words
-            if c[:2] == ["source", "interface"] and len(c) in (3, 4) and \
-                    (len(c) == 3 or monitor_text.direction(c[3]) is not None):
-                s.sources[canonical(c[2])[0]] = monitor_text.direction(c[3]) or "both" if len(c) == 4 else "both"
-            elif c[:2] == ["destination", "interface"] and len(c) == 3:
-                s.destination = canonical(c[2])[0]
+            if c[:2] in (["source", "interface"], ["destination", "interface"]) and len(c) >= 3:
+                rest = c[2:]
+                way = monitor_text.direction(rest[-1]) if c[0] == "source" and len(rest) > 1 else None
+                name = " ".join(rest[:-1] if way is not None else rest)  # "1/1/1", or "lag 30"
+                if len(name.split()) > 2 or c[0] == "source" and len(rest) > 1 and way is None and \
+                        not name.startswith("lag"):
+                    self.unparsed(child, node.text)
+                elif c[0] == "source":
+                    s.sources[canonical(name)[0]] = way or "both"
+                else:
+                    s.destination = canonical(name)[0]
             elif c in (["enable"], ["comment"]) or c[0] == "comment":
                 pass
             else:
@@ -708,15 +821,40 @@ class _Reader:
         w = node.words
         if w == ["router", "vrrp", "enable"]:
             return True  # implied by the groups
-        if w == ["router", "pim"]:
+        if w[:2] == ["router", "pim"] and len(w) in (2, 4) and w[2:3] in ([], ["vrf"]):
+            vrf = w[3] if len(w) == 4 else ""
+            rps, rp_groups = (self.device.pim_rps, self.device.pim_rp_groups) if not vrf else \
+                (multicast_text.vrf(self.device, vrf).rps, multicast_text.vrf(self.device, vrf).rp_groups)
             for child in node.children:
                 c = child.words
                 if c == ["enable"]:
-                    self.device.multicast_routing = True
-                elif c[0] == "rp-address" and len(c) == 2:
-                    self.device.pim_rps.append(str(ipaddress.IPv4Address(c[1])))
+                    if vrf:
+                        multicast_text.vrf(self.device, vrf).routing = True
+                    else:
+                        self.device.multicast_routing = True
+                elif c[0] == "rp-address" and len(c) in (2, 3):
+                    rp = str(ipaddress.IPv4Address(c[1]))
+                    rps.append(rp)
+                    if len(c) == 3:
+                        rp_groups[rp] = str(ipaddress.IPv4Network(c[2]))
                 else:
                     self.unparsed(child, node.text)
+            return True
+        if w == ["router", "msdp"]:
+            for child in node.children:
+                c = child.words
+                if c == ["enable"]:
+                    continue
+                if c[:3] != ["ip", "msdp", "peer"] or len(c) != 4:
+                    self.unparsed(child, node.text)
+                    continue
+                source = ""
+                for g in child.children:
+                    if g.words[0] == "connect-source" and len(g.words) >= 2:
+                        source = canonical(" ".join(g.words[1:]))[0]
+                    elif g.words != ["enable"]:
+                        self.unparsed(g, f"{node.text} / {child.text}")
+                self.device.msdp_peers[str(ipaddress.IPv4Address(c[3]))] = source
             return True
         if w[1:2] == ["ospf"] and len(w) in (3, 5) and (len(w) == 3 or w[3] == "vrf"):
             vrf = w[4] if len(w) == 5 else ""
@@ -747,6 +885,7 @@ class _Reader:
             v.neighbors = vb.finish().neighbors
             v.networks, v.redistribute, v.redistribute_maps = vb.bgp.networks, vb.bgp.redistribute, \
                 vb.bgp.redistribute_maps
+            v.redistribute6, v.aggregates = vb.bgp.redistribute6, vb.bgp.aggregates
             self.device.bgp.vrfs[name] = v
 
     def _bgp_block(self, b: bgp_text.Builder, children: List[Node], section: str,
@@ -808,6 +947,10 @@ class _Reader:
         if w[0] == "maximum-paths" and n == 2 and not af:
             b.bgp.maximum_paths = int(w[1])
             return True
+        if not af and fabric.read_bgp_global(b.bgp, w):
+            return True
+        if w[0] == "aggregate-address" and af in ("ipv4", "ipv6"):
+            return bgp_text.read_aggregate(b.bgp.aggregates, w[1:])
         if w[0] != "neighbor" or n < 3:
             return False
         peer = b.peer(w[1])
@@ -840,6 +983,13 @@ class _Reader:
             peer.route_reflector_client = True
         elif args == ["remove-private-as"]:
             peer.remove_private_as = True
+        elif args[0] == "local-as" and len(args) >= 2:
+            peer.local_as, peer.local_as_options = args[1], " ".join(args[2:])
+        elif args[0] == "ttl-security-hops" and len(args) == 2:
+            peer.ttl_security = int(args[1])
+        elif args[0] == "maximum-prefix" and len(args) in (2, 3):
+            peer.maximum_prefix = int(args[1])
+            peer.maximum_prefix_warning = int(args[2]) if len(args) == 3 else None
         elif args[0] == "allowas-in" and len(args) in (1, 2):
             peer.allowas_in = int(args[1]) if len(args) == 2 else 0
         elif routemap_text.neighbor_policy(peer, args):
@@ -851,6 +1001,8 @@ class _Reader:
     @staticmethod
     def ospf_line(p: Ospf, w: List[str]) -> bool:
         n = len(w)
+        if aoscxrouting.read_ospf_line(p, w):
+            return True
         if w[0] == "router-id" and n == 2:
             p.router_id = str(ipaddress.IPv4Address(w[1]))
         elif w == ["passive-interface", "default"]:
@@ -885,6 +1037,44 @@ class _Reader:
             elif c[:2] == ["keepalive", "peer"] and len(c) in (5, 7) and c[3] == "source" and c[5:6] in ([], ["vrf"]):
                 m.peer_address = c[2]
                 self._vsx_source = c[4]
+            elif fabric.read_vsx_line(m, c):
+                pass
+            else:
+                self.unparsed(child, node.text)
+        return True
+
+    def qos(self, node: Node) -> bool:
+        """qos dscp-map D local-priority N; qos schedule-profile NAME with strict and dwrr queues."""
+        w = node.words
+        if w[:2] == ["qos", "schedule-profile"] and len(w) == 3:
+            profile = self.device.qos_profiles.setdefault(w[2], QosProfile(w[2], origin=Origin(node.line, node.text)))
+            for child in node.children:
+                try:
+                    ok = aoscxqos.read_schedule_line(profile, child.words)
+                except ValueError:
+                    ok = False
+                if not ok:
+                    self.unparsed(child, node.text)
+            return True
+        return aoscxqos.read_dscp_map(self.device, w)
+
+    def vsf(self, node: Node) -> bool:
+        """vsf member N with link L PORTS, and vsf split-detect mgmt: a stack of two switches."""
+        w = node.words
+        if w == ["vsf", "split-detect", "mgmt"]:
+            return True  # VSF's own detection, over the management port
+        if w[:2] != ["vsf", "member"] or len(w) != 3 or not w[2].isdigit():
+            return False
+        m = self.device.mlag or Mlag()
+        self.device.mlag = m
+        m.stack = True
+        for child in node.children:
+            c = child.words
+            if c[0] == "link" and len(c) == 3 and c[1].isdigit():
+                for port in c[2].split(","):
+                    self._vsf_links[canonical(port)[0]] = int(c[1])
+            elif c[0] == "type" and len(c) == 2:
+                pass
             else:
                 self.unparsed(child, node.text)
         return True
@@ -922,14 +1112,12 @@ class _Reader:
         """evpn / vlan N with rd auto and route-target export|import|both auto."""
         if node.words != ["evpn"]:
             return False
-        auto = (["rd", "auto"], ["route-target", "export", "auto"], ["route-target", "import", "auto"],
-                ["route-target", "both", "auto"], ["redistribute", "host-route"])
         for child in node.children:
             c = child.words
             if c[0] == "vlan" and len(c) == 2 and c[1].isdigit():
                 vxlan_text.vtep(self.device).evpn_vlans.append(int(c[1]))
                 for line in child.children:
-                    if line.words not in auto:
+                    if not fabric.read_evpn_line(self.device, int(c[1]), line.words):
                         self.unparsed(line, f"{node.text} / {child.text}")
             else:
                 self.unparsed(child, node.text)
@@ -983,6 +1171,9 @@ class _Reader:
         if w[:1] == ["client-limit"] and len(w) == 2:
             self._client_limit[iface.name] = int(w[1])
             return True
+        if w[:1] == ["reject-vlan"] and len(w) == 2:
+            iface.dot1x_fail_vlan = int(w[1])
+            return True
         if w[:1] == ["auth-mode"] and len(w) == 2 and w[1] in ("client-mode", "device-mode", "multi-domain"):
             self._auth_mode[iface.name] = w[1]
             return True
@@ -1030,6 +1221,8 @@ class _Reader:
                 group.shutdown = True
             elif w == ["no", "shutdown"]:
                 group.shutdown = False
+            elif aoscxmon.vrrp_track(group.tracks, w):
+                pass
             else:
                 self.unparsed(child, node.text)
 
@@ -1051,6 +1244,15 @@ class _Reader:
             group.mac = fhrp.mac(w[2])
             return True
         return len(w) == 1
+
+    def _active_gateway6(self, iface: Interface, w: List[str]) -> bool:
+        if w[0] == "mac" and len(w) == 2:
+            self.device.anycast_mac = self.device.anycast_mac or fhrp.mac(w[1])
+            return True
+        if len(w) == 1:
+            self._gateways6.setdefault(iface.name, []).append(str(ipaddress.ip_address(w[0])))
+            return True
+        return False
 
     def interface_line(self, iface: Interface, w: List[str]) -> bool:
         n = len(w)
@@ -1108,6 +1310,12 @@ class _Reader:
             setattr(iface, f"acl{'6' if w[2] == 'ipv6' else ''}_{w[4].replace('routed-', '')}", w[3])
         elif w[:2] == ["apply", "policy"] and n == 4 and w[3] in ("in", "out", "routed-in", "routed-out"):
             setattr(iface, f"qos_policy_{w[3].replace('routed-', '')}", w[2])
+        elif aoscxsec.interface_line(self.device, iface, w) or aoscxauto.PtpReader.interface_line(iface, w) or \
+                aoscxrouting.read_ospf_interface(iface, w) or \
+                iface.kind == InterfaceKind.TUNNEL and aoscxrouting.read_tunnel_line(iface, w):
+            pass
+        elif w[:3] == ["apply", "qos", "schedule-profile"] and n == 4:
+            self._schedule[iface.name] = w[3]
         elif w[:2] == ["qos", "trust"] and n == 3 and w[2] in ("dscp", "cos", "none"):
             iface.qos_trust = w[2]
         elif w in (["dhcpv4-snooping", "trust"], ["arp", "inspection", "trust"]):
@@ -1119,8 +1327,13 @@ class _Reader:
         elif w[:2] == ["ip", "helper-address"] and n >= 3:
             iface.helper_addresses.append(w[2])
             if n == 5 and w[3] == "vrf":
-                return False  # relay through another VRF: not in the model
+                iface.helper_vrf = w[4]
+                return True
             return n == 3
+        elif w == ["ip", "proxy-arp"]:
+            iface.proxy_arp = True
+        elif w[:2] == ["active-gateway", "ipv6"] and n >= 3:
+            return self._active_gateway6(iface, w[2:])
         elif w[0] == "default-gateway" and n == 2:  # mgmt
             self.device.static_routes.append(StaticRoute("0.0.0.0/0" if ":" not in w[1] else "::/0",
                                                          next_hop=w[1], vrf=iface.vrf or MGMT_VRF))
@@ -1183,8 +1396,44 @@ class _Reader:
         iface.duplex = duplex
         return True
 
+    def _anycast(self) -> None:
+        """An active gateway on the interface's own address is the anycast gateway (EOS ip address virtual)."""
+        d = self.device
+        for iface in d.interfaces.values():
+            for g in [g for g in iface.fhrp if g.protocol == "anycast"]:
+                own = [a for a in iface.ipv4 if str(ipaddress.ip_interface(a).ip) in [g.address] + g.secondary]
+                if not own or len(own) != len([g.address] + g.secondary):
+                    continue
+                iface.fhrp.remove(g)
+                iface.virtual_ipv4 = own
+                iface.ipv4 = [a for a in iface.ipv4 if a not in own]
+                if g.mac:
+                    d.anycast_mac = d.anycast_mac or g.mac
+            gateways = self._gateways6.get(iface.name, [])
+            own6 = [a for a in iface.ipv6 if str(ipaddress.ip_interface(a).ip) in gateways]
+            if own6:
+                iface.virtual_ipv6 = own6
+                iface.ipv6 = [a for a in iface.ipv6 if a not in own6]
+            for address in gateways:
+                if not any(str(ipaddress.ip_interface(a).ip) == address for a in own6):
+                    d.unparsed.append(Unparsed(iface.origin.line, f"active-gateway ipv6 {address}",
+                                               "an IPv6 active gateway the interface does not hold"))
+            for word in self._icmp_off:
+                if iface.ipv4 or iface.virtual_ipv4:
+                    setattr(iface, "ip_redirects" if word == "redirect" else "ip_unreachables", False)
+
     def _finish(self) -> None:
+        for name, link in self._vsf_links.items():
+            if name not in self.device.interfaces:
+                self.device.interfaces[name] = Interface(name, InterfaceKind.ETHERNET)
+            self.device.interfaces[name].svl_link = link
+        self._anycast()
         qos_text.adopt(self.device, self._class_acls)
+        aoscxqos.finish(self.device, self._schedule)
+        self._pbr.finish()
+        aoscxmon.finish_lldp(self.device, self._lldp)
+        aoscxmgmt.finish(self.device, self._user_keys, self._user_groups, self._rest_api)
+        self._ptp.finish()
         if self.device.vxlan is not None and self._vxlan_source:
             self.device.vxlan.source_interface = vxlan_text.interface_of(self.device, self._vxlan_source)
         if self._sflow_global and not monitor_text.sflow_ports(self.device):

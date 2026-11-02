@@ -15,20 +15,30 @@ OSPF, BGP, spanning tree and LLDP/CDP. Everything else is listed in the report a
 from __future__ import annotations
 
 import ipaddress
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 
 from .. import aaa as aaa_text
 from .. import acl as acl_text
 from .. import bgp as bgp_text
 from .. import fhrp
 from .. import hosts as hosts_text
+from .. import nxosaccess
+from .. import nxosfabric
+from .. import nxosmcast
+from .. import nxosqos
+from .. import nxossec
+from .. import nxosmon
+from .. import nxosmgmt
+from .. import nxosauto
+from .. import nxosrouting
+from .. import tracking as tracking_text
 from .. import ospf as ospf_text
 from .. import partial
 from .. import routemap as routemap_text
 from .. import snmp as snmp_text
 from .. import stp as stp_text
 from .. import vrfs as vrfs_text
-from ..model import (BgpNeighbor, Device, FhrpGroup, Interface, InterfaceKind, LacpMode, Ospf, StaticRoute, StpMode,
+from ..model import (Bgp, BgpNeighbor, Device, FhrpGroup, Interface, InterfaceKind, LacpMode, Ospf, StaticRoute, StpMode,
                      SwitchportMode)
 from ..names import PortMapper
 from ..report import Report, Severity
@@ -40,7 +50,9 @@ ROLES = [(15, "network-admin"), (0, "network-operator")]
 HASHES = ("md5-crypt", "sha256-crypt", "sha512-crypt")
 MGMT_VRF = "management"
 PERMIT_ALL = "RS-PERMIT-ALL"  # the route map NX-OS needs for redistribution where the source had none
-WRITTEN = {"acl", "policy", "dhcp-relay", "fhrp", "speed", "storm", "stp-guards"}
+WRITTEN = {"acl", "policy", "dhcp-relay", "fhrp", "speed", "storm", "stp-guards", "voice", "l2sec", "dot1x", "poe",
+           "dhcp", "aaa", "mlag", "vxlan", "multicast", "qos", "nat", "vpn", "monitor", "track",
+           "bfd", "isis", "rip", "mpls", "pbr"}
 _MGMT_NAMES = {"mgmt-vrf", "mgmt-intf", "management", "mgmt"}
 
 
@@ -56,9 +68,20 @@ class Writer:
         self.permit_all = False
         self.evpn = False  # nv overlay evpn, for the EVPN address family
         self.ospf_tags: Dict[int, str] = {}  # id of an Ospf -> the router ospf tag it is written under
+        self.l3: Dict[str, int] = {}  # VRF -> the VLAN of its layer 3 VNI
+        self.qos = nxosqos.Writer(device, report, IND)
+        self.track_plan = tracking_text.Plan()
+        self.mirror_ports = nxosmon.destinations(device)
+        self.key_chains: List[str] = []  # key chains of OSPF SHA authentication, written before the interfaces
+        self.redistributed: List[bool] = []  # RIP and IS-IS redistribution that needs the permit-all route map
 
     def vrf(self, name: str) -> str:
         return MGMT_VRF if name in self.mgmt_vrfs else name
+
+    def adder(self, label: str) -> nxosaccess.Add:
+        def add(severity: Severity, code: str, message: str) -> None:
+            self.report.add("interface", label, severity, code, message)
+        return add
 
     def label(self, iface: Interface) -> str:
         return f"{iface.source_name or iface.name} -> {self.port(iface.name)}"
@@ -66,29 +89,51 @@ class Writer:
     def emit(self) -> str:
         body: List[str] = []
         self.out = body
+        self.l3 = nxosfabric.l3vni_vlans(self.device, self.report)
+        self.track_plan = tracking_text.plan(self.device, self.report, "nxos", PLATFORM)
         self.system()
         self.users()
         self.snmp()
         self.acls()
         self.policies()
+        self.qos_lines()
+        self.out += nxossec.nat_lines(self.device, self.report, self.port, self.vrf, self.features)
+        tracking = nxosmon.tracking_lines(self.device, self.track_plan, self.port, self.vrf, IND, self.features)
+        tracking += nxosrouting.global_lines(self.device, self.report, self.features)
+        self.out += tracking + (["!"] if tracking else [])
         self.vlans()
         self.spanning_tree()
+        self.out += nxosfabric.vpc_lines(self.device, self.report, IND, self.vrf)
         self.vrfs()
         self.routes([r for r in self.device.static_routes if not r.vrf], "")
+        chains_at = len(self.out)
         for iface in self.device.interfaces.values():
             self.interface(iface)
+        if self.key_chains:
+            self.out[chains_at:chains_at] = self.key_chains + ["!"]
+        self.fabric()
+        self.monitoring()
         self.ospf()
+        self.igps()
         self.bgp()
         self.vty()
-        if self.permit_all:
+        if self.permit_all or self.redistributed:
             self.out += [f"route-map {PERMIT_ALL} permit 10", "!"]
         partial.device(self.device, self.report, PLATFORM, WRITTEN)
         self.report.unparsed(self.device.unparsed)
-        head = [f"feature {f}" for f in sorted(self.features)]
+        if self.device.mlag is not None and not self.device.mlag.stack:
+            self.features.add("vpc")
+        if self.device.vxlan is not None:
+            self.features |= {"nv overlay", "vn-segment-vlan-based"}
+        if nxosfabric.anycast_mac_lines(self.device):
+            self.features.add("fabric forwarding")
+        head = nxosrouting.mpls_head(self.device) + [f"feature {f}" for f in sorted(self.features)]
         if self.device.management.ssh is False:
             head.append("no feature ssh")
-        if self.evpn:
+        if self.evpn or (self.device.vxlan is not None and self.device.vxlan.evpn_vlans):
             head.append("nv overlay evpn")
+        if any(i.evpn_esi for i in self.device.interfaces.values()):
+            head.append("evpn esi multihoming")
         return "\n".join(head + (["!"] if head else []) + body) + "\n"
 
     # system ----------------------------------------------------------------------------------------------------------
@@ -102,10 +147,7 @@ class Writer:
         if sy.hostname:
             self.out.append(f"hostname {sy.hostname}")
             self.report.item("system", "hostname")
-        if sy.banner_motd:
-            delim = "#" if "#" not in sy.banner_motd else "%"
-            self.out += [f"banner motd {delim}", sy.banner_motd, delim]
-            self.report.item("system", "banner motd")
+        self.out += nxosmgmt.banner_lines(self.device, self.report)
         if sy.domain_name:
             self.out.append(f"ip domain-name {sy.domain_name}")
         for domain in sy.dns_search:
@@ -144,21 +186,24 @@ class Writer:
         for server in sy.syslog_servers:
             self.report.item("system", f"syslog {server}")
             level = f" {sy.logging_level}" if sy.logging_level is not None else ""
-            self.out.append(f"logging server {server}{level}{self.use_vrf()}")
+            transport = nxosmgmt.syslog_transport(self.device, server, self.report)
+            if transport and not level:
+                level = " 5"
+            self.out.append(f"logging server {server}{level}{transport}{self.use_vrf()}")
         if sy.logging_source and sy.syslog_servers:
             self.out.append(f"logging source-interface {self.port(sy.logging_source)}")
-        for name, source in sy.transfer_source.items():
-            self.report.skip("system", f"{name} source interface", partial.CODE,
-                             f"not written for NX-OS yet ({source}); configure it by hand")
+        self.out += nxosmgmt.logging_lines(self.device, self.report)
+        for name in sy.transfer_source:
+            self.report.item("system", f"{name} source interface")
+        self.out += nxosaccess.transfer_lines(self.device, self.port)
         m = self.device.management
         if m.telnet:
             self.features.add("telnet")
             self.report.item("management", "telnet")
         if m.ssh:
             self.report.item("management", "ssh")
-        if m.http or m.https:
-            self.report.skip("management", "web server", partial.CODE,
-                             "NX-OS has no HTTP management server; use NX-API (feature nxapi) by hand if needed")
+        self.out += nxosmgmt.api_lines(self.device, self.report, self.vrf, self.features)
+        self.out += nxosmgmt.password_lines(self.device, self.report)
         if m.lldp or any(not (i.lldp_tx and i.lldp_rx) for i in self.device.interfaces.values()):
             self.features.add("lldp")
             self.report.item("management", "LLDP")
@@ -171,6 +216,10 @@ class Writer:
         """NX-OS takes a name and an offset, as IOS does."""
         self.report.item("system", "time zone")
         minutes = offset_minutes(tz)
+        zone = nxosmgmt.timezone_lines(tz, self.report) if minutes is None else []
+        if zone:
+            self.out += zone
+            return
         if minutes is None:
             self.report.add("system", "time zone", Severity.REVIEW, "timezone",
                             f"NX-OS takes a fixed offset (clock timezone NAME H M); '{tz}' is not written, set it by "
@@ -182,6 +231,7 @@ class Writer:
         self.out.append(f"clock timezone {name} {sign}{abs(minutes) // 60} {abs(minutes) % 60}")
 
     def users(self) -> None:
+        self.out += nxosmgmt.role_lines(self.device, self.report, IND)
         for user in self.device.users:
             label = aaa_text.user_label(user)
             password = aaa_text.password(user, HASHES, self.report)
@@ -189,7 +239,7 @@ class Writer:
                 continue
             self.report.item("management", label)
             kind, value = password
-            role = aaa_text.role(user.privilege, ROLES)
+            role = nxosmgmt.user_role(self.device, user) or aaa_text.role(user.privilege, ROLES)
             if kind == "plain":
                 self.out.append(f"username {user.name} password {value} role {role}")
             elif kind in HASHES:
@@ -198,30 +248,17 @@ class Writer:
                 self.out.append(f"username {user.name} role {role}")
                 self.report.add("management", label, Severity.REVIEW, "no-password",
                                 "the user has no password in the source; set one")
+            self.out += nxosmgmt.ssh_key_lines(user, self.report, label)
         if self.device.aaa.enable_secret is not None:
             self.report.skip("management", "enable secret", "enable",
                              "NX-OS has no enable password; the role of each user sets what it may do")
 
     def snmp(self) -> None:
-        sn = self.device.snmp
-        if sn.location:
-            self.out.append(f"snmp-server location {sn.location}")
-        if sn.contact:
-            self.out.append(f"snmp-server contact {sn.contact}")
-        for c in sn.communities:
-            label = snmp_text.community_label(self.device, c)
-            self.report.item("management", label)
-            group = "network-admin" if c.access == "rw" else "network-operator"
-            self.out.append(f"snmp-server community {c.name} group {group}")
-            if c.acl:
-                self.report.add("management", label, Severity.REVIEW, partial.CODE,
-                                f"the manager list {c.acl} is not written for NX-OS yet (use-acl)")
-        rest = [what for what, stated in (("notification hosts", bool(sn.hosts or sn.traps)),
-                                          ("SNMPv3 users and groups", bool(sn.users or sn.groups)),
-                                          ("the source interface", bool(sn.source))) if stated]
-        if rest:
-            self.report.skip("management", "SNMP", partial.CODE,
-                             f"not written for NX-OS yet: {', '.join(rest)}; configure by hand")
+        self.out += nxosaccess.aaa_lines(self.device, self.report, IND, self.vrf, self.port, self.features)
+        self.out += nxosaccess.snmp_lines(self.device, self.report, self.vrf, self.port)
+        nxosaccess.unwritable(self.device, self.report)
+        nxossec.unwritable(self.device, self.report)
+        self.out.append("!")
 
     # ACLs and policies -----------------------------------------------------------------------------------------------
 
@@ -236,13 +273,37 @@ class Writer:
                                          icmp_names=True)
             self.out += [IND + line for line in lines]
             self.out.append("!")
+        for mac_acl in self.device.mac_acls.values():
+            self.out += nxossec.mac_acl_lines(mac_acl, self.report, IND)
+        self.out += nxossec.macsec_lines(self.device, self.report, IND, self.features)
 
     def policies(self) -> None:
         routemap_text.items(self.device, self.report)
         for pl in self.device.prefix_lists.values():
             self.out += routemap_text.ios_prefix_lines(pl, "ios")
+        self.out += routemap_text.ios_list_lines(self.device, "nxos", self.report)
         for rm in self.device.route_maps.values():
             self.out += routemap_text.ios_route_map_lines(rm, "nxos", self.report, IND)
+
+    def monitoring(self) -> None:
+        d, rep = self.device, self.report
+        lines = nxosauto.ptp_lines(d, rep, self.features)
+        lines += nxosmon.lldp_lines(d, rep)
+        lines += nxosmon.sflow_lines(d, rep, self.port, self.vrf, self.features)
+        lines += nxosmon.netflow_lines(d, rep, self.port, self.vrf, IND, self.features)
+        lines += nxosmon.mirror_lines(d, rep, self.port, IND)
+        nxosmon.unwritable(d, rep)
+        lines += nxosauto.eem_lines(d, rep, self.port, IND)
+        if lines:
+            self.out += lines + ["!"]
+
+    def qos_lines(self) -> None:
+        lines = nxosqos.class_lines(self.device, self.report, IND)
+        lines += self.qos.lines()
+        lines += nxosqos.policy_lines(self.device, self.report, IND)
+        lines += nxosqos.copp(self.device, self.report)
+        if lines:
+            self.out += lines + ["!"]
 
     # layer 2 ---------------------------------------------------------------------------------------------------------
 
@@ -254,11 +315,23 @@ class Writer:
                 self.out.append(f"{IND}name {vlan.name.replace(' ', '_')}")
             if vlan.shutdown:
                 self.out.append(f"{IND}shutdown")
-            if vlan.dhcp_snooping or vlan.arp_inspection or vlan.igmp_querier:
-                self.report.add("vlan", str(vid), Severity.REVIEW, partial.CODE,
-                                "DHCP snooping, ARP inspection and the IGMP querier are not written for NX-OS yet")
-        if self.device.vlans:
+            vni = nxosfabric.vlan_vni(self.device, vid)
+            if vni is not None:
+                self.out.append(f"{IND}vn-segment {vni}")
+        self.out += nxosfabric.l3vni_vlan_lines(self.device, self.l3, IND)
+        nxosfabric.trunk_groups(self.device, self.report)
+        if self.device.vlans or self.l3:
             self.out.append("!")
+        self.out += nxosfabric.anycast_mac_lines(self.device)
+        snooping = nxosmcast.snooping_lines(self.device, self.report, IND)
+        if snooping:
+            self.out += snooping + ["!"]
+        pim = nxosmcast.lines(self.device, self.report, self.port, self.features)
+        if pim:
+            self.out += pim + ["!"]
+        l2sec = nxosaccess.l2sec_lines(self.device, self.report, self.features)
+        if l2sec:
+            self.out += l2sec + ["!"]
 
     def spanning_tree(self) -> None:
         dev = self.device
@@ -303,16 +376,27 @@ class Writer:
             if info is not None and (info.rd or info.rt_import or info.rt_export) and name == MGMT_VRF:
                 self.report.add("system", f"vrf {sources[0]}", Severity.APPROX, "mgmt-vrf",
                                 "it becomes NX-OS VRF management, which takes no route distinguisher or route targets")
-            elif info is not None and (info.rd or info.rt_import or info.rt_export):
-                if info.rd:
-                    self.out.append(f"{IND}rd {info.rd}")
-                pairs = vrfs_text.targets(info)
-                if pairs:
-                    self.out.append(f"{IND}address-family ipv4 unicast")
-                    self.out += [f"{IND * 2}route-target {direction} {value}" for direction, value in pairs]
+            elif name != MGMT_VRF:
+                self.out += nxosfabric.vrf_lines(self.device, sources[0], info, self.report, IND,
+                                                 self._vrf_has_ipv6(sources[0]))
+                self.out += nxosmcast.vrf_lines(self.device, sources[0], self.report, IND)
             self.routes([r for r in self.device.static_routes if r.vrf and self.vrf(r.vrf) == name], IND)
         if names:
             self.out.append("!")
+
+    def _vrf_has_ipv6(self, vrf: str) -> bool:
+        d = self.device
+        if any(i.vrf == vrf and (i.ipv6 or i.virtual_ipv6) for i in d.interfaces.values()):
+            return True
+        v = d.bgp.vrfs.get(vrf) if d.bgp is not None else None
+        return v is not None and bool(v.redistribute6 or any(":" in n for n in v.networks))
+
+    def fabric(self) -> None:
+        self.out += nxosfabric.l3vni_interfaces(self.device, self.l3, IND, self.vrf)
+        self.out += nxosfabric.nve_lines(self.device, self.report, IND, self.port, self.vrf)
+        self.out += nxosfabric.evpn_lines(self.device, self.report, IND)
+        if self.device.bgp is not None:
+            self.out += nxosfabric.bgp_evpn(self.device, self.device.bgp, self.report)
 
     def routes(self, routes: List[StaticRoute], ind: str) -> None:
         for route in routes:
@@ -327,13 +411,15 @@ class Writer:
                     words.append(self.port(route.interface))
                 if route.next_hop:
                     words.append(route.next_hop)
+                track = self.track_plan.route_track(route.track) if route.track else ""
+                if track:
+                    words += ["track", track]
             if route.name:
                 words += ["name", route.name.replace(" ", "_")]
+            if route.tag is not None:
+                words += ["tag", str(route.tag)]
             if route.distance is not None:
                 words.append(str(route.distance))
-            if route.track:
-                self.report.add("route", label, Severity.REVIEW, partial.CODE,
-                                f"tracking (object {route.track}) is not written for NX-OS yet; the route is always on")
             self.out.append(ind + " ".join(words))
         if routes and not ind:
             self.out.append("!")
@@ -342,9 +428,18 @@ class Writer:
 
     def interface(self, iface: Interface) -> None:
         label = self.label(iface)
-        if iface.kind in (InterfaceKind.TUNNEL, InterfaceKind.OTHER):
+        tunnel: List[str] = []
+        if iface.kind == InterfaceKind.TUNNEL:
+            found = nxosrouting.tunnel_lines(iface, self.port, self.adder(label), self.features)
+            if found is None:
+                self.report.skip("interface", label, "vpn-unsupported",
+                                 "an IPsec tunnel interface has no NX-OS form (a Nexus switch terminates no VPNs); move "
+                                 "it to a router or firewall")
+                return
+            tunnel = found
+        elif iface.kind == InterfaceKind.OTHER:
             self.report.skip("interface", label, partial.CODE,
-                             "tunnel interfaces are not written for NX-OS yet; configure it by hand")
+                             "this kind of interface is not written for NX-OS; configure it by hand")
             return
         self.report.item("interface", label)
         if (iface.source_name or iface.name, self.port(iface.name)) in self.port.renumbered:
@@ -355,6 +450,7 @@ class Writer:
         lines: List[str] = []
         if iface.description:
             lines.append(f"description {iface.description}")
+        lines += tunnel
         physical = iface.kind in (InterfaceKind.ETHERNET, InterfaceKind.LAG)
         if iface.kind == InterfaceKind.VLAN:
             self.features.add("interface-vlan")
@@ -362,6 +458,10 @@ class Writer:
             lines.append(f"encapsulation dot1q {iface.encapsulation_vlan}")
         if physical and not iface.lag:
             lines += self.switchport(iface)
+            lines += nxosfabric.port_lines(self.device, iface, self.adder(label), IND)
+            if iface.mode != SwitchportMode.ROUTED:
+                lines += nxosaccess.port_lines(self.device, iface, self.adder(label), label, self.report,
+                                               self.features)
         if iface.kind == InterfaceKind.ETHERNET:
             if iface.speed:
                 lines.append(f"speed {iface.speed}")
@@ -379,6 +479,12 @@ class Writer:
         layer3 = iface.mode == SwitchportMode.ROUTED or not physical
         if layer3 and not iface.lag:
             lines += self.layer3(iface, name)
+        lines += nxosmon.interface_lines(self.device, iface, self.adder(label), self.mirror_ports)
+        lines += nxosauto.ptp_interface(iface, self.adder(label))
+        if not iface.lag:
+            lines += nxossec.interface_lines(self.device, iface, self.adder(label))
+            lines += nxosqos.interface_policy_lines(self.device, iface, self.adder(label))
+            lines += self.qos.interface(iface, self.adder(label))
         for key, value in sorted(iface.storm_control.items()):
             if key in ("broadcast", "multicast", "unicast"):
                 lines.append(f"storm-control {key} level {value:.2f}")
@@ -434,12 +540,19 @@ class Writer:
         vrf = iface.vrf if iface.kind != InterfaceKind.MANAGEMENT else (iface.vrf or MGMT_VRF)
         if vrf:
             lines.append(f"vrf member {self.vrf(vrf)}")
-        for n, address in enumerate(iface.ipv4):
-            lines.append(f"ip address {address}" + (" secondary" if n else ""))
+        if iface.kind == InterfaceKind.VLAN and iface.vrf in self.l3 and self.l3[iface.vrf] == int(iface.name[4:]):
+            lines.append("ip forward")
+        gateway, mode = nxosfabric.anycast_lines(self.device, iface, self.adder(label))
+        if gateway:
+            lines += gateway
+        else:
+            for n, address in enumerate(iface.ipv4):
+                lines.append(f"ip address {address}" + (" secondary" if n else ""))
+            for address in iface.ipv6:
+                lines.append(f"ipv6 address {address}")
         if iface.dhcp_client:
             lines.append("ip address dhcp")
-        for address in iface.ipv6:
-            lines.append(f"ipv6 address {address}")
+        lines += mode
         for attr, word, direction in (("acl_in", "ip", "in"), ("acl_out", "ip", "out"),
                                       ("acl6_in", "ipv6", "in"), ("acl6_out", "ipv6", "out")):
             acl = getattr(iface, attr)
@@ -449,11 +562,20 @@ class Writer:
             elif acl:
                 self.report.add("interface", label, Severity.REVIEW, "acl-missing",
                                 f"ACL {acl} is applied but not defined; left out")
+        lines += nxosaccess.layer3_lines(iface, self.adder(label), self.port)
         if iface.helper_addresses:
             self.features.add("dhcp")
-        for helper in iface.helper_addresses:
-            lines.append(f"ip dhcp relay address {helper}")
+        lines += nxosaccess.relay_lines(iface, self.vrf, self.port)
         lines += self.ospf_interface(iface)
+        d = self.device
+        lines += nxosrouting.ospf_interface(d, iface, name, self.adder(label), self.key_chains, IND)
+        lines += nxosrouting.bfd_interface(iface, self.report, label)
+        lines += nxosrouting.rip_interface(d, iface)
+        lines += nxosrouting.isis_interface(d, iface)
+        if iface.mpls:
+            lines.append("mpls ip")
+        lines += nxosrouting.pbr_interface(d, iface, self.adder(label), self.features)
+        lines += nxosmcast.interface_lines(iface, self.adder(label))
         lines += self.fhrp_lines(iface, name)
         return lines
 
@@ -467,9 +589,8 @@ class Writer:
             lines.append("hsrp version 2")
         for g in groups:
             add = fhrp.adder(self.report, name, g)
-            if g.tracks:
-                add(Severity.REVIEW, partial.CODE, "tracking is not written for NX-OS yet")
             body = self.hsrp(g) if g.protocol == "hsrp" else self.vrrp(g, add)
+            body += [f"track {t} decrement {dec}" for t, dec in self.track_plan.fhrp_tracks(g.tracks)]
             lines.append(f"{g.protocol} {g.group}")
             lines += [IND + line for line in body]
         return lines
@@ -571,6 +692,11 @@ class Writer:
                 body = []
                 if p.router_id:
                     body.append(f"router-id {p.router_id}")
+                elif self.device.system.router_id and not p.vrf:
+                    body.append(f"router-id {self.device.system.router_id}")
+                    self.report.add("ospf", label, Severity.APPROX, "router-id",
+                                    f"NX-OS has no global router ID: {self.device.system.router_id} is written as the "
+                                    "OSPF router ID")
                 if p.reference_bandwidth:
                     body.append(f"auto-cost reference-bandwidth {p.reference_bandwidth} Mbps")
                 for area, kind in p.area_types.items():
@@ -580,10 +706,17 @@ class Writer:
                 if p.default_originate:
                     body.append("default-information originate" + (" always" if p.default_originate == "always"
                                                                     else ""))
-                if p.bfd_all:
-                    self.report.add("ospf", label, Severity.REVIEW, partial.CODE, "BFD is not written for NX-OS yet")
+                body += nxosrouting.ospf_options(p)
                 self.out += [ind + line for line in body]
             self.out.append("!")
+
+    def igps(self) -> None:
+        d, rep = self.device, self.report
+        for lines in (nxosrouting.rip_lines(d, rep, IND, self.redistributed, self.features),
+                      nxosrouting.isis_lines(d, rep, IND, self.redistributed, self.features),
+                      nxosrouting.mpls_lines(d, rep, self.port, IND, self.features)):
+            if lines:
+                self.out += lines + ["!"]
 
     # BGP -------------------------------------------------------------------------------------------------------------
 
@@ -594,49 +727,92 @@ class Writer:
         self.features.add("bgp")
         label = f"bgp {bgp.local_as}"
         self.report.item("bgp", label)
-        if bgp.peer_groups:
-            self.report.add("bgp", label, Severity.APPROX, "peer-groups",
-                            f"the peer groups {', '.join(bgp.peer_groups)} are written into each neighbor; NX-OS "
-                            "templates are not used")
         self.out.append(f"router bgp {bgp.local_as}")
+        body: List[str] = []
         if bgp.router_id:
-            self.out.append(f"{IND}router-id {bgp.router_id}")
+            body.append(f"router-id {bgp.router_id}")
+        body += nxosfabric.bgp_globals(self.device, bgp, self.report)
         af: List[str] = [f"network {n}" for n in bgp.networks if ipaddress.ip_network(n).version == 4]
         af += [self.redistribute(s, bgp.redistribute_maps.get(s), "bgp", label) for s in bgp.redistribute]
         af += [f"maximum-paths {bgp.maximum_paths}"] if bgp.maximum_paths else []
         af += [f"maximum-paths ibgp {bgp.maximum_paths_ibgp}"] if bgp.maximum_paths_ibgp else []
+        af += nxosfabric.aggregate_lines(bgp.aggregates, "ipv4")
+        af += nxosfabric.distance_line(bgp)
         if af:
-            self.out.append(f"{IND}address-family ipv4 unicast")
-            self.out += [IND * 2 + line for line in af]
+            body.append("address-family ipv4 unicast")
+            body += [IND + line for line in af]
         af6 = [f"network {n}" for n in bgp.networks if ipaddress.ip_network(n).version == 6]
         af6 += [self.redistribute(s, None, "bgp", label) for s in bgp.redistribute6]
+        af6 += nxosfabric.aggregate_lines(bgp.aggregates, "ipv6")
         if af6:
-            self.out.append(f"{IND}address-family ipv6 unicast")
-            self.out += [IND * 2 + line for line in af6]
-        for peer in bgp_text.flat(bgp):
+            body.append("address-family ipv6 unicast")
+            body += [IND + line for line in af6]
+        if any("evpn" in p.families for p in list(bgp.peer_groups.values()) + bgp.neighbors):
+            body.append("address-family l2vpn evpn")
+            self.evpn = True
+        templates = self.templates(bgp)
+        for name, group in bgp.peer_groups.items():
+            self.report.item("bgp", f"peer group {name}")
+            bgp_text.unwritten(group, set(bgp_text.OPTIONS), self.report, f"peer group {name}", "NX-OS")
+            body += self.neighbor(group, f"template peer {templates[('', name)]}")
+        for peer in bgp.neighbors:
             self.report.item("bgp", f"neighbor {peer.address}")
             bgp_text.unwritten(peer, set(bgp_text.OPTIONS), self.report, f"neighbor {peer.address}", "NX-OS")
-            self.out += [IND + line for line in self.neighbor(peer)]
+            body += self.neighbor(peer, inherit=templates.get(("", peer.peer_group)), group=bgp.peer_groups.get(
+                peer.peer_group))
         for name, v in bgp.vrfs.items():
             vlabel = f"bgp vrf {name}"
             self.report.item("bgp", vlabel)
-            self.out.append(f"{IND}vrf {name}")
-            vaf = [f"network {n}" for n in v.networks]
-            vaf += [self.redistribute(s, v.redistribute_maps.get(s), "bgp", vlabel) for s in v.redistribute]
-            vaf += [f"maximum-paths {v.maximum_paths}"] if v.maximum_paths else []
-            if vaf:
-                self.out.append(f"{IND * 2}address-family ipv4 unicast")
-                self.out += [IND * 3 + line for line in vaf]
+            for gname, group in v.peer_groups.items():
+                self.report.item("bgp", f"peer group {gname} (vrf {name})")
+                body += self.neighbor(group, f"template peer {templates[(name, gname)]}")
+            body.append(f"vrf {self.vrf(name)}")
+            vx = self.device.vxlan
+            l3vni = vx is not None and name in vx.vrf_vnis
+            for family in ("ipv4", "ipv6"):
+                vaf = [f"network {n}" for n in v.networks if ipaddress.ip_network(n).version == (4 if family == "ipv4"
+                                                                                                 else 6)]
+                if family == "ipv4":
+                    vaf += [self.redistribute(s, v.redistribute_maps.get(s), "bgp", vlabel) for s in v.redistribute]
+                    vaf += [f"maximum-paths {v.maximum_paths}"] if v.maximum_paths else []
+                else:
+                    vaf += [self.redistribute(s, None, "bgp", vlabel) for s in v.redistribute6]
+                vaf += nxosfabric.aggregate_lines(v.aggregates, family)
+                if vaf or (l3vni and (family == "ipv4" or self._vrf_has_ipv6(name))):
+                    if l3vni:
+                        vaf.append("advertise l2vpn evpn")
+                    body.append(f"{IND}address-family {family} unicast")
+                    body += [IND * 2 + line for line in vaf]
             for peer in v.neighbors:
                 plabel = f"neighbor {peer.address} (vrf {name})"
                 self.report.item("bgp", plabel)
                 bgp_text.unwritten(peer, set(bgp_text.OPTIONS), self.report, plabel, "NX-OS")
-                self.out += [IND * 2 + line for line in self.neighbor(peer)]
+                key = (name, peer.peer_group) if (name, peer.peer_group) in templates else ("", peer.peer_group)
+                vgroup = v.peer_groups.get(peer.peer_group) or bgp.peer_groups.get(peer.peer_group)
+                body += [IND + line for line in self.neighbor(peer, inherit=templates.get(key), group=vgroup)]
+        self.out += [IND + line for line in body]
         self.out.append("!")
 
-    def neighbor(self, p: BgpNeighbor) -> List[str]:
-        lines = [f"neighbor {p.address}"]
+    def templates(self, bgp: Bgp) -> Dict[Tuple[str, str], str]:
+        """The template name of each peer group (VRF, group): a VRF's own group whose name the process also uses is
+        renamed."""
+        result = {("", name): name for name in bgp.peer_groups}
+        for vname, v in bgp.vrfs.items():
+            for gname in v.peer_groups:
+                written = gname if gname not in bgp.peer_groups else f"{gname}-{vname}"
+                result[(vname, gname)] = written
+                if written != gname:
+                    self.report.add("bgp", f"bgp vrf {vname}", Severity.APPROX, "bgp-template",
+                                    f"peer group {gname} of the VRF is written as template {written}: NX-OS templates "
+                                    "are shared by the process and its VRFs")
+        return result
+
+    def neighbor(self, p: BgpNeighbor, head: str = "", inherit: Optional[str] = None,
+                 group: Optional[BgpNeighbor] = None) -> List[str]:
+        lines = [head or f"neighbor {p.address}"]
         body: List[str] = []
+        if inherit:
+            body.append(f"inherit peer {inherit}")
         if p.remote_as:
             body.append(f"remote-as {p.remote_as}")
         if p.description:
@@ -645,6 +821,10 @@ class Writer:
             body.append(f"update-source {self.port(p.update_source)}")
         if p.ebgp_multihop:
             body.append(f"ebgp-multihop {p.ebgp_multihop}")
+        if p.ttl_security:
+            body.append(f"ttl-security hops {p.ttl_security}")
+        if p.local_as:
+            body.append(f"local-as {p.local_as}" + (f" {p.local_as_options}" if p.local_as_options else ""))
         if p.bfd:
             self.features.add("bfd")
             body.append("bfd")
@@ -656,14 +836,19 @@ class Writer:
             body.append(f"timers {p.keepalive if p.keepalive is not None else 60} "
                         f"{p.hold if p.hold is not None else 180}")
         if p.remove_private_as:
-            body.append("remove-private-as")
+            mode = {"": "", "all": " all", "all replace-as": " replace-as"}.get(p.remove_private_as_mode, "")
+            body.append(f"remove-private-as{mode}")
+        inherited = set(group.families) if group is not None else set()
         for family in p.families:
             header = {"ipv4": "address-family ipv4 unicast", "ipv6": "address-family ipv6 unicast",
                       "evpn": "address-family l2vpn evpn"}[family]
             options: List[str] = []
             if family == "evpn":
                 self.evpn = True
-                options.append("send-community extended")
+                if p.send_community:
+                    options.append("send-community")
+                if group is None or family not in inherited:
+                    options.append("send-community extended")
             else:
                 if p.send_community:
                     options.append("send-community")
@@ -672,7 +857,8 @@ class Writer:
                 if p.route_reflector_client:
                     options.append("route-reflector-client")
                 if p.maximum_prefix is not None:
-                    options.append(f"maximum-prefix {p.maximum_prefix}")
+                    options.append(f"maximum-prefix {p.maximum_prefix}" + (
+                        f" {p.maximum_prefix_warning}" if p.maximum_prefix_warning is not None else ""))
                 if p.allowas_in is not None:
                     options.append("allowas-in" + (f" {p.allowas_in}" if p.allowas_in else ""))
                 for attr, direction in (("route_map_in", "in"), ("route_map_out", "out")):
@@ -681,6 +867,8 @@ class Writer:
                 for attr, direction in (("prefix_list_in", "in"), ("prefix_list_out", "out")):
                     if getattr(p, attr):
                         options.append(f"prefix-list {getattr(p, attr)} {direction}")
+            if family in inherited and not options:
+                continue  # the template activates it
             body.append(header)
             body += [IND + o for o in options]
         return lines + [IND + line for line in body]
