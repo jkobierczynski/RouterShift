@@ -22,6 +22,7 @@ from .. import dhcp as dhcp_text
 from .. import evpn as evpn_text
 from .. import fhrp as fhrp_text
 from .. import junospolicy
+from .. import multicast as multicast_text
 from .. import ospf as ospf_text
 from .. import vrfs as vrfs_text
 from .. import vxlan as vxlan_text
@@ -105,7 +106,12 @@ class Reader:
         self.instance_imports: Dict[str, List[str]] = {}
         self.vrf_policies: Dict[str, List[Tuple[str, str, Statement]]] = {}
         self.vni_targets: Dict[int, Dict[str, str]] = {}  # VNI -> both|import|export -> target
-        self.switch_target = ""  # switch-options vrf-target: the target of VNIs without their own
+        self.switch_target = ""
+        self.rp_ranges: Dict[Tuple[str, str], List[str]] = {}  # (VRF, RP) -> group ranges
+        self.local_rp = ""
+        self.local_rp_ranges: List[str] = []
+        self.anycast_set: List[str] = []
+        self.msdp_sources: Dict[str, str] = {}  # MSDP peer -> local-address  # switch-options vrf-target: the target of VNIs without their own
         self.vlan_vxlan: Dict[str, Dict[str, str]] = {}  # VLAN name -> vni / multicast-group / ingress
         self.esi: Dict[str, Dict[str, str]] = {}  # aggregate -> esi settings
         self.mc_ae: Dict[str, Dict[str, str]] = {}  # aggregate -> mc-ae settings
@@ -883,7 +889,7 @@ class Reader:
             return False
         if rest[0] == "routing-options":
             return self.routing_options(s, rest[1:], vrf)
-        if rest[0] == "protocols" and len(rest) >= 2 and rest[1] in ("ospf", "bgp"):
+        if rest[0] == "protocols" and len(rest) >= 2 and rest[1] in ("ospf", "bgp", "pim", "igmp"):
             return self.protocols(s, rest[1:], vrf)
         if rest[0] == "forwarding-options":
             return self.forwarding_options(s, rest[1:], vrf)
@@ -893,12 +899,111 @@ class Reader:
             return True
         return False
 
+    def multicast(self, w: List[str], vrf: str) -> bool:
+        """protocols pim / igmp / msdp / igmp-snooping, in the main instance or a VRF's."""
+        dev = self.device
+        if w[0] == "pim":
+            if vrf:
+                m = multicast_text.vrf(dev, vrf)
+                m.routing = True
+                rps, rp_groups = m.rps, m.rp_groups
+            else:
+                dev.multicast_routing = True
+                rps, rp_groups = dev.pim_rps, dev.pim_rp_groups
+            more = w[1:]
+            if not more:
+                return True
+            if more[0] == "interface" and len(more) == 4 and more[2] == "mode" and \
+                    more[3] in multicast_text.PIM_MODES:
+                if more[1] == "all":
+                    return more[3] == "sparse"  # PIM everywhere: multicast routing on
+                iface = self.canonical(more[1])
+                if iface is None:
+                    return False
+                iface.pim = more[3]
+                return True
+            if more[:3] == ["rp", "static", "address"] and len(more) >= 4:
+                rp = more[3]
+                if rp not in rps:
+                    rps.append(rp)
+                if len(more) == 4:
+                    return True
+                if more[4] == "group-ranges" and len(more) == 6:
+                    self.rp_ranges.setdefault((vrf, rp), []).append(more[5])
+                    return True
+                return False
+            if more[:2] == ["rp", "local"] and len(more) >= 4 and not vrf:
+                if more[2] == "address" and len(more) == 4:
+                    self.local_rp = more[3]
+                    if more[3] not in rps:
+                        rps.append(more[3])
+                    return True
+                if more[2] == "group-ranges" and len(more) == 4:
+                    self.local_rp_ranges.append(more[3])
+                    return True
+                if more[2:4] == ["anycast-pim", "rp-set"] and len(more) == 6 and more[4] == "address":
+                    self.anycast_set.append(more[5])
+                    return True
+                return more[2:3] == ["anycast-pim"] and more[3:4] == ["local-address"] and len(more) == 5
+            return False
+        if w[0] == "igmp" and len(w) == 5 and w[1] == "interface" and w[3] == "version" and w[4].isdigit():
+            iface = self.canonical(w[2])
+            if iface is None:
+                return False
+            iface.igmp_version = int(w[4])
+            return True
+        if w[0] == "msdp" and not vrf and len(w) >= 3 and w[1] == "peer":
+            if len(w) == 3:
+                dev.msdp_peers.setdefault(w[2], "")
+                return True
+            if w[3] == "local-address" and len(w) == 5:
+                self.msdp_sources[w[2]] = w[4]
+                dev.msdp_peers.setdefault(w[2], "")
+                return True
+            return False
+        if w[0] == "igmp-snooping" and not vrf and len(w) >= 3 and w[1] == "vlan":
+            if w[2] == "all" and len(w) == 3:
+                dev.igmp_snooping = True
+                return True
+            vid = self.vlan_names.get(w[2])
+            if vid is None or vid not in dev.vlans:
+                return False
+            vlan = dev.vlans[vid]
+            if len(w) == 3:
+                vlan.igmp_snooping = True
+                return True
+            if w[3:5] == ["l2-querier", "source-address"] and len(w) == 6:
+                vlan.igmp_querier = True
+                vlan.igmp_querier_address = w[5]
+                return True
+            return False
+        return False
+
+    def finish_multicast(self) -> None:
+        dev = self.device
+        for (vrf, rp), ranges in self.rp_ranges.items():
+            groups = dev.pim_rp_groups if not vrf else multicast_text.vrf(dev, vrf).rp_groups
+            groups[rp] = ranges[0]
+            if ranges[1:]:
+                dev.unparsed.append(Unparsed(0, f"set protocols pim rp static address {rp} group-ranges "
+                                             f"{ranges[1]}", "RouterShift keeps one group range per RP"))
+        if self.local_rp:
+            if self.local_rp_ranges:
+                dev.pim_rp_groups[self.local_rp] = self.local_rp_ranges[0]
+            if self.anycast_set:
+                dev.pim_anycast[self.local_rp] = list(self.anycast_set)
+        for peer, address in self.msdp_sources.items():
+            iface = vxlan_text.interface_of(dev, address)
+            dev.msdp_peers[peer] = iface
+
     def protocols(self, s: Statement, w: List[str], vrf: str) -> bool:
         if w[0] == "ospf" and len(w) >= 2:
             return self.ospf(w[1:], vrf)
         if w[0] == "bgp" and len(w) >= 2:
             self.bgp_line = self.bgp_line or s.line
             return self.bgp(w[1:], vrf)
+        if w[0] in ("pim", "igmp", "msdp", "igmp-snooping"):
+            return self.multicast(w, vrf)
         if w[0] == "lldp":
             m = self.device.management
             if w[1:] in ([], ["interface", "all"]):
@@ -1209,6 +1314,7 @@ class Reader:
                     if MGMT_INSTANCE not in dev.vrfs:
                         dev.vrfs.insert(0, MGMT_INSTANCE)
         self.finish_ports()
+        self.finish_multicast()
         self.finish_services()
         self.finish_fabric()
         self.finish_exports()

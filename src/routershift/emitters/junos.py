@@ -24,13 +24,14 @@ from .. import evpn as evpn_text
 from .. import fhrp as fhrp_text
 from .. import hosts as hosts_text
 from .. import l2sec as l2sec_text
+from .. import multicast as multicast_text
 from .. import junospolicy
 from .. import ospf as ospf_text
 from .. import partial
 from .. import snmp as snmp_text
 from .. import vrfs as vrfs_text
 from ..junostext import Tree, quote
-from ..model import (BgpAggregate, BgpNeighbor, Device, FhrpGroup, Interface, InterfaceKind, LacpMode, StpMode,
+from ..model import (AclAction, BgpAggregate, BgpNeighbor, Device, FhrpGroup, Interface, InterfaceKind, LacpMode, StpMode,
                      SwitchportMode, VrfInfo)
 from ..names import PortMapper
 from ..report import Report, Severity
@@ -42,9 +43,10 @@ CLASSES = [(15, "super-user"), (5, "operator"), (0, "read-only")]
 HASHES = ("md5-crypt", "sha256-crypt", "sha512-crypt", "junos")
 MGMT_INSTANCE = "mgmt_junos"
 # What partial.device need not report: the device-wide features this writer writes
-WRITTEN = {"acl", "policy", "dhcp", "l2sec", "aaa", "mlag", "vxlan"}
+WRITTEN = {"acl", "policy", "dhcp", "l2sec", "aaa", "mlag", "vxlan", "multicast"}
 # What partial.port need not report
-PORT_WRITTEN = {"dhcp-relay", "fhrp", "voice", "speed", "l2sec", "storm", "poe", "dot1x", "stp-guards", "mlag"}
+PORT_WRITTEN = {"dhcp-relay", "fhrp", "voice", "speed", "l2sec", "storm", "poe", "dot1x", "stp-guards", "mlag",
+                "multicast"}
 _NAME_CHARS = re.compile(r"[^A-Za-z0-9_.-]+")
 
 
@@ -107,6 +109,7 @@ class Writer:
         self.lldp()
         self.spanning_tree()
         self.snooping()
+        self.multicast()
         self.dhcp_relay()
         self.dhcp_server()
         self.aaa()
@@ -270,9 +273,6 @@ class Writer:
             if vlan.shutdown:
                 self.report.add("vlan", str(vid), Severity.REVIEW, "vlan-shutdown",
                                 "Junos cannot shut a VLAN down; it is written active")
-            if vlan.dhcp_snooping or vlan.arp_inspection or vlan.igmp_querier:
-                self.report.add("vlan", str(vid), Severity.REVIEW, "junos-not-yet",
-                                "DHCP snooping, ARP inspection and the IGMP querier are not written for Junos yet")
 
     def members(self, iface: Interface) -> List[str]:
         if iface.mode == SwitchportMode.ACCESS:
@@ -1227,6 +1227,122 @@ class Writer:
             if low.isdigit():
                 vids += [v for v in range(int(low), int(high or low) + 1) if v in self.vlan_names]
         return vids
+
+    # multicast ---------------------------------------------------------------------------------------------------
+
+    def multicast(self) -> None:
+        """PIM and IGMP on routed interfaces, rendezvous points, anycast RP, MSDP, and IGMP snooping with its
+        querier."""
+        dev = self.device
+        label = "multicast routing"
+        if multicast_text.uses_pim(dev) or dev.multicast_vrfs or dev.msdp_peers:
+            self.report.item("system", label)
+        for vrf_name in [""] + list(dev.multicast_vrfs):
+            base: Tuple[str, ...] = ("protocols",)
+            if vrf_name:
+                base = ("routing-instances", self.instance(vrf_name)) + base
+                m = dev.multicast_vrfs[vrf_name]
+                routing, rps, rp_groups = m.routing, m.rps, m.rp_groups
+            else:
+                routing, rps, rp_groups = dev.multicast_routing, dev.pim_rps, dev.pim_rp_groups
+            ifaces = [i for i in dev.interfaces.values() if (i.pim or i.igmp_version is not None)
+                      and i.vrf == vrf_name and not i.shutdown]
+            for iface in ifaces:
+                unit = self.unit_name(iface.name)
+                if iface.pim:
+                    self.add(*base, "pim", f"interface {unit}", f"mode {iface.pim}")
+                if iface.igmp_version is not None:
+                    self.add(*base, "igmp", f"interface {unit}", f"version {iface.igmp_version}")
+            for rp in rps:
+                if rp in dev.pim_anycast and not vrf_name and self.owns(rp, dev.pim_anycast[rp]):
+                    continue  # written as the local RP below
+                groups = rp_groups.get(rp, "")
+                path = base + ("pim", "rp", "static", f"address {rp}")
+                self.add(*path)
+                self.rp_groups(path, groups, label)
+            if routing and not ifaces and not rps:
+                self.add(*base, "pim", "interface all", "mode sparse")
+                self.report.add("system", label, Severity.APPROX, "pim-all",
+                                ("VRF " + vrf_name + ": " if vrf_name else "") + "Junos routes multicast where PIM "
+                                "runs; with no PIM interface in the source, PIM is written on every interface")
+        for rp, peers in dev.pim_anycast.items():
+            own = self.owns(rp, peers)
+            if not own:
+                self.report.add("system", label, Severity.REVIEW, "anycast-rp",
+                                f"anycast RP {rp} ({', '.join(peers)}): Junos sets the RP set only on the RPs "
+                                "themselves (pim rp local ... anycast-pim); this switch owns none of the addresses, so "
+                                "it is left out and the RP is written as a static one")
+                continue
+            path = ("protocols", "pim", "rp", "local")
+            self.add(*path, f"address {rp}")
+            self.rp_groups(path, dev.pim_rp_groups.get(rp, ""), label)
+            for peer in peers:
+                self.add(*path, "anycast-pim", "rp-set", f"address {peer}")
+            self.add(*path, "anycast-pim", f"local-address {own}")
+        for peer, via in dev.msdp_peers.items():
+            path = ("protocols", "msdp", f"peer {peer}")
+            self.add(*path)
+            source = dev.interfaces.get(via) if via else None
+            if source is not None and source.ipv4:
+                self.add(*path, f"local-address {source.ipv4[0].split('/')[0]}")
+        self.igmp_snooping()
+
+    def owns(self, rp: str, peers: List[str]) -> str:
+        """The address of the anycast RP set (or the RP address) that is one of this switch's own, or ""."""
+        mine = {a.split("/")[0]: a for i in self.device.interfaces.values() for a in i.ipv4}
+        return next((a for a in peers + [rp] if a in mine), "")
+
+    def rp_groups(self, path: Tuple[str, ...], groups: str, label: str) -> None:
+        if groups.startswith("acl "):
+            acl = self.device.acls.get(groups[4:])
+            prefixes = [e.source for e in acl.entries if e.action == AclAction.PERMIT and e.source != "any"] \
+                if acl is not None else []
+            if acl is None or not prefixes or any(e.action == AclAction.DENY for e in acl.entries):
+                self.report.add("system", label, Severity.REVIEW, "rp-groups",
+                                f"the RP's groups come from {groups}, which is not a plain list of group prefixes; "
+                                "set group-ranges by hand")
+                return
+            for prefix in prefixes:
+                self.add(*path, f"group-ranges {prefix}")
+        elif groups:
+            self.add(*path, f"group-ranges {groups}")
+
+    def igmp_snooping(self) -> None:
+        dev = self.device
+        snooped = multicast_text.snooped(dev)
+        if not snooped and not multicast_text.stated(dev):
+            return
+        self.report.item("vlan", multicast_text.LABEL)
+        base = ("protocols", "igmp-snooping")
+        every = dev.igmp_snooping and all(v.igmp_snooping is not False for v in dev.vlans.values())
+        if every:
+            self.add(*base, "vlan all")
+        for vid in snooped:
+            vlan = dev.vlans[vid]
+            name = self.vlan_names.get(vid, f"VLAN{vid}")
+            if not every:
+                self.add(*base, f"vlan {name}")
+            if not (dev.igmp_querier or vlan.igmp_querier):
+                continue
+            address = vlan.igmp_querier_address or dev.igmp_querier_address
+            if not address:
+                svi = dev.interfaces.get(f"Vlan{vid}")
+                address = svi.ipv4[0].split("/")[0] if svi is not None and svi.ipv4 else ""
+            if not address:
+                self.report.add("vlan", multicast_text.LABEL, Severity.REVIEW, "igmp-querier",
+                                f"VLAN {vid}: the Junos querier needs a source address and the VLAN has none; set "
+                                "l2-querier source-address by hand")
+                continue
+            self.add(*base, f"vlan {name}", "l2-querier", f"source-address {address}")
+            version = vlan.igmp_querier_version or dev.igmp_querier_version
+            if version and version != 2:
+                self.report.add("vlan", multicast_text.LABEL, Severity.APPROX, "igmp-querier",
+                                f"VLAN {vid}: the querier version ({version}) is not written; the Junos querier "
+                                "sends the version of the hosts it hears")
+        if dev.igmp_snooping is False or any(v.igmp_snooping is False for v in dev.vlans.values()):
+            self.report.add("vlan", multicast_text.LABEL, Severity.APPROX, "igmp-off",
+                            "Junos snoops only the VLANs listed under igmp-snooping; the VLANs where the source "
+                            "switched snooping off are simply not listed")
 
     def snooping(self) -> None:
         dev = self.device
