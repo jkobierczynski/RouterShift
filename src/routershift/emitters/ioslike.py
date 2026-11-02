@@ -28,6 +28,7 @@ from .. import multicast as multicast_text
 from .. import monitor as monitor_text
 from .. import tracking as tracking_text
 from .. import vxlan as vxlan_text
+from .. import evpn as evpn_text
 from .. import hosts as hosts_text
 from .. import igp as igp_text
 from .. import bfd as bfd_text
@@ -83,6 +84,9 @@ class Writer:
             for name in nat_text.outside(self.device, rule):
                 self.nat_outside.setdefault(name, []).append(rule)
         self.key_chains: List[str] = []  # IOS: key chains the interfaces' OSPF authentication uses
+        # IOS: the VLAN that carries each layer 3 VNI; EOS: the VLANs and SVIs an IOS source used for them, left out
+        self.l3vni_vlans: Dict[str, int] = evpn_text.ios_l3vni_vlans(self.device, self.report) if self.ios else {}
+        self.skip_vlans = set(self.device.vxlan.vrf_vlans.values()) if self.device.vxlan and not self.ios else set()
         self.track_plan = tracking_text.plan(self.device, self.report, self.target, "IOS" if self.ios else "EOS")
         self.system()
         self.spanning_tree()
@@ -98,7 +102,10 @@ class Writer:
         self.mpls()
         mark = len(self.out)
         for iface in self.device.interfaces.values():
+            if iface.kind == InterfaceKind.VLAN and iface.name[4:].isdigit() and int(iface.name[4:]) in self.skip_vlans:
+                continue
             self.interface(iface)
+        self._l3vni_interfaces()
         self.out[mark:mark] = self.key_chains
         self.mirrors()
         self.vxlan()
@@ -227,7 +234,17 @@ class Writer:
                 any("ipv6" in p.families for p in bgp.neighbors)))
 
     def vlans(self) -> None:
+        if self.skip_vlans:
+            self.report.add("interface", vxlan_text.LABEL, Severity.INFO, "evpn-l3vni-vlan",
+                            "the VLANs and SVIs that carried the layer 3 VNIs on IOS ("
+                            + ", ".join(str(v) for v in sorted(self.skip_vlans)) + ") are left out: EOS maps a VRF "
+                            "to its VNI directly")
+        for vrf, vid in self.l3vni_vlans.items():
+            if vid not in self.device.vlans:
+                self.out += [f"vlan {vid}", f"{self.ind}name L3VNI-{self.vrf(vrf)}", "!"]
         for vlan in sorted(self.device.vlans.values(), key=lambda v: v.vlan_id):
+            if vlan.vlan_id in self.skip_vlans:
+                continue
             self.out.append(f"vlan {vlan.vlan_id}")
             if vlan.name:
                 self.out.append(f"{self.ind}name {vlan.name}")
@@ -262,6 +279,9 @@ class Writer:
             vrf = self.vrf(iface.vrf)
             lines.append(f"vrf forwarding {vrf}" if self.ios else f"vrf {vrf}")
         lines += self._addresses(iface, add)
+        if iface.unnumbered:
+            lines.append(f"ip unnumbered {self.port(iface.unnumbered)}" if self.ios else
+                         f"ip address unnumbered {self.port(iface.unnumbered)}")
         lines += self._acl_bindings(iface, add)
         lines += self._hardening(iface)
         lines += self._fhrp(iface, name)
@@ -295,6 +315,7 @@ class Writer:
         lines += self._l2sec_interface(iface, add, label)
         if iface.mlag_id is not None and not self.ios:
             lines.append(f"mlag {iface.mlag_id}")
+        lines += self._evpn_interface(iface, add)
         if iface.cdp is not None and self.ios:
             lines.append("cdp enable" if iface.cdp else "no cdp enable")
         if iface.stp_portfast:
@@ -317,6 +338,55 @@ class Writer:
         if (iface.source_name or iface.name, name) in self.port.renumbered:
             add(Severity.APPROX, "port-renamed",
                 f"named {name} without a port map; check it against the cabling of the new device")
+
+    def _evpn_interface(self, iface: Interface, add: "_Add") -> List[str]:
+        """EVPN multihoming on a LAG, its LACP system ID, and SVI autostate."""
+        lines: List[str] = []
+        if iface.evpn_esi and self.ios:
+            lines.append(f"evpn ethernet-segment {evpn_text.es_number(iface)}")
+            notes = [f"EVPN multihoming written as ethernet segment {evpn_text.es_number(iface)} (l2vpn evpn "
+                     "ethernet-segment); check that the Catalyst model and release support it"]
+            if iface.evpn_es_rt:
+                notes.append(f"the ES-import route target {iface.evpn_es_rt} is derived from the identifier on IOS XE")
+            if iface.lacp_system_id:
+                notes.append(f"the LAG's LACP system ID {iface.lacp_system_id} has no per-LAG equivalent; both "
+                             "switches must present the same LACP system ID to the device")
+            add(Severity.REVIEW, "evpn-es", "; ".join(notes))
+        elif iface.evpn_esi:
+            lines.append("evpn ethernet-segment")
+            lines.append(f"{self.ind}identifier {iface.evpn_esi}")
+            if iface.evpn_single_active:
+                lines.append(f"{self.ind}redundancy single-active")
+            if iface.evpn_es_rt:
+                lines.append(f"{self.ind}route-target import {iface.evpn_es_rt}")
+            if iface.evpn_df_preference is not None:
+                lines.append(f"{self.ind}designated-forwarder election algorithm preference value "
+                             f"{iface.evpn_df_preference}")
+            if self.device.platform == "ios":
+                add(Severity.APPROX, "evpn-es", "EOS takes the ES-import route target from the identifier unless "
+                                                "one is set; check it matches the peer")
+        if iface.lacp_system_id and not self.ios:
+            lines.append(f"lacp system-id {iface.lacp_system_id}")
+        elif iface.lacp_system_id and not iface.evpn_esi:
+            add(Severity.REVIEW, "lacp-system-id", f"the LAG's LACP system ID {iface.lacp_system_id} has no per-LAG "
+                                                   "equivalent on IOS; left out")
+        if iface.mac_address:
+            digits = iface.mac_address.replace(":", "")
+            lines.append(f"mac-address {digits[0:4]}.{digits[4:8]}.{digits[8:12]}")
+        if iface.autostate is False:
+            lines.append("no autostate")
+        return lines
+
+    def _l3vni_interfaces(self) -> None:
+        """IOS: an SVI in the VRF for the VLAN of each layer 3 VNI."""
+        vx = self.device.vxlan
+        for vrf, vid in self.l3vni_vlans.items():
+            if f"Vlan{vid}" in self.device.interfaces:
+                continue
+            source = vx.source_interface if vx else ""
+            self.out += [f"interface Vlan{vid}", f" description L3VNI {self.vrf(vrf)}",
+                         f" vrf forwarding {self.vrf(vrf)}"] + \
+                ([f" ip unnumbered {self.port(source)}"] if source else []) + [" no autostate", " no shutdown", "!"]
 
     def _switchport(self, iface: Interface, add: "_Add") -> List[str]:
         lines: List[str] = []
@@ -1513,6 +1583,8 @@ class Writer:
                     body += self._bgp_af_options(peer)
             if af == "ipv4":
                 body += self._maximum_paths(v.maximum_paths, None)
+            if self.device.vxlan and name in self.device.vxlan.vrf_vnis:
+                body.append("advertise l2vpn evpn")
             if body or af == "ipv4":
                 result[af] = body
         return result
@@ -1571,9 +1643,8 @@ class Writer:
         vx = self.device.vxlan
         lines: List[str] = []
         if not self.ios and vx is not None:
-            for vid in vx.evpn_vlans:
-                lines += [f"vlan {vid}", f"{self.ind}rd auto", f"{self.ind}route-target both auto",
-                          f"{self.ind}redistribute learned"]
+            lines += evpn_text.eos_instances(vx, self.ind)
+        evpn_text.domains_report(bgp, self.report, self.ios)
         if not peers:
             return lines
         if not self.ios:
@@ -1583,6 +1654,8 @@ class Writer:
             body.append(f"neighbor {p.address} activate")
             if self.ios:
                 body.append(f"neighbor {p.address} send-community extended")
+        if not self.ios:
+            body += evpn_text.eos_af_lines(bgp)
         lines.append("address-family l2vpn evpn" if self.ios else "address-family evpn")
         lines += [self.ind + line for line in body]
         if self.ios:
@@ -1597,39 +1670,70 @@ class Writer:
             return
         vxlan_text.item(d, self.report)
         ind = self.ind
+        rep = self.report
         if not self.ios:
             lines = ["interface Vxlan1"]
             if vx.source_interface:
                 lines.append(f"{ind}vxlan source-interface {self.port(vx.source_interface)}")
+            if vx.mlag_shared_mac:
+                lines.append(f"{ind}vxlan virtual-router encapsulation mac-address mlag-system-id")
             lines += [f"{ind}vxlan vlan {vid} vni {vni}" for vid, vni in vx.vlan_vnis.items()]
             lines += [f"{ind}vxlan vrf {self.vrf(vrf)} vni {vni}" for vrf, vni in vx.vrf_vnis.items()]
             if vx.flood_vteps:
                 lines.append(f"{ind}vxlan flood vtep {' '.join(vx.flood_vteps)}")
+            groups: Dict[str, List[int]] = {}
+            for vid, group in vx.mcast_groups.items():
+                groups.setdefault(group, []).append(vid)
+            lines += [f"{ind}vxlan mcast-group {g} vlan {evpn_text.vlan_text(v)}" for g, v in groups.items()]
+            if "ecn" in vx.qos_propagation:
+                lines.append(f"{ind}vxlan qos ecn propagation")
+            if "dscp" in vx.qos_propagation:
+                lines.append(f"{ind}vxlan qos dscp propagation encapsulation")
             self.out += lines + ["!"]
             return
         lines = []
         if vx.evpn_vlans:
-            lines += ["l2vpn evpn", f"{ind}replication-type ingress", "!"]
-            for vid in vx.evpn_vlans:
-                lines += [f"l2vpn evpn instance {vid} vlan-based", f"{ind}encapsulation vxlan", "!"]
+            lines += ["l2vpn evpn", f"{ind}replication-type ingress"]
+            if any(i.virtual_ipv4 or i.virtual_ipv6 for i in self.device.interfaces.values()):
+                lines.append(f"{ind}default-gateway advertise enable")
+            if self.device.bgp and self.device.bgp.evpn_host_flap:
+                window, moves, _ = self.device.bgp.evpn_host_flap
+                lines.append(f"{ind}mac duplication limit {moves} time {window}")
+            lines.append("!")
+            lines += evpn_text.ios_instances(vx, rep, ind)
+        lines += evpn_text.ios_segments(self.device, ind)
         for vid, vni in vx.vlan_vnis.items():
             member = f"member evpn-instance {vid} vni {vni}" if vid in vx.evpn_vlans else f"member vni {vni}"
             lines += [f"vlan configuration {vid}", f"{ind}{member}", "!"]
+        for vrf, vid in self.l3vni_vlans.items():
+            lines += [f"vlan configuration {vid}", f"{ind}member vni {vx.vrf_vnis[vrf]}", "!"]
         lines += ["interface nve1", f"{ind}no ip address"]
         if vx.source_interface:
             lines.append(f"{ind}source-interface {self.port(vx.source_interface)}")
         if vx.evpn_vlans:
             lines.append(f"{ind}host-reachability protocol bgp")
         for vid, vni in vx.vlan_vnis.items():
-            if vid in vx.evpn_vlans:
+            if vid in vx.mcast_groups:
+                lines.append(f"{ind}member vni {vni} mcast-group {vx.mcast_groups[vid]}")
+            elif vid in vx.evpn_vlans:
                 lines.append(f"{ind}member vni {vni} ingress-replication")
             else:
                 lines.append(f"{ind}member vni {vni}")
                 lines += [f"{ind * 2}ingress-replication {a}" for a in vx.flood_vteps]
-        if vx.vrf_vnis:
-            self.report.add("interface", vxlan_text.LABEL, Severity.REVIEW, "vxlan-l3vni",
-                            "IOS carries a layer 3 VNI in a VLAN of its own with an SVI in the VRF; the VNIs of "
-                            f"{', '.join(vx.vrf_vnis)} are not written")
+        for vrf in self.l3vni_vlans:
+            lines.append(f"{ind}member vni {vx.vrf_vnis[vrf]} vrf {self.vrf(vrf)}")
+        if vx.mcast_groups:
+            rep.add("interface", vxlan_text.LABEL, Severity.APPROX, "vxlan-mcast",
+                    "VLANs " + evpn_text.vlan_text(list(vx.mcast_groups)) + " flood through their multicast group "
+                    "(replication-type static); the underlay needs PIM towards the rendezvous point")
+        if vx.mlag_shared_mac:
+            rep.add("interface", vxlan_text.LABEL, Severity.APPROX, "vxlan-mlag-mac",
+                    "'vxlan virtual-router encapsulation mac-address mlag-system-id' has no IOS equivalent: without "
+                    "MLAG each switch routes with its own MAC")
+        if vx.qos_propagation:
+            rep.add("interface", vxlan_text.LABEL, Severity.APPROX, "vxlan-qos",
+                    "copying " + " and ".join(q.upper() for q in vx.qos_propagation) + " between the inner and outer "
+                    "header is left out: IOS XE copies the DSCP to the outer header by default")
         self.out += lines + ["!"]
 
     @staticmethod

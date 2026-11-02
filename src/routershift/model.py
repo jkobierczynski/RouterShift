@@ -223,6 +223,16 @@ class Interface:
     port_security_violation: str = ""  # shutdown, restrict (drop and report) or protect (drop)
     storm_control: Dict[str, float] = field(default_factory=dict)  # broadcast|multicast|unicast|unknown-unicast -> %
     mlag_id: Optional[int] = None  # the multi-chassis LAG this port-channel is (EOS mlag N, AOS-CX multi-chassis)
+    # EVPN multihoming: the ethernet segment identifier of the LAG, 10 bytes as EOS writes them
+    # ("0000:0000:0021:0022:0020"); "" = none
+    evpn_esi: str = ""
+    evpn_es_rt: str = ""  # the ES-import route target (a MAC address, EOS form 00:21:00:22:00:20)
+    evpn_df_preference: Optional[int] = None  # designated-forwarder election by preference
+    evpn_single_active: bool = False  # single-active redundancy instead of all-active
+    lacp_system_id: str = ""  # the LACP system ID the LAG uses (EOS form 0021.0022.0020)
+    mac_address: str = ""  # SVI: the MAC it routes with ("" = the switch's own), xx:xx:xx:xx:xx:xx
+    autostate: Optional[bool] = None  # SVI: down while no port of its VLAN is up; None = the default (on)
+    unnumbered: str = ""  # borrows the address of this interface (canonical name)
     fhrp: List["FhrpGroup"] = field(default_factory=list)
     nat: str = ""  # "inside", "outside" or ""
     ospf_cost: Optional[int] = None
@@ -440,6 +450,15 @@ class Bgp:
     distance: Optional[Tuple[int, int, int]] = None  # administrative distance of external, internal, local routes
     multipath_relax: bool = False  # equal-cost paths through different neighbor ASes (bestpath as-path multipath-relax)
     vrfs: Dict[str, BgpVrf] = field(default_factory=dict)
+    # EVPN gateway between two domains (EOS domain identifier, neighbor X domain remote): the domain IDs and the
+    # neighbors in the remote domain
+    evpn_domain: str = ""
+    evpn_remote_domain: str = ""
+    evpn_remote_peers: List[str] = field(default_factory=list)
+    evpn_inter_domain_nhs: bool = False  # next-hop-self on IP-prefix routes passed between the domains
+    evpn_import_discard: bool = False  # routes no VRF imports are dropped (EOS route import match-failure action
+    # discard)
+    evpn_host_flap: Optional[Tuple[int, int, int]] = None  # MAC moves: window seconds, moves, expiry seconds
     origin: Origin = field(default_factory=Origin)
 
 
@@ -866,7 +885,29 @@ class Vxlan:
     vrf_vnis: Dict[str, int] = field(default_factory=dict)  # VRF -> layer 3 VNI (symmetric routing)
     flood_vteps: List[str] = field(default_factory=list)  # static head-end replication peers
     evpn_vlans: List[int] = field(default_factory=list)  # VLANs whose MAC addresses BGP EVPN advertises (rd and
-    # route targets auto)
+    # route targets auto unless an instance of evpn_instances names them)
+    evpn_instances: Dict[str, "EvpnInstance"] = field(default_factory=dict)  # by name
+    mcast_groups: Dict[int, str] = field(default_factory=dict)  # VLAN -> underlay multicast group its BUM traffic uses
+    # IOS: the VLAN that carries the layer 3 VNI of a VRF (vlan configuration N / member vni V, with an SVI in the VRF)
+    vrf_vlans: Dict[str, int] = field(default_factory=dict)
+    mlag_shared_mac: bool = False  # EOS: vxlan virtual-router encapsulation mac-address mlag-system-id
+    qos_propagation: List[str] = field(default_factory=list)  # EOS vxlan qos: "ecn", "dscp" (copied to the outer
+    # header)
+    origin: Origin = field(default_factory=Origin)
+
+
+@dataclass
+class EvpnInstance:
+    """An EVPN instance: VLANs whose MAC routes share a route distinguisher and route targets (EOS router bgp / vlan N
+    or vlan-aware-bundle NAME; IOS l2vpn evpn instance N vlan-based)."""
+
+    name: str  # the VLAN of a VLAN-based instance, or the bundle name
+    vlans: List[int] = field(default_factory=list)
+    bundle: bool = False  # one instance for several VLANs (EOS vlan-aware-bundle)
+    rd: str = ""  # "" = auto
+    rt_import: List[str] = field(default_factory=list)  # [] = auto
+    rt_export: List[str] = field(default_factory=list)
+    igmp: bool = False  # IGMP joins are advertised as EVPN routes (EOS redistribute igmp)
     origin: Origin = field(default_factory=Origin)
 
 

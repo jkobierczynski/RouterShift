@@ -28,6 +28,7 @@ from .. import multicast as multicast_text
 from .. import monitor as monitor_text
 from .. import tracking as tracking_text
 from .. import vxlan as vxlan_text
+from .. import evpn as evpn_text
 from .. import igp as igp_text
 from .. import routemap as routemap_text
 from .. import qos as qos_text
@@ -38,7 +39,7 @@ from .. import aaa as aaa_text
 from ..confparse import Node
 from ..errors import ParseError
 from ..model import (IpSla, Netflow, Sflow, AaaGroup, AaaMethod, AaaServer, Acl, Device, LocalUser, DhcpPool, FhrpGroup, IkePolicy, IpsecPeer, IpsecTransform, NtpKey, PreSharedKey,
-                     SnmpCommunity, SnmpGroup, SnmpHost, SnmpUser, NatPool, NatRule, Interface, InterfaceKind, LacpMode, Origin, Ospf, OspfNetwork, Wlan, Mlag, Rip, Isis,
+                     EvpnInstance, Vxlan, SnmpCommunity, SnmpGroup, SnmpHost, SnmpUser, NatPool, NatRule, Interface, InterfaceKind, LacpMode, Origin, Ospf, OspfNetwork, Wlan, Mlag, Rip, Isis,
                      QosAction, QosClass, QosPolicy, StaticRoute, BgpNeighbor, BgpVrf, StpMode, SwitchportMode, Unparsed, Vlan)
 
 # Lines that only describe the file or the software, not the device's behaviour.
@@ -150,6 +151,13 @@ class _Reader:
         self._sflow_off: List[str] = []  # EOS: ports with no sflow enable
         self._nve_vrfs: Dict[int, str] = {}  # IOS nve: layer 3 VNI -> VRF
         self._nve_vlans: Dict[int, int] = {}  # IOS: VNI -> VLAN of vlan configuration / member vni
+        self._nve_groups: Dict[int, str] = {}  # IOS nve: VNI -> its multicast group
+        self._evpn_peers: Dict[str, List[str]] = {}
+        self._evi_vlans: Dict[str, int] = {}  # IOS: EVPN instance -> its VLAN
+        self._ios_evis: Dict[str, EvpnInstance] = {}  # IOS l2vpn evpn instance N -> its RD and targets
+        self._evpn_flap: Optional[Tuple[int, int]] = None  # IOS l2vpn evpn / mac duplication limit N time S  # EOS: neighbors in the remote EVPN domain
+        self._ios_segments: Dict[int, Interface] = {}  # IOS l2vpn evpn ethernet-segment N, read into a stand-in
+        self._ios_es_ports: Dict[str, int] = {}  # IOS: port-channel -> its ethernet segment
         # Set by a line handler that understood part of a line: the report group and reason the line is listed under
         self._reason: Optional[Tuple[str, str]] = None
         self._stp_defaults: Dict[str, bool] = {}  # IOS: spanning-tree portfast [bpduguard] default
@@ -1750,6 +1758,9 @@ class _Reader:
             elif w[0] == "vlan" and len(w) == 2 and w[1].isdigit() and self.device.platform == "eos":
                 self._eos_evpn_vlan(int(w[1]), child)
                 continue
+            elif w[0] == "vlan-aware-bundle" and len(w) == 2 and self.device.platform == "eos":
+                self._eos_evpn_bundle(w[1], child)
+                continue
             elif w[0] == "address-family":
                 self.unparsed(child, node.text)
                 continue
@@ -1764,6 +1775,12 @@ class _Reader:
                     continue
                 if lw[0] in ("exit-peer-session", "exit-peer-policy"):
                     continue
+                if af == "evpn":
+                    try:
+                        if evpn_text.af_line(self._evpn_peers, b.bgp, lw):
+                            continue
+                    except (ValueError, IndexError):
+                        pass
                 try:
                     understood = self.bgp_line(b, self._direct(line.words), af)
                 except (ValueError, IndexError):
@@ -1774,6 +1791,7 @@ class _Reader:
                     self.unparsed(line, f"{node.text} / {child.text}" if af else node.text)
         self._apply_templates(b)
         self.device.bgp = b.finish()
+        self.device.bgp.evpn_remote_peers = self._evpn_peers.get("remote", [])
         for name, (vb, v) in self._bgp_vrfs.items():
             finished = vb.finish()
             v.neighbors = finished.neighbors
@@ -1835,8 +1853,8 @@ class _Reader:
         self._add_vrf(name)
         for child in node.children:
             c = self._direct(child.words)
-            if c == ["exit-address-family"]:
-                continue
+            if c in (["exit-address-family"], ["advertise", "l2vpn", "evpn"]):
+                continue  # (IOS: the VRF's routes go to EVPN as type 5 routes; the layer 3 VNI says so)
             try:
                 if c[0] == "maximum-paths" and len(c) in (2, 3) and c[-1].isdigit():
                     v.maximum_paths = int(c[-1])
@@ -1887,10 +1905,35 @@ class _Reader:
                 self.unparsed(child, node.text)
 
     def _eos_evpn_vlan(self, vid: int, node: Node) -> None:
-        """EOS: router bgp / vlan N with rd auto, route-target both auto, redistribute learned."""
-        vxlan_text.vtep(self.device).evpn_vlans.append(vid)
+        """EOS: router bgp / vlan N with rd, route-target import|export|both and redistribute learned."""
+        inst = evpn_text.instance(vxlan_text.vtep(self.device), str(vid), [vid])
+        inst.origin = Origin(node.line, node.text)
         for child in node.children:
-            if child.words not in (["rd", "auto"], ["route-target", "both", "auto"], ["redistribute", "learned"]):
+            try:
+                ok = evpn_text.instance_line(inst, child.words)
+            except (ValueError, IndexError):
+                ok = False
+            if not ok:
+                self.unparsed(child, node.text)
+
+    def _eos_evpn_bundle(self, name: str, node: Node) -> None:
+        """EOS: router bgp / vlan-aware-bundle NAME with rd, route targets, redistribute and vlan LIST."""
+        vx = vxlan_text.vtep(self.device)
+        inst = evpn_text.instance(vx, name, [], bundle=True)
+        inst.origin = Origin(node.line, node.text)
+        for child in node.children:
+            c = child.words
+            try:
+                if c[0] == "vlan" and len(c) == 2:
+                    vlans = evpn_text.vlan_list(c[1])
+                    inst.vlans += vlans
+                    vx.evpn_vlans += [v for v in vlans if v not in vx.evpn_vlans]
+                    ok = True
+                else:
+                    ok = evpn_text.instance_line(inst, c)
+            except (ValueError, IndexError):
+                ok = False
+            if not ok:
                 self.unparsed(child, node.text)
 
     def _vxlan_interface(self, node: Node) -> bool:
@@ -1915,6 +1958,15 @@ class _Reader:
                     vx.vrf_vnis[w[1]] = int(w[3])
                 elif w[:2] == ["flood", "vtep"] and n >= 3:
                     vx.flood_vteps += [str(ipaddress.ip_address(a)) for a in w[2:]]
+                elif w[0] == "mcast-group" and n == 4 and w[2] == "vlan":
+                    for vid in evpn_text.vlan_list(w[3]):
+                        vx.mcast_groups[vid] = str(ipaddress.IPv4Address(w[1]))
+                elif w == ["virtual-router", "encapsulation", "mac-address", "mlag-system-id"]:
+                    vx.mlag_shared_mac = True
+                elif w[:3] == ["qos", "ecn", "propagation"] and n == 3:
+                    vx.qos_propagation.append("ecn")
+                elif w == ["qos", "dscp", "propagation", "encapsulation"]:
+                    vx.qos_propagation.append("dscp")
                 else:
                     self.unparsed(child, node.text)
             elif w[0] == "source-interface" and n == 2:
@@ -1925,6 +1977,8 @@ class _Reader:
                 vni = int(w[2])
                 if w[3:4] == ["vrf"] and n == 5:
                     self._nve_vrfs[vni] = w[4]
+                elif w[3:4] == ["mcast-group"] and n == 5:
+                    self._nve_groups[vni] = str(ipaddress.IPv4Address(w[4]))
                 elif w[3:] not in ([], ["ingress-replication"]):
                     self.unparsed(child, node.text)
                 for grand in child.children:
@@ -1945,14 +1999,37 @@ class _Reader:
         vxlan)."""
         w = node.words
         if w == ["l2vpn", "evpn"]:
-            ok = ("replication-type", "router-id", "logging")
+            ok = ("replication-type", "router-id", "logging", "default-gateway")
             for child in node.children:
-                if child.words[0] not in ok:
+                c = child.words
+                if c[:3] == ["mac", "duplication", "limit"] and len(c) == 6 and c[4] == "time":
+                    self._evpn_flap = (int(c[5]), int(c[3]))  # (window, moves)
+                elif c[0] not in ok:
                     self.unparsed(child, node.text)
             return True
         if w[:3] == ["l2vpn", "evpn", "instance"] and len(w) == 5 and w[4] == "vlan-based":
+            inst = EvpnInstance(w[3])
+            inst.origin = Origin(node.line, node.text)
             for child in node.children:
-                if child.words not in (["encapsulation", "vxlan"], ["replication-type", "ingress"]):
+                c = child.words
+                if c in (["encapsulation", "vxlan"], ["replication-type", "ingress"], ["replication-type", "static"]):
+                    continue
+                try:
+                    understood = evpn_text.instance_line(inst, c)
+                except (ValueError, IndexError):
+                    understood = False
+                if not understood:
+                    self.unparsed(child, node.text)
+            self._ios_evis[w[3]] = inst
+            return True
+        if w[:3] == ["l2vpn", "evpn", "ethernet-segment"] and len(w) == 4 and w[3].isdigit():
+            es = self._ios_segments.setdefault(int(w[3]), Interface("es", InterfaceKind.OTHER))
+            for child in node.children:
+                try:
+                    understood = evpn_text.ios_es_line(es, child.words)
+                except (ValueError, IndexError):
+                    understood = False
+                if not understood:
                     self.unparsed(child, node.text)
             return True
         return False
@@ -1966,6 +2043,7 @@ class _Reader:
                 vx = vxlan_text.vtep(self.device)
                 vx.vlan_vnis[vid] = int(c[4])
                 vx.evpn_vlans.append(vid)
+                self._evi_vlans[c[2]] = vid
             elif c[:2] == ["member", "vni"] and len(c) == 3:
                 self._nve_vlans[int(c[2])] = vid
             else:
@@ -2602,6 +2680,8 @@ class _Reader:
                     child.words[1].isdigit():
                 self._nxos_fhrp(iface, child)
                 continue
+            if child.children and self._interface_block(iface, child):
+                continue
             self._reason = None
             try:
                 understood = self.interface_line(iface, child.words)
@@ -2621,6 +2701,19 @@ class _Reader:
             if group.protocol == "hsrp":
                 group.version = hsrp_version
         return True
+
+    def _interface_block(self, iface: Interface, node: Node) -> bool:
+        """Interface lines with a block of their own: EOS evpn ethernet-segment."""
+        if node.words == ["evpn", "ethernet-segment"]:
+            for child in node.children:
+                try:
+                    ok = evpn_text.es_line(iface, child.words)
+                except (ValueError, IndexError):
+                    ok = False
+                if not ok:
+                    self.unparsed(child, f"interface {iface.source_name} / {node.text}")
+            return True
+        return False
 
     # first-hop redundancy --------------------------------------------------------------------------------------------
 
@@ -3006,6 +3099,19 @@ class _Reader:
             setattr(iface, "lldp_tx" if w[2] == "transmit" else "lldp_rx", False)
         elif w[0] == "mlag" and n == 2 and w[1].isdigit():
             iface.mlag_id = int(w[1])
+        elif w[:2] == ["evpn", "ethernet-segment"] and n == 3 and w[2].isdigit():
+            self._ios_es_ports[iface.name] = int(w[2])  # IOS: the segment is defined under l2vpn evpn
+        elif w[:2] == ["lacp", "system-id"] and n == 3:
+            iface.lacp_system_id = w[2].lower()
+        elif w == ["no", "autostate"]:
+            iface.autostate = False
+        elif w[0] == "mac-address" and n == 2 and iface.kind == InterfaceKind.VLAN:
+            digits = w[1].replace(".", "").replace(":", "").lower()
+            if len(digits) != 12:
+                return False
+            iface.mac_address = ":".join(digits[i:i + 2] for i in range(0, 12, 2))
+        elif w[:2] == ["ip", "unnumbered"] and n == 3 or w[:3] == ["ip", "address", "unnumbered"] and n == 4:
+            iface.unnumbered = names.canonical(w[-1])[0]
         elif w in (["cdp", "enable"], ["no", "cdp", "enable"]):
             iface.cdp = w[0] == "cdp"
         elif w == ["mpls", "ip"] or w == ["mpls", "ldp", "interface"]:
@@ -3097,11 +3203,7 @@ class _Reader:
         multicast_text.finish(self.device)
         self._finish_monitor()
         if self.device.vxlan is not None:
-            for vni, vrf in self._nve_vrfs.items():
-                self.device.vxlan.vrf_vnis[vrf] = vni
-            for vni, vid in self._nve_vlans.items():  # a VLAN mapped to a VNI without EVPN floods to static peers
-                if vni not in self._nve_vrfs:
-                    self.device.vxlan.vlan_vnis[vid] = vni
+            self._finish_evpn(self.device.vxlan)
         for wl in self.device.wlans:
             wl.vlan = self._wlan_profiles.get(self._wlan_tags.get(wl.name, ""))
         self._finish_aaa()
@@ -3160,6 +3262,44 @@ class _Reader:
         tags = {tag for tag, _ in self._ospf_vrfs}
         self.device.ospf = [p for p in self.device.ospf if not (
             p.process in tags and not p.vrf and p == Ospf(process=p.process, origin=p.origin))]
+
+    def _finish_evpn(self, vx: Vxlan) -> None:
+        """IOS: the VNIs of interface nve1 meet their VLANs, VRFs, EVPN instances and ethernet segments."""
+        for vni, vrf in self._nve_vrfs.items():
+            vx.vrf_vnis[vrf] = vni
+        for vni, vid in self._nve_vlans.items():  # a VLAN mapped to a VNI without EVPN floods to static peers
+            if vni in self._nve_vrfs:
+                # the VLAN and SVI only carry the layer 3 VNI: the model keeps them as the VRF's VNI VLAN
+                vx.vrf_vlans[self._nve_vrfs[vni]] = vid
+                self.device.vlans.pop(vid, None)
+                self.device.interfaces.pop(f"Vlan{vid}", None)
+            else:
+                vx.vlan_vnis[vid] = vni
+        # IOS XE distributed anycast gateway: an SVI of an EVPN VLAN with a MAC of its own, the same on every switch
+        for iface in self.device.interfaces.values():
+            if iface.kind == InterfaceKind.VLAN and iface.mac_address and iface.name[4:].isdigit() and \
+                    int(iface.name[4:]) in vx.evpn_vlans and not iface.fhrp:
+                iface.virtual_ipv4, iface.ipv4 = iface.ipv4, []
+                iface.virtual_ipv6, iface.ipv6 = iface.ipv6, []
+                self._varp_mac, iface.mac_address = iface.mac_address, ""
+        by_vni = {vni: vid for vid, vni in vx.vlan_vnis.items()}
+        for vni, group in self._nve_groups.items():
+            if vni in by_vni:
+                vx.mcast_groups[by_vni[vni]] = group
+        for evi, inst in self._ios_evis.items():
+            evi_vlan = self._evi_vlans.get(evi)
+            if evi_vlan is not None and (inst.rd or inst.rt_import or inst.rt_export):
+                inst.name, inst.vlans = str(evi_vlan), [evi_vlan]
+                vx.evpn_instances[inst.name] = inst
+        if self._evpn_flap and self.device.bgp is not None:
+            moves, window = self._evpn_flap[1], self._evpn_flap[0]
+            self.device.bgp.evpn_host_flap = (window, moves, 0)
+        for name, number in self._ios_es_ports.items():
+            es = self._ios_segments.get(number)
+            port = self.device.interfaces.get(name)
+            if es is not None and port is not None:
+                port.evpn_esi, port.evpn_single_active = es.evpn_esi, es.evpn_single_active
+                port.evpn_df_preference = es.evpn_df_preference
 
     def _finish_stp(self) -> None:
         """IOS: spanning-tree portfast default and portfast bpduguard default, written out on each port they cover."""

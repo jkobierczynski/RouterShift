@@ -433,6 +433,6 @@ def test_converts_and_reads_back(source: str, target: str) -> None:
         assert bx is not None
         assert bool(bx.source_interface) == bool(fx.source_interface)
         assert bx.vlan_vnis == fx.vlan_vnis and sorted(bx.evpn_vlans) == sorted(fx.evpn_vlans)
-        assert sorted(bx.vrf_vnis.values()) == ([] if target == "ios" else sorted(fx.vrf_vnis.values()))
+        assert sorted(bx.vrf_vnis.values()) == sorted(fx.vrf_vnis.values())
         assert bx.flood_vteps == (fx.flood_vteps if set(fx.vlan_vnis) - set(fx.evpn_vlans) else bx.flood_vteps)
     assert report.counts()

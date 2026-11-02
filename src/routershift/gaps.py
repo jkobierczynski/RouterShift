@@ -86,6 +86,8 @@ def unwritten(device: Device, report: Report, target: str, port: Callable[[str],
         if info.export_map or info.rt_evpn:
             add("system", f"vrf {name}", "the EVPN route targets and export route map:", Severity.APPROX)
     routemap_text.lists_unsupported(device, report, platform)
+    for kind, item, what, severity in later_features(device, report, port):
+        add(kind, item, what, severity)
     s = device.system
     if s.syslog_transport:
         add("system", "syslog servers", "the transport of " + ", ".join(
@@ -101,6 +103,34 @@ def unwritten(device: Device, report: Report, target: str, port: Callable[[str],
                 report.add("qos", f"policy {policy.name}", Severity.APPROX, "qos-burst",
                            f"class {action.qos_class}: the burst of {action.burst_bytes} bytes is not converted; the "
                            f"{platform} default is used")
+
+
+def later_features(device: Device, report: Report, port: Callable[[str], str]) -> List[Tuple[str, str, str, Severity]]:
+    """Settings of the data-centre and management features only the IOS and EOS writer writes: (report kind, item,
+    what is not written, severity)."""
+    found: List[Tuple[str, str, str, Severity]] = []
+    vx = device.vxlan
+    if vx is not None:
+        named = [i.name for i in vx.evpn_instances.values() if i.rd or i.rt_import or i.rt_export or i.bundle]
+        if named:
+            found.append(("interface", "VXLAN", "the route distinguishers and route targets of EVPN instances "
+                          + ", ".join(named) + ":", Severity.REVIEW))
+        if vx.mcast_groups:
+            found.append(("interface", "VXLAN", "the multicast groups of VLANs "
+                          + ", ".join(str(v) for v in vx.mcast_groups) + ":", Severity.REVIEW))
+    bgp = device.bgp
+    if bgp is not None and (bgp.evpn_domain or bgp.evpn_remote_peers or bgp.evpn_host_flap):
+        found.append(("bgp", f"bgp {bgp.local_as}", "the EVPN domain gateway and host-flap settings:",
+                      Severity.REVIEW))
+    for iface in device.interfaces.values():
+        label = _interface_item(report, iface, port)
+        options = [w for w, v in (("the EVPN ethernet segment", iface.evpn_esi),
+                                  ("the LACP system ID", iface.lacp_system_id),
+                                  ("the SVI MAC address", iface.mac_address), ("no autostate", iface.autostate is False),
+                                  ("the unnumbered address", iface.unnumbered)) if v]
+        if options:
+            found.append(("interface", label, ", ".join(options) + ":", Severity.REVIEW))
+    return found
 
 
 # Section of the source -> the report item it belongs to --------------------------------------------------------------

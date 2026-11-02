@@ -45,4 +45,4 @@ def test_reports() -> None:
     assert "Comware: VXLAN (VNIs 10100, 10200, 50001) is not written" in text
     assert "Comware: the EVPN address family of 10.255.255.9 is not written" in text
     _, report = convert(sample("eos_leaf.cfg"), "eos", "ios")
-    assert "the VNIs of PROD are not written" in report.to_text()
+    assert "VNI 50001 (PROD) in VLAN 3900" in report.to_text()
