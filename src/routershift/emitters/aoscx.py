@@ -19,6 +19,7 @@ from .. import bfd as bfd_text
 from .. import igp as igp_text
 from .. import aoscxfabric as fabric
 from .. import aoscxqos
+from .. import aoscxsec
 from .. import routemap as routemap_text
 from .. import bgp as bgp_text
 from .. import dhcp as dhcp_text
@@ -67,6 +68,7 @@ class Writer:
         self.vrfs()
         self.spanning_tree()
         self.acls()
+        self.security()
         self.policies()
         if bfd_text.uses_bfd(self.device):
             self.out.append("bfd")
@@ -523,6 +525,13 @@ class Writer:
         if instances or vlans:
             self.report.item("system", "bridge priority")
 
+    def security(self) -> None:
+        """MAC ACLs, MACsec policies, and the control plane's ACLs and policing."""
+        for mac_acl in self.device.mac_acls.values():
+            self.out += aoscxsec.mac_acl_lines(mac_acl, self.report, _IND)
+        self.out += aoscxsec.macsec(self.device, self.report, _IND)
+        self.out += aoscxsec.control_plane(self.device, self.report, self.vrf, _IND)
+
     def acls(self) -> None:
         for acl in self.device.acls.values():
             name = acl_text.safe_name(acl.name)
@@ -796,6 +805,7 @@ class Writer:
                 hosts_text.poe_limit(iface, add, "AOS-CX", False)
         lines += self._port_access_interface(iface, add)
         lines += self._qos_interface(iface, add)
+        lines += aoscxsec.mac_acl_interface(self.device, iface, add)
         lines += [f"no lldp {name}" for name, on in (("transmit", iface.lldp_tx), ("receive", iface.lldp_rx)) if not on]
         lines += self._l2sec_interface(iface, add)
         if iface.stp_portfast:

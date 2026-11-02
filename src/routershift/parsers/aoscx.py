@@ -27,6 +27,7 @@ from .. import acl as acl_text
 from .. import bfd as bfd_text
 from .. import aoscxfabric as fabric
 from .. import aoscxqos
+from .. import aoscxsec
 from .. import multicast as multicast_text
 from .. import routemap as routemap_text
 from .. import bgp as bgp_text
@@ -41,7 +42,7 @@ from .. import confparse
 from ..confparse import Node
 from ..errors import ParseError
 from ..model import (BgpVrf, Sflow, AaaGroup, AaaMethod, AaaServer, Acl, Device, LocalUser, DhcpPool, FhrpGroup, NtpKey, SnmpCommunity, SnmpHost, SnmpUser, Interface, InterfaceKind, LacpMode, Origin, Ospf, QosAction, QosClass,
-                     QosPolicy, QosProfile, StaticRoute, StpMode, SwitchportMode, Unparsed, Vlan, Mlag)
+                     QosPolicy, QosProfile, MacAcl, StaticRoute, StpMode, SwitchportMode, Unparsed, Vlan, Mlag)
 from .ioslike import _is_address, _vlan_ids
 
 MGMT_VRF = "mgmt"
@@ -133,6 +134,13 @@ class _Reader:
             "vsx": self.vsx,
             "vsf": self.vsf,
             "qos": self.qos,
+            "apply": lambda node: aoscxsec.control_plane_acl(self.device, node.words),
+            "copp-policy": lambda node: len(node.words) == 2 and self.policy_node(
+                node, aoscxsec.copp_policy(self.device, [c.words for c in node.children])),
+            "macsec": lambda node: node.words[:2] == ["macsec", "policy"] and len(node.words) == 3 and
+            self.policy_node(node, aoscxsec.macsec_policy(self.device, node.words[2], [c.words for c in node.children])),
+            "mka": lambda node: node.words[:2] == ["mka", "policy"] and len(node.words) == 3 and
+            self.policy_node(node, aoscxsec.mka_policy(self.device, node.words[2], [c.words for c in node.children])),
             "mirror": self.mirror,
             "evpn": self.evpn,
             "sflow": self.sflow,
@@ -602,6 +610,16 @@ class _Reader:
     def acl(self, node: Node) -> bool:
         """access-list ip NAME / access-list ipv6 NAME, entries "10 permit tcp 10.0.0.0/255.255.255.0 any eq 443"."""
         w = node.words
+        if len(w) == 3 and w[1] == "mac":
+            mac_acl = self.device.mac_acls.setdefault(w[2], MacAcl(w[2], origin=Origin(node.line, node.text)))
+            for child in node.children:
+                try:
+                    ok = aoscxsec.mac_acl_line(mac_acl, child.words)
+                except (ValueError, KeyError, IndexError):
+                    ok = False
+                if not ok:
+                    self.unparsed(child, node.text)
+            return True
         if len(w) != 3 or w[1] not in ("ip", "ipv6"):
             return False
         family = 6 if w[1] == "ipv6" else 4
@@ -1233,6 +1251,8 @@ class _Reader:
             setattr(iface, f"acl{'6' if w[2] == 'ipv6' else ''}_{w[4].replace('routed-', '')}", w[3])
         elif w[:2] == ["apply", "policy"] and n == 4 and w[3] in ("in", "out", "routed-in", "routed-out"):
             setattr(iface, f"qos_policy_{w[3].replace('routed-', '')}", w[2])
+        elif aoscxsec.interface_line(self.device, iface, w):
+            pass
         elif w[:3] == ["apply", "qos", "schedule-profile"] and n == 4:
             self._schedule[iface.name] = w[3]
         elif w[:2] == ["qos", "trust"] and n == 3 and w[2] in ("dscp", "cos", "none"):
