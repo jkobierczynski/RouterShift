@@ -31,6 +31,7 @@ from .. import aoscxsec
 from .. import aoscxmon
 from .. import aoscxmgmt
 from .. import aoscxauto
+from .. import aoscxrouting
 from .. import multicast as multicast_text
 from .. import routemap as routemap_text
 from .. import bgp as bgp_text
@@ -97,6 +98,7 @@ class _Reader:
         self._user_groups: Dict[str, str] = {}  # user -> a user group of the switch's own
         self._rest_api = False
         self._ptp = aoscxauto.PtpReader(self.device)
+        self._pbr = aoscxrouting.PbrReader(self.device)
         self._lldp: Dict[str, int] = {}  # lldp holdtime-multiplier and management address, resolved at the end
 
     def unparsed(self, node: Node, section: str = "") -> None:
@@ -162,6 +164,8 @@ class _Reader:
             "user-group": lambda node: len(node.words) == 2 and self.policy_node(
                 node, aoscxmgmt.read_user_group(self.device, node.words[1], [c.words for c in node.children])),
             "password": self.password,
+            "pbr-action-list": lambda node: len(node.words) == 2 and self.policy_node(
+                node, self._pbr.action_list(node.words[1], [c.words for c in node.children])),
             "ptp": lambda node: node.words == ["ptp", "profile", aoscxauto.PROFILE] and self.policy_node(
                 node, self._ptp.profile([c.words for c in node.children])),
             "track": lambda node: aoscxmon.read_track(self.device, node.words, lambda x: canonical(x)[0], node.line,
@@ -694,6 +698,8 @@ class _Reader:
         self.device.qos_policies[policy.name] = policy
         for child in node.children:
             c = child.words
+            if self._pbr.policy_entry(policy.name, c):
+                continue
             action = QosAction(c[3]) if len(c) >= 4 and c[0].isdigit() and c[1:3] == ["class", "ip"] else None
             args = c[4:]
             while action is not None and args:
@@ -991,6 +997,8 @@ class _Reader:
     @staticmethod
     def ospf_line(p: Ospf, w: List[str]) -> bool:
         n = len(w)
+        if aoscxrouting.read_ospf_line(p, w):
+            return True
         if w[0] == "router-id" and n == 2:
             p.router_id = str(ipaddress.IPv4Address(w[1]))
         elif w == ["passive-interface", "default"]:
@@ -1298,7 +1306,9 @@ class _Reader:
             setattr(iface, f"acl{'6' if w[2] == 'ipv6' else ''}_{w[4].replace('routed-', '')}", w[3])
         elif w[:2] == ["apply", "policy"] and n == 4 and w[3] in ("in", "out", "routed-in", "routed-out"):
             setattr(iface, f"qos_policy_{w[3].replace('routed-', '')}", w[2])
-        elif aoscxsec.interface_line(self.device, iface, w) or aoscxauto.PtpReader.interface_line(iface, w):
+        elif aoscxsec.interface_line(self.device, iface, w) or aoscxauto.PtpReader.interface_line(iface, w) or \
+                aoscxrouting.read_ospf_interface(iface, w) or \
+                iface.kind == InterfaceKind.TUNNEL and aoscxrouting.read_tunnel_line(iface, w):
             pass
         elif w[:3] == ["apply", "qos", "schedule-profile"] and n == 4:
             self._schedule[iface.name] = w[3]
@@ -1416,6 +1426,7 @@ class _Reader:
         self._anycast()
         qos_text.adopt(self.device, self._class_acls)
         aoscxqos.finish(self.device, self._schedule)
+        self._pbr.finish()
         aoscxmon.finish_lldp(self.device, self._lldp)
         aoscxmgmt.finish(self.device, self._user_keys, self._user_groups, self._rest_api)
         self._ptp.finish()

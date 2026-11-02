@@ -23,6 +23,7 @@ from .. import aoscxsec
 from .. import aoscxmon
 from .. import aoscxmgmt
 from .. import aoscxauto
+from .. import aoscxrouting
 from .. import routemap as routemap_text
 from .. import bgp as bgp_text
 from .. import dhcp as dhcp_text
@@ -75,8 +76,12 @@ class Writer:
         self.policies()
         if bfd_text.uses_bfd(self.device):
             self.out.append("bfd")
-        bfd_text.pbr_unsupported(self.device, self.report, "AOS-CX")
-        igp_text.unsupported(self.device, self.report, "AOS-CX")
+        aoscxrouting.bfd_ecmp(self.device, self.report)
+        if self.device.rip is not None:
+            self.report.skip("rip", igp_text.RIP_LABEL, "rip-unsupported", "AOS-CX has no RIP; left out")
+        if self.device.isis is not None:
+            self.report.skip("isis", igp_text.isis_label(self.device.isis), "isis-unsupported",
+                             "AOS-CX has no IS-IS; left out")
         self.qos()
         self.vlans()
         self.groups = {i.name: fhrp.plan(i, "aoscx", self.report, self.port(i.name))
@@ -771,11 +776,17 @@ class Writer:
         def add(severity: Severity, code: str, message: str) -> None:
             self.report.add("interface", label, severity, code, message)
 
+        tunnel: List[str] = []
         if iface.kind == InterfaceKind.TUNNEL:
-            self.report.skip("interface", label, "tunnel",
-                             "tunnel interfaces are not converted for AOS-CX yet; configure it by hand")
-            return
-        lines: List[str] = ["shutdown" if iface.shutdown else "no shutdown"]
+            found = aoscxrouting.tunnel_lines(self.device, iface, add,
+                                              lambda i: i.ipv4[0].split("/")[0] if i.ipv4 else "")
+            if found is None:
+                self.report.skip("interface", label, "tunnel",
+                                 "an IPsec tunnel interface has no AOS-CX form (AOS-CX terminates no VPNs); move it "
+                                 "to a router or firewall")
+                return
+            tunnel = found
+        lines: List[str] = tunnel + ["shutdown" if iface.shutdown else "no shutdown"]
         if iface.description:
             lines.append(f"description {iface.description}")
         if iface.mtu is not None:
@@ -833,6 +844,7 @@ class Writer:
         lines += self._qos_interface(iface, add)
         lines += aoscxsec.mac_acl_interface(self.device, iface, add)
         lines += aoscxauto.ptp_interface(iface)
+        lines += self.pbr.interface(iface, add)
         lines += [f"no lldp {name}" for name, on in (("transmit", iface.lldp_tx), ("receive", iface.lldp_rx)) if not on]
         lines += self._l2sec_interface(iface, add)
         if iface.stp_portfast:
@@ -915,6 +927,7 @@ class Writer:
             lines.append(f"redistribute {source}" + (f" route-map {rm}" if rm else ""))
         if p.bfd_all:
             lines.append("bfd all-interfaces")
+        lines += aoscxrouting.ospf_option_lines(p, self.report, label)
         if p.default_originate:
             lines.append("default-information originate" + (" always" if p.default_originate == "always" else ""))
         for dotted in sorted(set(areas.values()) | set(p.area_types), key=ospf_text.area_number):
@@ -955,10 +968,12 @@ class Writer:
         for pl in self.device.prefix_lists.values():
             self.out += routemap_text.ios_prefix_lines(pl, "aoscx")
         self.out += routemap_text.ios_list_lines(self.device, "aoscx", self.report)
-        skip = bfd_text.pbr_only(self.device)  # reported with the interface
+        skip = bfd_text.pbr_only(self.device)  # written as classifier policies
         for rm in self.device.route_maps.values():
             if rm.name not in skip:
                 self.out += routemap_text.ios_route_map_lines(rm, "aoscx", self.report, _IND)
+        self.pbr = aoscxrouting.PbrWriter(self.device, self.report, _IND)
+        self.out += self.pbr.lines()
 
     def bgp(self) -> None:
         bgp = self.device.bgp
@@ -1079,6 +1094,9 @@ class Writer:
             lines.append(f"ip ospf network {iface.ospf_network}")
         if iface.ospf_bfd and not any(p.bfd_all for p in self.device.ospf):
             lines.append("ip ospf bfd")
+        label = f"{iface.source_name or iface.name} -> {self.port(iface.name)}"
+        lines += aoscxrouting.ospf_auth_lines(
+            iface, lambda severity, code, message: self.report.add("interface", label, severity, code, message))
         return lines + bfd_text.separate_lines(iface)
 
     def _layer2(self, iface: Interface, add: _Add) -> List[str]:

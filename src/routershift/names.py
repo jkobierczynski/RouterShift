@@ -221,7 +221,7 @@ class PortMapper:
 
     def _aoscx_logical(self, iface: Interface) -> str:
         name = iface.name
-        for prefix, word in (("Port-channel", "lag"), ("Vlan", "vlan"), ("Loopback", "loopback")):
+        for prefix, word in (("Port-channel", "lag"), ("Vlan", "vlan"), ("Loopback", "loopback"), ("Tunnel", "tunnel")):
             if name.startswith(prefix) and iface.kind != InterfaceKind.SUBINTERFACE:
                 return f"{word} {name[len(prefix):]}"
         if iface.kind == InterfaceKind.MANAGEMENT:
