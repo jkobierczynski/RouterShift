@@ -100,6 +100,15 @@ class System:
     logging_source: str = ""  # canonical name of the interface syslog packets leave from
     # Syslog servers that do not use UDP port 514: address -> (protocol "udp", "tcp" or "tls", port)
     syslog_transport: Dict[str, Tuple[str, int]] = field(default_factory=dict)
+    banner_login: str = ""  # shown before the login prompt
+    banner_exec: str = ""  # IOS: shown after login (EOS has none)
+    logging_buffer: Optional[int] = None  # local log buffer size, bytes
+    logging_buffer_level: Optional[int] = None  # severity kept in it
+    logging_console_level: Optional[int] = None  # severity shown on the console; -1 = console logging off
+    logging_monitor_level: Optional[int] = None  # the same on remote terminals
+    logging_timestamp: str = ""  # "msec": timestamps with sub-second resolution (EOS high-resolution)
+    logging_hostname: str = ""  # what names the device in syslog messages: "hostname", "fqdn" or "ip"
+    logging_facility_levels: Dict[str, int] = field(default_factory=dict)  # EOS logging level FACILITY SEVERITY
 
 
 @dataclass
@@ -151,6 +160,11 @@ class Management:
     lldp_holdtime: Optional[int] = None  # how long neighbours keep them
     lldp_mgmt_interface: str = ""  # EOS lldp management-address IF: the address advertised (canonical)
     lldp_mgmt_vrf: str = ""  # EOS lldp management-address vrf V
+    # Programmatic interfaces: "netconf", "gnmi", "http" (EOS eAPI / IOS RESTCONF) -> the VRF it serves in ("" = the
+    # default VRF)
+    apis: Dict[str, str] = field(default_factory=dict)
+    api_acls: Dict[str, str] = field(default_factory=dict)  # api -> the IPv4 ACL that limits its clients
+    password_min_length: Optional[int] = None  # local passwords at least this long
 
 
 @dataclass
@@ -690,6 +704,8 @@ class Snmp:
     users: List["SnmpUser"] = field(default_factory=list)
     source: str = ""  # canonical name of the interface SNMP packets leave from
     vrf: str = ""  # VRF the agent answers in, where the platform sets one for all of SNMP
+    views: Dict[str, List[Tuple[str, bool]]] = field(default_factory=dict)  # view -> (OID subtree, included)
+    engine_id: str = ""  # the local SNMPv3 engine ID (hex)
 
 
 @dataclass
@@ -742,6 +758,24 @@ class LocalUser:
     password: str = ""  # clear text, when the source has it (or a reversible type 7)
     password_hash: str = ""  # carried only when the target accepts the same hash
     hash_type: str = ""  # "md5-crypt" ($1$), "sha512-crypt" ($6$), or a platform's own form ("ios-scrypt", ...)
+    role: str = ""  # a role of the device's own (Device.roles): EOS role, IOS parser view
+    ssh_keys: List[str] = field(default_factory=list)  # public keys: "TYPE BASE64 [COMMENT]"
+    origin: Origin = field(default_factory=Origin)
+
+
+@dataclass
+class RoleRule:
+    action: str  # "permit" or "deny"
+    mode: str  # "exec" or "config" (EOS config-all and named modes are kept as written)
+    command: str  # EOS: a regular expression; IOS parser view: the command words, | between alternatives
+    sequence: Optional[int] = None
+
+
+@dataclass
+class Role:
+    """Role-based CLI access: the commands a user of the role may run (EOS role, IOS parser view)."""
+    name: str
+    rules: List[RoleRule] = field(default_factory=list)
     origin: Origin = field(default_factory=Origin)
 
 
@@ -1139,6 +1173,7 @@ class Device:
     qos_tc_dscp: Dict[int, int] = field(default_factory=dict)  # traffic class -> DSCP it is rewritten to
     snmp: Snmp = field(default_factory=Snmp)
     users: List[LocalUser] = field(default_factory=list)
+    roles: Dict[str, Role] = field(default_factory=dict)
     aaa: Aaa = field(default_factory=Aaa)
     unparsed: List[Unparsed] = field(default_factory=list)
 

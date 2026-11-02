@@ -179,6 +179,25 @@ def later_features(device: Device, report: Report, port: Callable[[str], str]) -
         found.append(("monitor", "sflow", "the sFlow extensions and the source interface's VRF:", Severity.APPROX))
     if device.netflow is not None and device.netflow.sample_rate:
         found.append(("monitor", "netflow", f"sampling 1 in {device.netflow.sample_rate}:", Severity.REVIEW))
+    sy = device.system
+    options = [w for w, v in (("the login banner", sy.banner_login), ("the exec banner", sy.banner_exec)) if v]
+    if options:
+        found.append(("system", "banners", ", ".join(options) + ":", Severity.REVIEW))
+    if sy.logging_buffer is not None or sy.logging_buffer_level is not None or sy.logging_console_level is not None \
+            or sy.logging_monitor_level is not None or sy.logging_timestamp or sy.logging_hostname \
+            or sy.logging_facility_levels:
+        found.append(("system", "local logging", "the logging buffer, console and syslog format:", Severity.APPROX))
+    if device.roles or any(u.role for u in device.users):
+        found.append(("management", "roles", "the CLI roles " + ", ".join(device.roles) + ":", Severity.REVIEW))
+    if any(u.ssh_keys for u in device.users):
+        found.append(("management", "SSH keys", "the users' SSH public keys:", Severity.REVIEW))
+    if device.snmp.views or device.snmp.engine_id:
+        found.append(("management", "SNMP views", "the SNMP views and engine ID:", Severity.REVIEW))
+    if m_.apis:
+        found.append(("management", "programmatic interfaces", "the APIs " + ", ".join(m_.apis) + ":",
+                      Severity.REVIEW))
+    if m_.password_min_length is not None:
+        found.append(("management", "password length", "the minimum password length:", Severity.APPROX))
     # (new device-level settings go above this line)
     for iface in device.interfaces.values():
         label = _interface_item(report, iface, port)

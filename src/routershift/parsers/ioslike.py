@@ -38,9 +38,10 @@ from .. import confparse, names
 from .. import dhcp as dhcp_text
 from .. import vpn as vpn_text
 from .. import aaa as aaa_text
+from .. import access as access_text
 from ..confparse import Node
 from ..errors import ParseError
-from ..model import (IpSla, Netflow, Sflow, AaaGroup, AaaMethod, AaaServer, Acl, Device, LocalUser, DhcpPool, FhrpGroup, IkePolicy, IpsecPeer, IpsecTransform, NtpKey, PreSharedKey,
+from ..model import (Role, IpSla, Netflow, Sflow, AaaGroup, AaaMethod, AaaServer, Acl, Device, LocalUser, DhcpPool, FhrpGroup, IkePolicy, IpsecPeer, IpsecTransform, NtpKey, PreSharedKey,
                      EvpnInstance, Vxlan, CoppClass, MacAcl, MacsecProfile, QosProfile, QosQueue, SnmpCommunity, SnmpGroup, SnmpHost, SnmpUser, NatPool, NatRule, Interface, InterfaceKind, LacpMode, Origin, Ospf, OspfNetwork, Wlan, Mlag, Rip, Isis,
                      QosAction, QosClass, QosPolicy, StaticRoute, BgpNeighbor, BgpVrf, StpMode, SwitchportMode, Unparsed, Vlan)
 
@@ -197,6 +198,8 @@ class _Reader:
         for banner in banners:
             if banner.kind == "motd":
                 self.device.system.banner_motd = banner.text
+            elif banner.kind in ("login", "exec"):
+                setattr(self.device.system, f"banner_{banner.kind}", banner.text)
             else:
                 self.device.unparsed.append(Unparsed(
                     banner.line, f"banner {banner.kind}", "", "Login and exec banners",
@@ -226,7 +229,13 @@ class _Reader:
             "fhrp": self.fhrp_version,
             "router": self.router,
             "dhcp": self.eos_dhcp,
-            "service": lambda node: node.words == ["service", "dhcp"],
+            "service": self.service,
+            "role": self.eos_role,
+            "parser": self.parser_view,
+            "netconf-yang": self.ios_api,
+            "restconf": self.ios_api,
+            "gnxi": self.ios_api,
+            "security": self.ios_security_passwords,
             "crypto": self.crypto,
             "snmp-server": self.snmp,
             "username": self.username,
@@ -415,7 +424,122 @@ class _Reader:
             return not args and group.level in ("noauth", "auth", "priv")
         if w[1] == "user" and len(w) >= 5 and w[4] == "v3":
             return self._snmp_user(w[2], w[3], w[5:], origin)
+        if w[1] == "view" and len(w) == 5 and w[4] in ("included", "excluded"):
+            s.views.setdefault(w[2], []).append((w[3], w[4] == "included"))
+            return True
+        if w[1:3] == ["engineID", "local"] and len(w) == 4:
+            s.engine_id = w[3]
+            return True
         return False
+
+    def _local_logging(self, w: List[str]) -> bool:
+        """logging buffered [SIZE] [LEVEL], console / monitor LEVEL, EOS format and per-facility levels, IOS
+        origin-id."""
+        s = self.device.system
+        n = len(w)
+        if w[1] == "buffered" and 2 <= n <= 4:
+            for word in w[2:]:
+                if word.isdigit() and int(word) > 7:
+                    s.logging_buffer = int(word)
+                elif mgmt_text.level(word) is not None:
+                    s.logging_buffer_level = mgmt_text.level(word)
+                else:
+                    return False
+            return True
+        if w[1] in ("console", "monitor") and n == 3 and mgmt_text.level(w[2]) is not None:
+            setattr(s, f"logging_{w[1]}_level", mgmt_text.level(w[2]))
+            return True
+        if w[1:3] == ["format", "timestamp"] and w[3:] == ["high-resolution"]:
+            s.logging_timestamp = "msec"
+            return True
+        if w[1:3] == ["format", "hostname"] and n == 4 and w[3] in ("fqdn", "ipv4"):
+            s.logging_hostname = "fqdn" if w[3] == "fqdn" else "ip"
+            return True
+        if w[1] == "origin-id" and n == 3 and w[2] in ("hostname", "ip"):
+            s.logging_hostname = w[2]
+            return True
+        if w[1] == "level" and n == 4 and mgmt_text.level(w[3]) is not None:
+            s.logging_facility_levels[w[2]] = mgmt_text.level(w[3]) or 0
+            return True
+        return False
+
+    def service(self, node: Node) -> bool:
+        """service dhcp; service timestamps log datetime [msec] ... (the sub-second resolution is kept)."""
+        w = node.words
+        if w == ["service", "dhcp"]:
+            return True
+        if w[1:4] == ["timestamps", "log", "datetime"]:
+            if "msec" in w:
+                self.device.system.logging_timestamp = "msec"
+            return set(w[4:]) <= {"msec", "localtime", "show-timezone", "year"}
+        return False
+
+    def eos_role(self, node: Node) -> bool:
+        """EOS role NAME / [SEQ] permit|deny [mode M] command REGEX."""
+        w = node.words
+        if len(w) != 2 or self.device.platform != "eos":
+            return False
+        role = self.device.roles[w[1]] = Role(w[1], origin=Origin(node.line, node.text))
+        for child in node.children:
+            if not access_text.eos_role_line(role, child.words):
+                self.unparsed(child, node.text)
+        return True
+
+    def parser_view(self, node: Node) -> bool:
+        """IOS parser view NAME / secret / commands MODE include [all] CMD."""
+        w = node.words
+        if w[1:2] != ["view"] or len(w) != 3:
+            return False
+        role = self.device.roles[w[2]] = Role(w[2], origin=Origin(node.line, node.text))
+        for child in node.children:
+            if not access_text.ios_view_line(role, child.words):
+                self.unparsed(child, node.text)
+        return True
+
+    def ios_api(self, node: Node) -> bool:
+        """IOS netconf-yang, restconf, gnxi [secure-server | server] and their client ACLs."""
+        w = node.words
+        m = self.device.management
+        api = {"netconf-yang": "netconf", "restconf": "http", "gnxi": "gnmi"}[w[0]]
+        if len(w) == 1 or w[1:] in (["secure-server"], ["server"]):
+            m.apis.setdefault(api, "")
+            return not node.children
+        if w[1:4] in (["ssh", "ipv4", "access-list"], ["ipv4", "access-list", "name"]) and w[-2] == "name" or \
+                w[1:3] == ["ipv4", "access-list"] and len(w) == 5 and w[3] == "name":
+            m.api_acls[api] = w[-1]
+            return True
+        return False
+
+    def ios_security_passwords(self, node: Node) -> bool:
+        """IOS security passwords min-length N."""
+        w = node.words
+        if w[1:3] == ["passwords", "min-length"] and len(w) == 4 and w[3].isdigit():
+            self.device.management.password_min_length = int(w[3])
+            return True
+        return False
+
+    def _ios_pubkey_chain(self, node: Node) -> bool:
+        """IOS ip ssh pubkey-chain / username U / key-string (lines, exit) | key-hash (a hash only: not kept)."""
+        users = {u.name: u for u in self.device.users}
+        for child in node.children:
+            c = child.words
+            if c[0] != "username" or len(c) != 2:
+                self.unparsed(child, node.text)
+                continue
+            user = users.get(c[1])
+            if user is None:
+                user = LocalUser(c[1], origin=Origin(child.line, child.text))
+                self.device.users.append(user)
+                users[c[1]] = user
+            for grand in child.children:
+                if grand.words == ["key-string"]:
+                    key = " ".join(g.text.strip() for g in grand.children if g.words != ["exit"])
+                    if key:
+                        user.ssh_keys.append(key)
+                else:
+                    self._reason = ("SSH public keys", "IOS keeps only a hash of the key; add the key itself by hand")
+                    self.unparsed(grand, f"{node.text} / {child.text}")
+        return True
 
     def _snmp_host(self, args: List[str], origin: Origin) -> bool:
         host = SnmpHost(str(ipaddress.ip_address(args[0])), origin=origin)
@@ -459,6 +583,8 @@ class _Reader:
     def logging(self, node: Node) -> bool:
         w = node.words
         s = self.device.system
+        if self._local_logging(w):
+            return True
         if len(w) == 3 and w[1] == "trap" and mgmt_text.level(w[2]) is not None:
             s.logging_level = mgmt_text.level(w[2])
             return True
@@ -560,6 +686,8 @@ class _Reader:
             return self.ip_sla(node, w[2])
         if w[1:2] == ["flow-export"]:
             return self.flow_export(w[2:])
+        if w[1:] == ["ssh", "pubkey-chain"]:
+            return self._ios_pubkey_chain(node)
         if w[1:] in (["sla", "server", "twamp"], ["sla", "responder", "twamp"]):
             return self._ios_twamp(node)
         if w[1:2] == ["multicast-routing"] and w[2:] in ([], ["distributed"]):
@@ -768,7 +896,18 @@ class _Reader:
     def username(self, node: Node) -> bool:
         """username U [privilege N] [role R] [secret|password [type] X | nopassword]"""
         w = node.words
+        if w[2:3] == ["ssh-key"] and len(w) >= 5:  # EOS: username U ssh-key TYPE KEY [COMMENT]
+            known = next((u for u in self.device.users if u.name == w[1]), None)
+            if known is None:
+                known = LocalUser(w[1], origin=Origin(node.line, node.text))
+                self.device.users.append(known)
+            known.ssh_keys.append(node.text.split(None, 3)[3])
+            return True
         user = LocalUser(w[1], origin=Origin(node.line, node.text))
+        earlier = next((u for u in self.device.users if u.name == w[1]), None)
+        if earlier is not None:  # named before by its SSH key
+            self.device.users.remove(earlier)
+            user.ssh_keys = earlier.ssh_keys
         args = w[2:]
         if self.nxos and "role" in args[:-1]:  # NX-OS: username U password 5 X role R
             at = args.index("role")
@@ -781,9 +920,12 @@ class _Reader:
             elif args[0] == "role" and len(args) >= 2:
                 role = aaa_text.privilege(args[1], _EOS_ROLES)
                 if role is None:
-                    return False
-                user.privilege = user.privilege if user.privilege is not None else role
+                    user.role = args[1]
+                else:
+                    user.privilege = user.privilege if user.privilege is not None else role
                 args = args[2:]
+            elif args[0] == "view" and len(args) >= 2:  # IOS: the user's parser view
+                user.role, args = args[1], args[2:]
             elif args[0] in ("secret", "password"):
                 self.device.users.append(user)
                 return self._password(user, args, self.device.platform)
@@ -2970,6 +3112,10 @@ class _Reader:
         telnet."""
         w = node.words
         m = self.device.management
+        if w[1:2] == ["api"]:
+            return access_text.eos_api_block(self.device, w, node.children, self.unparsed)
+        if w[1:] == ["security"]:
+            return self._eos_management_security(node)
         if w[1:] not in (["ssh"], ["telnet"]):
             return False
         server = w[1]
@@ -2989,6 +3135,22 @@ class _Reader:
                 if child.children:
                     in_vrf = m.ssh = True
             else:
+                self.unparsed(child, node.text)
+        return True
+
+    def _eos_management_security(self, node: Node) -> bool:
+        """EOS management security / password / minimum length N (TLS profiles are not converted)."""
+        for child in node.children:
+            c = child.words
+            if c == ["password"]:
+                for g in child.children:
+                    if g.words[:2] == ["minimum", "length"] and len(g.words) == 3 and g.words[2].isdigit():
+                        self.device.management.password_min_length = int(g.words[2])
+                    else:
+                        self.unparsed(g, f"{node.text} / {child.text}")
+            else:
+                self._reason = ("TLS profiles", "SSL/TLS profiles and certificates are not converted; set up the "
+                                "target's trustpoints and certificates by hand")
                 self.unparsed(child, node.text)
         return True
 

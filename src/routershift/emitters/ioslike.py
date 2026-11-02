@@ -22,6 +22,7 @@ from .. import qos as qos_text
 from .. import snmp as snmp_text
 from .. import stp as stp_text
 from .. import aaa as aaa_text
+from .. import access as access_text
 from .. import vpn as vpn_text
 from .. import vrfs as vrfs_text
 from .. import multicast as multicast_text
@@ -2379,21 +2380,48 @@ class Writer:
             if secret:
                 self.report.item("management", "enable secret")
                 self.out.append(f"enable {secret}" if self.ios else f"enable password {secret.split(' ', 1)[1]}")
+        for role in self.device.roles.values():
+            if self.ios:
+                self.out += access_text.ios_view_lines(role, self.report)
+            else:
+                self.report.item("management", f"role {role.name}")
+                self.out += access_text.eos_role_lines(role, self.ind)
+                if role.origin.text.startswith("parser view"):
+                    self.report.add("management", f"role {role.name}", Severity.APPROX, "role-view",
+                                    "the parser view's commands are written as EOS command patterns: check that "
+                                    "each matches the commands meant")
         for u in self.device.users:
             label = aaa_text.user_label(u)
-            secret = self._secret(u)
+            secret = self._secret(u) if u.password or u.password_hash or not u.ssh_keys else "nopassword"
             if not secret:
+                if u.ssh_keys and not self.ios:
+                    self.out += [f"username {u.name} ssh-key {key}" for key in u.ssh_keys]
                 continue
             self.report.item("management", label)
             words = [f"username {u.name}"]
             if u.privilege is not None:
                 words.append(f"privilege {u.privilege}")
+            if u.role and u.role not in self.device.roles:
+                self.report.add("management", label, Severity.REVIEW, "role-missing",
+                                f"role {u.role} is not defined in the source")
             if not self.ios:
-                words.append(f"role {aaa_text.role(u.privilege, self._EOS_ROLES)}")
-            if secret == "nopassword":
+                words.append(f"role {u.role or aaa_text.role(u.privilege, self._EOS_ROLES)}")
+            elif u.role:
+                words.append(f"view {u.role}")
+            if secret == "nopassword" and not u.ssh_keys:
                 self.report.add("management", label, Severity.REVIEW, "no-password",
                                 "the user has no password in the source; give it one")
             self.out.append(" ".join(words + [secret]))
+            if not self.ios:
+                self.out += [f"username {u.name} ssh-key {key}" for key in u.ssh_keys]
+        if self.ios:
+            self.out += access_text.ios_pubkey_lines(self.device, self.report)
+        m = self.device.management
+        if m.password_min_length is not None:
+            self.report.item("management", "password length")
+            self.out += [f"security passwords min-length {m.password_min_length}"] if self.ios else \
+                ["management security", f"{self.ind}password", f"{self.ind * 2}minimum length {m.password_min_length}",
+                 "!"]
 
     def _group_vrf(self, addresses: List[str], protocol: str) -> str:
         """The VRF the servers of a group share, if they do."""
@@ -2508,6 +2536,12 @@ class Writer:
         if s.contact:
             self.out.append(f"snmp-server contact {s.contact}")
             rep.item("management", "snmp contact")
+        if s.engine_id:
+            self.out.append(f"snmp-server engineID local {s.engine_id}")
+            rep.item("management", "SNMP engine ID")
+        for view, subtrees in s.views.items():
+            rep.item("management", f"SNMP view {view}")
+            self.out += [f"snmp-server view {view} {oid} {'included' if inc else 'excluded'}" for oid, inc in subtrees]
         groups = dict(s.groups)
         for u in s.users:
             if u.group not in groups:
@@ -2516,9 +2550,10 @@ class Writer:
             words = [f"snmp-server group {g.name} v3 {g.level}"]
             words += [f"read {g.read_view}"] if g.read_view else []
             words += [f"write {g.write_view}"] if g.write_view else []
-            if g.read_view or g.write_view:
+            missing = [v for v in (g.read_view, g.write_view) if v and v not in s.views]
+            if missing:
                 rep.add("management", f"SNMPv3 group {g.name}", Severity.REVIEW, "snmp-view",
-                        "MIB views are not converted; define them by hand")
+                        f"MIB view {', '.join(dict.fromkeys(missing))} is not defined in the source; define it by hand")
             rep.item("management", f"SNMPv3 group {g.name}")
             self.out.append(" ".join(words))
         for u in s.users:
@@ -2601,6 +2636,7 @@ class Writer:
         if s.logging_level is not None:
             self.out.append(f"logging trap {mgmt_text.LEVELS[s.logging_level]}")
             self.report.item("system", "syslog level")
+        self.out += access_text.logging_lines(self.device, self.report, self.ios)
         if s.logging_source:
             source = self.port(s.logging_source)
             owner = self.device.interfaces.get(s.logging_source)
@@ -2668,6 +2704,10 @@ class Writer:
             self.out.append("cdp run" if m.cdp else "no cdp run")
         elif m.cdp:
             rep.add("management", "CDP", Severity.APPROX, "cdp-lldp", "EOS has no CDP; LLDP announces the switch")
+        if m.apis:
+            self.out.append("!")
+            self.out += access_text.ios_api_lines(self.device, rep, self.vrf) if self.ios else \
+                access_text.eos_api_lines(self.device, rep, ind, self.vrf)
 
     def _lldp_options(self) -> None:
         """LLDP timers (same meaning both sides) and the advertised management address (EOS only)."""
@@ -2737,15 +2777,19 @@ class Writer:
                         "zone of the tz database); set it by hand")
 
     def banner(self) -> None:
-        text = self.device.system.banner_motd
-        if not text:
-            return
-        if self.ios:
-            delim = "^C" if "^C" not in text else "%"
-            self.out += [f"banner motd {delim}", text, delim]
-        else:
-            self.out += ["banner motd", text, "EOF"]
-        self.report.item("system", "banner motd")
+        s = self.device.system
+        for kind, text in (("login", s.banner_login), ("motd", s.banner_motd), ("exec", s.banner_exec)):
+            if not text:
+                continue
+            self.report.item("system", f"banner {kind}")
+            if self.ios:
+                delim = "^C" if "^C" not in text else "%"
+                self.out += [f"banner {kind} {delim}", text, delim]
+            elif kind == "exec":
+                self.report.add("system", "banner exec", Severity.REVIEW, "banner-exec",
+                                "EOS has no banner after login; merge it into the motd banner if it matters; left out")
+            else:
+                self.out += [f"banner {kind}", text, "EOF"]
 
     def unparsed(self) -> None:
         self.report.unparsed(self.device.unparsed)
