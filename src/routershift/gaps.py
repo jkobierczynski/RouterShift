@@ -202,6 +202,18 @@ def later_features(device: Device, report: Report, port: Callable[[str], str]) -
         found.append(("system", "PTP", "PTP:", Severity.REVIEW))
     for name in device.event_handlers:
         found.append(("system", f"event handler {name}", "event handlers and EEM applets:", Severity.REVIEW))
+    if device.bfd_multihop is not None or device.bfd_slow_timer is not None:
+        found.append(("system", "BFD", "the BFD multihop and slow timers:", Severity.APPROX))
+    if device.ecmp_hash:
+        found.append(("system", "ECMP hashing", "the ECMP hash fields:", Severity.APPROX))
+    if bgp is not None:
+        options = [w for w, v in (("asdot notation", bgp.asdot),
+                                  ("missing-as-worst MED", bgp.med_missing_as_worst or any(
+                                      v.med_missing_as_worst for v in bgp.vrfs.values())),
+                                  ("the OSPF route types redistributed", bgp.ospf_match or any(
+                                      v.ospf_match for v in bgp.vrfs.values()))) if v]
+        if options:
+            found.append(("bgp", f"bgp {bgp.local_as}", ", ".join(options) + ":", Severity.APPROX))
     # (new device-level settings go above this line)
     for iface in device.interfaces.values():
         label = _interface_item(report, iface, port)

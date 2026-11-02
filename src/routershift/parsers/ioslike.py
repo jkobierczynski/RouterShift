@@ -151,6 +151,8 @@ class _Reader:
         self._wlan_tags: Dict[str, str] = {}  # WLAN -> policy profile, from the policy tags
         self._flow_exporters: Dict[str, Netflow] = {}  # IOS flow exporter -> its collector, version and source
         self._flow_monitors: Dict[str, Tuple[List[str], str]] = {}  # IOS flow monitor -> exporters, record
+        self._bfd_templates: Dict[str, Tuple[int, int, int]] = {}  # IOS single-hop template -> its timers
+        self._bfd_ports: Dict[str, str] = {}  # IOS: port -> the BFD template it names
         self._ptp_mechanism = ""  # IOS: ptp mode boundary delay-req (e2e) | pdelay-req (p2p)
         self._samplers: Dict[str, int] = {}  # IOS sampler -> one packet in N
         self._port_samplers: List[str] = []  # IOS: the samplers the ports' flow monitors use
@@ -234,6 +236,8 @@ class _Reader:
             "service": self.service,
             "role": self.eos_role,
             "ptp": self.ptp,
+            "bfd-template": self.bfd_template,
+            "bfd": self.bfd_global,
             "event-handler": self.eos_event_handler,
             "event": self.eem_applet,
             "parser": self.parser_view,
@@ -478,6 +482,46 @@ class _Reader:
                 self.device.system.logging_timestamp = "msec"
             return set(w[4:]) <= {"msec", "localtime", "show-timezone", "year"}
         return False
+
+    def _eos_router_bfd(self, node: Node) -> bool:
+        """EOS router bfd / multihop interval TX min-rx RX multiplier N, slow-timer MS."""
+        d = self.device
+        for child in node.children:
+            c = child.words
+            if c[:2] == ["multihop", "interval"] and len(c) == 7 and c[3] == "min-rx" and c[5] == "multiplier":
+                d.bfd_multihop = (int(c[2]), int(c[4]), int(c[6]))
+            elif c[0] == "slow-timer" and len(c) == 2 and c[1].isdigit():
+                d.bfd_slow_timer = int(c[1])
+            else:
+                self.unparsed(child, node.text)
+        return True
+
+    def bfd_global(self, node: Node) -> bool:
+        """IOS bfd slow-timers MS (bfd map is not converted)."""
+        w = node.words
+        if w[1] == "slow-timers" and len(w) == 3 and w[2].isdigit():
+            self.device.bfd_slow_timer = int(w[2])
+            return True
+        return False
+
+    def bfd_template(self, node: Node) -> bool:
+        """IOS bfd-template single-hop | multi-hop NAME / interval min-tx TX min-rx RX multiplier N."""
+        w = node.words
+        if len(w) != 3 or w[1] not in ("single-hop", "multi-hop"):
+            return False
+        timers: Optional[Tuple[int, int, int]] = None
+        for child in node.children:
+            c = child.words
+            if c[:2] == ["interval", "min-tx"] and len(c) == 7 and c[3] == "min-rx" and c[5] == "multiplier":
+                timers = (int(c[2]), int(c[4]), int(c[6]))
+            else:
+                self.unparsed(child, node.text)
+        if timers is not None:
+            if w[1] == "multi-hop":
+                self.device.bfd_multihop = timers
+            else:
+                self._bfd_templates[w[2]] = timers
+        return True
 
     def ptp(self, node: Node) -> bool:
         """ptp mode, domain, priority1/2 (both); EOS clock-identity, source ip, message-type dscp."""
@@ -748,6 +792,18 @@ class _Reader:
             return self.ip_sla(node, w[2])
         if w[1:2] == ["flow-export"]:
             return self.flow_export(w[2:])
+        if w[1] == "load-sharing" and len(w) >= 5 and w[3:5] == ["fields", "ip"] and \
+                set(w[5:]) <= {"source-ip", "destination-ip", "source-port", "destination-port"}:
+            self.device.ecmp_platform, self.device.ecmp_hash = w[2], w[5:]  # EOS
+            return True
+        if w[1:4] == ["cef", "load-sharing", "algorithm"] and len(w) >= 5:
+            if w[4:] == ["include-ports", "source", "destination"]:
+                self.device.ecmp_hash = ["source-ip", "destination-ip", "source-port", "destination-port"]
+            elif w[4:] == ["universal"]:
+                self.device.ecmp_hash = ["source-ip", "destination-ip"]
+            else:
+                return False
+            return True
         if w[1:] == ["ssh", "pubkey-chain"]:
             return self._ios_pubkey_chain(node)
         if w[1:] in (["sla", "server", "twamp"], ["sla", "responder", "twamp"]):
@@ -2266,6 +2322,8 @@ class _Reader:
             return self._eos_msdp(node)
         if w[1:] == ["general"] and self.device.platform == "eos":
             return self._router_general(node)
+        if w[1:] == ["bfd"] and self.device.platform == "eos":
+            return self._eos_router_bfd(node)
         if w[1:] == ["rip"] and self.device.rip is None:
             rip = self.device.rip = Rip(origin=Origin(node.line, node.text))
             return self._igp_children(node, lambda c: igp_text.ios_rip_line(rip, c))
@@ -2524,6 +2582,7 @@ class _Reader:
                     v.networks, v.redistribute, v.redistribute_maps, v.aggregates = (
                         vb.bgp.networks, vb.bgp.redistribute, vb.bgp.redistribute_maps, vb.bgp.aggregates)
                     v.redistribute6 = vb.bgp.redistribute6
+                    v.ospf_match = vb.bgp.ospf_match
                 elif c[0] == "neighbor" and len(c) >= 3:
                     ok = ioslike_neighbor(vb, c[1], c[2:], af)
                 else:
@@ -2738,7 +2797,8 @@ class _Reader:
                     ok = True  # the same as the process's own
                 elif c[0] == "maximum-paths" and len(c) == 2:
                     v.maximum_paths, ok = int(c[1]), True
-                elif c[0] in ("network", "redistribute", "neighbor", "aggregate-address"):
+                elif c[0] in ("network", "redistribute", "neighbor", "aggregate-address") or \
+                        c == ["bgp", "bestpath", "med", "missing-as-worst"]:
                     ok = self.bgp_line(vb, c, af)
                 else:
                     ok = False
@@ -2748,6 +2808,7 @@ class _Reader:
                 self.unparsed(child, node.text)
         v.networks, v.redistribute, v.redistribute_maps = vb.bgp.networks, vb.bgp.redistribute, vb.bgp.redistribute_maps
         v.redistribute6, v.aggregates = vb.bgp.redistribute6, vb.bgp.aggregates
+        v.ospf_match, v.med_missing_as_worst = vb.bgp.ospf_match, vb.bgp.med_missing_as_worst
 
     @staticmethod
     def bgp_line(b: bgp_text.Builder, w: List[str], af: str) -> bool:
@@ -2770,6 +2831,14 @@ class _Reader:
             bgp.networks.append(prefix)
         elif w[0] == "redistribute" and n >= 2 and w[1] in bgp_text.REDISTRIBUTE:
             rest = w[3:] if w[1] == "ospf" and n >= 3 and w[2].isdigit() else w[2:]
+            if w[1] == "ospf" and rest[:1] == ["match"] and af != "ipv6":
+                kinds = [x for x in rest[1:] if x in ("internal", "external", "nssa-external")]
+                if not kinds or any(x not in ("internal", "external", "nssa-external", "1", "2") for x in rest[1:]):
+                    return False
+                bgp.ospf_match += [k for k in kinds if k not in bgp.ospf_match]
+                if "ospf" not in bgp.redistribute:
+                    bgp.redistribute.append("ospf")
+                return True
             if rest[:1] == ["route-map"] and len(rest) == 2 and af != "ipv6":
                 bgp.redistribute_maps[w[1]] = rest[1]
             elif rest:
@@ -2790,6 +2859,10 @@ class _Reader:
             bgp.distance = (int(w[2]), int(w[3]), int(w[4]))
         elif w == ["bgp", "bestpath", "as-path", "multipath-relax"]:
             bgp.multipath_relax = True
+        elif w == ["bgp", "bestpath", "med", "missing-as-worst"]:
+            bgp.med_missing_as_worst = True
+        elif w in (["bgp", "asn", "notation", "asdot"], ["bgp", "asnotation", "dot"]):
+            bgp.asdot = True
         elif w[0] == "maximum-paths" and n in (2, 3) and w[-1].isdigit() and af != "ipv6":
             if n == 3 and w[1] == "ibgp":
                 bgp.maximum_paths_ibgp = int(w[2])
@@ -3820,6 +3893,8 @@ class _Reader:
         elif w[:2] == ["ip", "flow"] and n == 3 and w[2] in ("ingress", "egress"):
             way = "input" if w[2] == "ingress" else "output"
             iface.flow = way if iface.flow in ("", way) else "both"
+        elif w[:2] == ["bfd", "template"] and n == 3:
+            self._bfd_ports[iface.name] = w[2]
         elif w[0] == "ptp" or w[:2] == ["no", "ptp"]:
             return automation_text.port_line(iface, w)
         elif w == ["no", "sflow", "enable"] and self.device.platform == "eos":
@@ -3972,6 +4047,11 @@ class _Reader:
         self._finish_copp()
         self._finish_qos()
         self._finish_macsec()
+        for name, template in self._bfd_ports.items():
+            port_ = self.device.interfaces.get(name)
+            timers = self._bfd_templates.get(template)
+            if port_ is not None and timers is not None and port_.bfd_interval is None:
+                port_.bfd_interval, port_.bfd_min_rx, port_.bfd_multiplier = timers
         if self._ptp_mechanism:
             for port_ in self.device.interfaces.values():
                 if port_.ptp and not port_.ptp_delay_mechanism:

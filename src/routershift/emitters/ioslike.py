@@ -118,6 +118,8 @@ class Writer:
         self.mirrors()
         self.twamp()
         self.out += automation_text.ptp_lines(self.device, self.report, self.ios)
+        self.out += bfd_text.global_lines(self.device, self.report, self.ios)
+        self.out += bfd_text.ecmp_lines(self.device, self.report, self.ios)
         self.out += automation_text.ios_lines(self.device, self.report, self.port) if self.ios else \
             automation_text.eos_lines(self.device, self.report, self.ind, self.port)
         self.vxlan()
@@ -1602,6 +1604,15 @@ class Writer:
             lines.append(f"{prefix}graceful-restart restart-time {bgp.graceful_restart_time}")
         if bgp.multipath_relax:
             lines.append("bgp bestpath as-path multipath-relax")
+        if bgp.asdot:
+            lines.append("bgp asnotation dot" if self.ios else "bgp asn notation asdot")
+        vrf_med = [n for n, v in bgp.vrfs.items() if v.med_missing_as_worst]
+        if bgp.med_missing_as_worst or (self.ios and vrf_med):
+            lines.append("bgp bestpath med missing-as-worst")
+            if self.ios and vrf_med and not bgp.med_missing_as_worst:
+                self.report.add("bgp", f"bgp {bgp.local_as}", Severity.APPROX, "bgp-med",
+                                f"VRF {', '.join(vrf_med)} treats a missing MED as worst; IOS sets it for the whole "
+                                "BGP process, so it is written there")
         if bgp.distance and not self.ios:
             lines.append("distance bgp " + " ".join(str(x) for x in bgp.distance))
         for group in bgp.peer_groups.values():
@@ -1630,7 +1641,7 @@ class Writer:
                     body.append(f"network {net}")
             for source in bgp.redistribute6 if af == "ipv6" else bgp.redistribute:
                 rm = bgp.redistribute_maps.get(source) if af == "ipv4" else None
-                body.append(self._bgp_redistribute(source) + (f" route-map {rm}" if rm else ""))
+                body += self._bgp_redistribute_lines(source, bgp.ospf_match, rm)
             body += self._aggregates(bgp.aggregates, af)
             if af == "ipv4" and self.ios and bgp.distance:
                 body.append("distance bgp " + " ".join(str(x) for x in bgp.distance))
@@ -1676,6 +1687,8 @@ class Writer:
                         lines.append(f"{ind}route-target {d} {family} {value}")
                 if info and info.export_map:
                     lines.append(f"{ind}route-target export {family} route-map {info.export_map}")
+                if vrf_bgp is not None and vrf_bgp.med_missing_as_worst:
+                    lines.append(f"{ind}bgp bestpath med missing-as-worst")
                 if vrf_bgp is not None:
                     lines += [ind + line for line in self._eos_bgp_vrf(bgp, vrf_bgp, name)]
         self.out.append(f"router bgp {bgp.local_as}")
@@ -1708,7 +1721,7 @@ class Writer:
         body += self._aggregates(v.aggregates, af)
         for source in v.redistribute6 if af == "ipv6" else v.redistribute:
             rm = v.redistribute_maps.get(source) if af == "ipv4" else None
-            body.append(self._bgp_redistribute(source) + (f" route-map {rm}" if rm else ""))
+            body += self._bgp_redistribute_lines(source, v.ospf_match, rm)
         return body
 
     def _vrf_peers(self, bgp: Bgp, v: BgpVrf, name: str) -> List[BgpNeighbor]:
@@ -1955,6 +1968,17 @@ class Writer:
                 if next_hop:
                     policy.append(f"{ind * 2}set nexthop {next_hop}")
             self.out += policy + ["!"]
+
+    def _bgp_redistribute_lines(self, source: str, match: List[str], rm: Optional[str]) -> List[str]:
+        """redistribute SOURCE [route-map RM]; OSPF with the route types it takes (IOS on one line, EOS one each)."""
+        tail = f" route-map {rm}" if rm else ""
+        if source != "ospf" or not match:
+            return [self._bgp_redistribute(source) + tail]
+        if self.ios:
+            words = {"internal": "internal", "external": "external 1 external 2",
+                     "nssa-external": "nssa-external 1 nssa-external 2"}
+            return [self._bgp_redistribute(source) + " match " + " ".join(words[m] for m in match) + tail]
+        return [f"redistribute ospf match {m}{tail}" for m in match]
 
     def _bgp_redistribute(self, source: str) -> str:
         if source == "ospf" and self.ios:

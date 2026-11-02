@@ -472,6 +472,8 @@ class BgpVrf:
     peer_groups: Dict[str, BgpNeighbor] = field(default_factory=dict)  # defined in the VRF (EOS)
     aggregates: List[BgpAggregate] = field(default_factory=list)
     redistribute6: List[str] = field(default_factory=list)  # IPv6
+    ospf_match: List[str] = field(default_factory=list)  # OSPF routes redistributed: internal, external, nssa-external
+    med_missing_as_worst: bool = False
 
 
 @dataclass
@@ -493,6 +495,9 @@ class Bgp:
     graceful_restart_time: Optional[int] = None  # seconds
     distance: Optional[Tuple[int, int, int]] = None  # administrative distance of external, internal, local routes
     multipath_relax: bool = False  # equal-cost paths through different neighbor ASes (bestpath as-path multipath-relax)
+    asdot: bool = False  # 4-byte AS numbers shown as X.Y
+    med_missing_as_worst: bool = False  # a route without MED loses (bgp bestpath med missing-as-worst)
+    ospf_match: List[str] = field(default_factory=list)  # OSPF routes redistributed: internal, external, nssa-external
     vrfs: Dict[str, BgpVrf] = field(default_factory=dict)
     # EVPN gateway between two domains (EOS domain identifier, neighbor X domain remote): the domain IDs and the
     # neighbors in the remote domain
@@ -1219,6 +1224,11 @@ class Device:
     users: List[LocalUser] = field(default_factory=list)
     roles: Dict[str, Role] = field(default_factory=dict)
     ptp: Optional[Ptp] = None
+    bfd_multihop: Optional[Tuple[int, int, int]] = None  # multihop sessions: transmit ms, receive ms, multiplier
+    bfd_slow_timer: Optional[int] = None  # ms, while a session is down or echo runs
+    ecmp_hash: List[str] = field(default_factory=list)  # fields of the ECMP hash: source-ip, destination-ip,
+    # source-port, destination-port ([] = the platform default)
+    ecmp_platform: str = ""  # EOS: the chip family the load-sharing line names (trident, sand, arad, ...)
     event_handlers: Dict[str, EventHandler] = field(default_factory=dict)
     aaa: Aaa = field(default_factory=Aaa)
     unparsed: List[Unparsed] = field(default_factory=list)
