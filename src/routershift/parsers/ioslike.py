@@ -35,6 +35,7 @@ from .. import nxossec
 from .. import nxosmon
 from .. import nxosmgmt
 from .. import nxosauto
+from .. import nxosrouting
 from .. import evpn as evpn_text
 from .. import igp as igp_text
 from .. import routemap as routemap_text
@@ -183,6 +184,7 @@ class _Reader:
         self._fabric = nxosfabric.Reader(self.device)  # NX-OS VXLAN, EVPN and vPC
         self._nxmon = nxosmon.Reader(self.device)  # NX-OS sFlow and NetFlow
         self._summer: Dict[str, object] = {}  # NX-OS clock summer-time
+        self._nxigp = nxosrouting.IgpReader(self.device)  # NX-OS router rip / isis and their interfaces
         self._host_flap: Optional[Tuple[int, int, int]] = None  # NX-OS l2rib dup-host-mac-detection
         self._bgp_router_id = ""  # EOS: a VRF that names the same router ID needs none of its own
         self._syslog_hosts: List[Tuple[Node, str, str]] = []  # every logging host line, its address and VRF
@@ -280,6 +282,8 @@ class _Reader:
             "nxapi": self.nxos_api,
             "grpc": self.nxos_api,
             "userpassphrase": self.userpassphrase,
+            "install": self.nxos_feature_set,
+            "feature-set": self.nxos_feature_set,
             "mpls": self.mpls,
             "wlan": self.wlan,
             "wireless": self.wireless,
@@ -323,6 +327,9 @@ class _Reader:
         """NX-OS: feature X switches a protocol on; the writer works out the features it needs."""
         w = node.words
         if w[1:] in (["nv", "overlay"], ["fabric", "forwarding"], ["sla", "sender"], ["sla", "responder"]):
+            return True
+        if w[1:] == ["mpls", "ldp"]:
+            self.device.mpls.ldp = True
             return True
         if len(w) != 2:
             return False
@@ -543,8 +550,13 @@ class _Reader:
         return True
 
     def bfd_global(self, node: Node) -> bool:
-        """IOS bfd slow-timers MS (bfd map is not converted)."""
+        """IOS bfd slow-timers MS (bfd map is not converted); NX-OS bfd multihop interval, bfd slow-timer."""
         w = node.words
+        if self.nxos:
+            try:
+                return nxosrouting.read_bfd(self.device, w)
+            except (ValueError, IndexError):
+                return False
         if w[1] == "slow-timers" and len(w) == 3 and w[2].isdigit():
             self.device.bfd_slow_timer = int(w[2])
             return True
@@ -856,6 +868,8 @@ class _Reader:
             return self.ip_sla(node, w[2])
         if w[1:2] == ["flow-export"]:
             return self.flow_export(w[2:])
+        if self.nxos and w[1] == "load-sharing" and len(w) >= 4:
+            return nxosrouting.read_load_sharing(self.device, w[2:])
         if w[1] == "load-sharing" and len(w) >= 5 and w[3:5] == ["fields", "ip"] and \
                 set(w[5:]) <= {"source-ip", "destination-ip", "source-port", "destination-port"}:
             self.device.ecmp_platform, self.device.ecmp_hash = w[2], w[5:]  # EOS
@@ -1603,8 +1617,8 @@ class _Reader:
             algorithm = "md5"
             for grand in child.children:
                 g = grand.words
-                if g[0] == "cryptographic-algorithm" and len(g) == 2 and g[1].startswith("hmac-sha-"):
-                    algorithm = g[1].replace("hmac-sha-", "sha")
+                if g[0] == "cryptographic-algorithm" and len(g) == 2 and g[1].lower().startswith("hmac-sha-"):
+                    algorithm = g[1].lower().replace("hmac-sha-", "sha")
                 elif g[0] == "cryptographic-algorithm" and g[1:] == ["md5"]:
                     algorithm = "md5"
                 elif g[0] != "key-string":
@@ -1632,6 +1646,11 @@ class _Reader:
     def nxos_api(self, node: Node) -> bool:
         """NX-OS nxapi use-vrf V | grpc use-vrf V."""
         return self.nxos and not node.children and nxosmgmt.read_api_vrf(self.device, node.words)
+
+    def nxos_feature_set(self, node: Node) -> bool:
+        """NX-OS install feature-set mpls / feature-set mpls (the MPLS features need them)."""
+        return self.nxos and node.words[-2:] in (["feature-set", "mpls"], ["feature-set", "mpls"]) and \
+            node.words[0] in ("install", "feature-set") and len(node.words) == (3 if node.words[0] == "install" else 2)
 
     def userpassphrase(self, node: Node) -> bool:
         """NX-OS userpassphrase min-length N."""
@@ -2465,6 +2484,18 @@ class _Reader:
             return self._router_general(node)
         if w[1:] == ["bfd"] and self.device.platform == "eos":
             return self._eos_router_bfd(node)
+        if self.nxos and w[1:2] in (["rip"], ["isis"]) and len(w) == 3:
+            children = [c.words for c in node.children]
+            nested = {k: [g.words for g in c.children] for k, c in enumerate(node.children)}
+            bad = self._nxigp.rip(children, nested) if w[1] == "rip" else self._nxigp.isis(w[2], children, nested)
+            origin = Origin(node.line, node.text)
+            if w[1] == "rip" and self.device.rip is not None:
+                self.device.rip.origin = origin
+            elif self.device.isis is not None:
+                self.device.isis.origin = origin
+            for text in bad:
+                self.device.unparsed.append(Unparsed(node.line, text, node.text))
+            return True
         if w[1:] == ["rip"] and self.device.rip is None:
             rip = self.device.rip = Rip(origin=Origin(node.line, node.text))
             return self._igp_children(node, lambda c: igp_text.ios_rip_line(rip, c))
@@ -3096,14 +3127,16 @@ class _Reader:
                 self._ospf_vrfs[(number, sub.vrf)] = sub.process
                 for line in child.children:
                     try:
-                        ok = self.ospf_line(sub, self._direct(line.words))
+                        ok = self.ospf_line(sub, self._direct(line.words)) or \
+                            nxosrouting.read_ospf_line(sub, line.words)
                     except (ValueError, IndexError):
                         ok = False
                     if not ok:
                         self.unparsed(line, child.text)
                 continue
             try:
-                understood = self.ospf_line(p, self._direct(child.words))
+                understood = self.ospf_line(p, self._direct(child.words)) or \
+                    self.nxos and nxosrouting.read_ospf_line(p, child.words)
             except (ValueError, IndexError):
                 understood = False
             if not understood and child.words[:2] == ["default-information", "originate"] and p.default_originate:
@@ -3554,6 +3587,12 @@ class _Reader:
         w = node.words
         m = self.device.mpls
         m.origin = Origin(node.line, node.text)
+        if self.nxos:
+            bad = nxosrouting.read_mpls(self.device, w, [c.words for c in node.children])
+            for k in bad or []:
+                self.unparsed(node.children[k], node.text)
+            if bad is not None:
+                return True
         if w[1:] == ["ip"]:
             return True  # label switching on (the IOS default)
         if w[1:] == ["label", "protocol", "ldp"]:
@@ -4133,6 +4172,9 @@ class _Reader:
             iface.flow = way if iface.flow in ("", way) else "both"
         elif w[:2] == ["bfd", "template"] and n == 3:
             self._bfd_ports[iface.name] = w[2]
+        elif self.nxos and (w[:3] == ["ip", "router", "rip"] or w == ["ip", "rip", "passive-interface"] or
+                            w[:2] == ["isis", "passive-interface"]):
+            return self._nxigp.interface_line(iface, w)
         elif self.nxos and w[0] == "ptp":
             return nxosauto.read_interface(iface, w)
         elif w[0] == "ptp" or w[:2] == ["no", "ptp"]:
@@ -4203,7 +4245,7 @@ class _Reader:
             iface.cdp = w[0] == "cdp"
         elif w == ["mpls", "ip"] or w == ["mpls", "ldp", "interface"]:
             # IOS: mpls ip (label switching and LDP); EOS: mpls ldp interface (mpls ip is the EOS default)
-            if self.device.platform == "ios" or w[1] == "ldp":
+            if self.device.platform in ("ios", "nxos") or w[1] == "ldp":
                 iface.mpls = True
                 self.device.mpls.ldp = True
         else:
@@ -4310,6 +4352,7 @@ class _Reader:
         if self.nxos:
             self._nxmon.finish()
             nxosmgmt.finish_timezone(self.device, self._summer)
+            self._nxigp.finish()
         self._finish_monitor()
         if self.nxos:
             self._fabric.finish()

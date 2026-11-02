@@ -30,6 +30,7 @@ from .. import nxossec
 from .. import nxosmon
 from .. import nxosmgmt
 from .. import nxosauto
+from .. import nxosrouting
 from .. import tracking as tracking_text
 from .. import ospf as ospf_text
 from .. import partial
@@ -50,7 +51,8 @@ HASHES = ("md5-crypt", "sha256-crypt", "sha512-crypt")
 MGMT_VRF = "management"
 PERMIT_ALL = "RS-PERMIT-ALL"  # the route map NX-OS needs for redistribution where the source had none
 WRITTEN = {"acl", "policy", "dhcp-relay", "fhrp", "speed", "storm", "stp-guards", "voice", "l2sec", "dot1x", "poe",
-           "dhcp", "aaa", "mlag", "vxlan", "multicast", "qos", "nat", "vpn", "monitor", "track"}
+           "dhcp", "aaa", "mlag", "vxlan", "multicast", "qos", "nat", "vpn", "monitor", "track",
+           "bfd", "isis", "rip", "mpls", "pbr"}
 _MGMT_NAMES = {"mgmt-vrf", "mgmt-intf", "management", "mgmt"}
 
 
@@ -70,6 +72,8 @@ class Writer:
         self.qos = nxosqos.Writer(device, report, IND)
         self.track_plan = tracking_text.Plan()
         self.mirror_ports = nxosmon.destinations(device)
+        self.key_chains: List[str] = []  # key chains of OSPF SHA authentication, written before the interfaces
+        self.redistributed: List[bool] = []  # RIP and IS-IS redistribution that needs the permit-all route map
 
     def vrf(self, name: str) -> str:
         return MGMT_VRF if name in self.mgmt_vrfs else name
@@ -95,20 +99,25 @@ class Writer:
         self.qos_lines()
         self.out += nxossec.nat_lines(self.device, self.report, self.port, self.vrf, self.features)
         tracking = nxosmon.tracking_lines(self.device, self.track_plan, self.port, self.vrf, IND, self.features)
+        tracking += nxosrouting.global_lines(self.device, self.report, self.features)
         self.out += tracking + (["!"] if tracking else [])
         self.vlans()
         self.spanning_tree()
         self.out += nxosfabric.vpc_lines(self.device, self.report, IND, self.vrf)
         self.vrfs()
         self.routes([r for r in self.device.static_routes if not r.vrf], "")
+        chains_at = len(self.out)
         for iface in self.device.interfaces.values():
             self.interface(iface)
+        if self.key_chains:
+            self.out[chains_at:chains_at] = self.key_chains + ["!"]
         self.fabric()
         self.monitoring()
         self.ospf()
+        self.igps()
         self.bgp()
         self.vty()
-        if self.permit_all:
+        if self.permit_all or self.redistributed:
             self.out += [f"route-map {PERMIT_ALL} permit 10", "!"]
         partial.device(self.device, self.report, PLATFORM, WRITTEN)
         self.report.unparsed(self.device.unparsed)
@@ -118,7 +127,7 @@ class Writer:
             self.features |= {"nv overlay", "vn-segment-vlan-based"}
         if nxosfabric.anycast_mac_lines(self.device):
             self.features.add("fabric forwarding")
-        head = [f"feature {f}" for f in sorted(self.features)]
+        head = nxosrouting.mpls_head(self.device) + [f"feature {f}" for f in sorted(self.features)]
         if self.device.management.ssh is False:
             head.append("no feature ssh")
         if self.evpn or (self.device.vxlan is not None and self.device.vxlan.evpn_vlans):
@@ -419,9 +428,18 @@ class Writer:
 
     def interface(self, iface: Interface) -> None:
         label = self.label(iface)
-        if iface.kind in (InterfaceKind.TUNNEL, InterfaceKind.OTHER):
+        tunnel: List[str] = []
+        if iface.kind == InterfaceKind.TUNNEL:
+            found = nxosrouting.tunnel_lines(iface, self.port, self.adder(label), self.features)
+            if found is None:
+                self.report.skip("interface", label, "vpn-unsupported",
+                                 "an IPsec tunnel interface has no NX-OS form (a Nexus switch terminates no VPNs); move "
+                                 "it to a router or firewall")
+                return
+            tunnel = found
+        elif iface.kind == InterfaceKind.OTHER:
             self.report.skip("interface", label, partial.CODE,
-                             "tunnel interfaces are not written for NX-OS yet; configure it by hand")
+                             "this kind of interface is not written for NX-OS; configure it by hand")
             return
         self.report.item("interface", label)
         if (iface.source_name or iface.name, self.port(iface.name)) in self.port.renumbered:
@@ -432,6 +450,7 @@ class Writer:
         lines: List[str] = []
         if iface.description:
             lines.append(f"description {iface.description}")
+        lines += tunnel
         physical = iface.kind in (InterfaceKind.ETHERNET, InterfaceKind.LAG)
         if iface.kind == InterfaceKind.VLAN:
             self.features.add("interface-vlan")
@@ -548,6 +567,14 @@ class Writer:
             self.features.add("dhcp")
         lines += nxosaccess.relay_lines(iface, self.vrf, self.port)
         lines += self.ospf_interface(iface)
+        d = self.device
+        lines += nxosrouting.ospf_interface(d, iface, name, self.adder(label), self.key_chains, IND)
+        lines += nxosrouting.bfd_interface(iface, self.report, label)
+        lines += nxosrouting.rip_interface(d, iface)
+        lines += nxosrouting.isis_interface(d, iface)
+        if iface.mpls:
+            lines.append("mpls ip")
+        lines += nxosrouting.pbr_interface(d, iface, self.adder(label), self.features)
         lines += nxosmcast.interface_lines(iface, self.adder(label))
         lines += self.fhrp_lines(iface, name)
         return lines
@@ -679,10 +706,17 @@ class Writer:
                 if p.default_originate:
                     body.append("default-information originate" + (" always" if p.default_originate == "always"
                                                                     else ""))
-                if p.bfd_all:
-                    self.report.add("ospf", label, Severity.REVIEW, partial.CODE, "BFD is not written for NX-OS yet")
+                body += nxosrouting.ospf_options(p)
                 self.out += [ind + line for line in body]
             self.out.append("!")
+
+    def igps(self) -> None:
+        d, rep = self.device, self.report
+        for lines in (nxosrouting.rip_lines(d, rep, IND, self.redistributed, self.features),
+                      nxosrouting.isis_lines(d, rep, IND, self.redistributed, self.features),
+                      nxosrouting.mpls_lines(d, rep, self.port, IND, self.features)):
+            if lines:
+                self.out += lines + ["!"]
 
     # BGP -------------------------------------------------------------------------------------------------------------
 
