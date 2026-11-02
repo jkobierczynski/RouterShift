@@ -23,7 +23,7 @@ from __future__ import annotations
 import ipaddress
 import re
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import AbstractSet, Callable, Dict, List, Optional, Sequence, Tuple
 
 from . import acl as acl_text
 from . import routemap as routemap_text
@@ -156,8 +156,11 @@ def _community_name(device: Device, rm: RouteMap, e: RouteMapEntry, rt: bool) ->
 
 
 def policies(device: Device, add: Add, report: Report, kinds: Dict[str, str],
-             communities: Dict[str, List[str]]) -> None:
+             communities: Dict[str, List[str]], skip: AbstractSet[str] = frozenset()) -> None:
+    """Each route map as a policy statement (those in skip are written another way)."""
     for rm in device.route_maps.values():
+        if rm.name in skip:
+            continue
         label = routemap_text.label(rm.name, "route-map")
         report.item("policy", label)
         if not rm.entries:
@@ -410,6 +413,7 @@ class Reader:
         self.filters: Dict[Tuple[str, str], Policy] = {}  # (family, name)
         self.qos_filters: Dict[Tuple[str, str], Policy] = {}  # filters with QoS actions
         self.mac_filters: Dict[str, Policy] = {}  # ethernet-switching filters that match MAC addresses
+        self.fbf_filters: Dict[str, Policy] = {}  # filter-based forwarding (policy-based routing)
         self.route_filters: Dict[str, str] = {}  # route-filter-list or prefix-list name -> kind
         self.used_as_export: Dict[str, str] = {}  # policy -> what exports it ("bgp", "ospf", ...)
         self.aggregates: Dict[str, List[BgpAggregate]] = {}  # export policy -> the aggregates it announces
@@ -492,6 +496,10 @@ class Reader:
             if any(t and t[0] in ("policer", "dscp", "forwarding-class", "loss-priority")
                    for term in policy.terms.values() for t in term.thens):
                 self.qos_filters[(family, name)] = policy  # a QoS policy: read with class of service
+                continue
+            if family == "inet" and any(t and t[0] == "routing-instance" for term in policy.terms.values()
+                                        for t in term.thens):
+                self.fbf_filters[name] = policy  # policy-based routing: read once the forwarding instances are known
                 continue
             if family == "ethernet-switching" and any(f and f[0] in MAC_MATCHES for term in policy.terms.values()
                                                       for f in term.froms):

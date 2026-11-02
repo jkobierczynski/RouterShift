@@ -25,8 +25,8 @@ def test_prefix_lists_and_route_maps() -> None:
             [(e.prefix, e.ge, e.le) for e in pl.entries], name
         assert back.prefix_lists[name].family == pl.family
     for name, rm in first.route_maps.items():
-        if name == "PBR-SCRUBBER":  # matches an ACL: a policy-based routing filter, not a routing policy
-            assert report.items[("policy", f"route-map {name}")].status == "needs-review"
+        if name == "PBR-SCRUBBER":  # matches an ACL: written as filter-based forwarding, not a routing policy
+            assert report.items[("policy", f"route-map {name}")].status == "approximated"
             continue
         got = back.route_maps[name]
         assert [(e.seq, e.action, e.match_prefix_lists, e.match_as_paths, e.match_communities, e.match_rpki, e.sets,

@@ -29,6 +29,8 @@ from .. import junospolicy
 from .. import junosqos
 from .. import junossec
 from .. import junosauto, junosmon
+from .. import junosrouting
+from .. import bfd as bfd_text
 from .. import junosmgmt
 from .. import ospf as ospf_text
 from .. import partial
@@ -50,7 +52,7 @@ MGMT_INSTANCE = "mgmt_junos"
 WRITTEN = {"acl", "policy", "dhcp", "l2sec", "aaa", "mlag", "vxlan", "multicast", "qos", "monitor", "track"}
 # What partial.port need not report
 PORT_WRITTEN = {"dhcp-relay", "fhrp", "voice", "speed", "l2sec", "storm", "poe", "dot1x", "stp-guards", "mlag",
-                "multicast", "qos", "monitor"}
+                "multicast", "qos", "monitor", "bfd", "pbr"}
 _NAME_CHARS = re.compile(r"[^A-Za-z0-9_.-]+")
 
 
@@ -81,6 +83,9 @@ class Writer:
         self.communities: Dict[str, List[str]] = {}
         self.filter_names: Dict[str, str] = {}
         self.rid: Optional[str] = None
+        self.pbr_filters: Dict[str, str] = {}
+        self.bfd_ports: Set[str] = set()  # ports whose BFD timers a session carries
+        self.bfd_multihop_used = False
         self.relays: List[Interface] = []
         self.trusted: List[Tuple[Interface, str]] = []
         self.guarded: List[Interface] = []
@@ -122,6 +127,9 @@ class Writer:
         self.cos()
         self.security()
         junosmon.MonitorWriter(self.device, self.add, self.report, self.port, self.unit_name, self.instance).write()
+        junosrouting.ecmp(self.device, self.add, self.report)
+        junosrouting.bfd_global(self.device, self.report, self.bfd_multihop_used)
+        self.unused_bfd()
         junosauto.write_ptp(self.device, self.add, self.report, self.unit_name)
         junosauto.write_events(self.device, self.add, self.report, self.port)
         self.dhcp_relay()
@@ -576,17 +584,27 @@ class Writer:
             self.add(*path, f"maximum-power {watts:g}")
 
     def interface_filters(self, iface: Interface, path: Tuple[str, ...]) -> None:
+        if iface.pbr and iface.pbr not in self.pbr_filters:
+            self.report.add("interface", self.label(iface), Severity.REVIEW, "pbr",
+                            f"route map {iface.pbr} also filters routes, or has no entry filter-based forwarding can "
+                            "hold: policy-based routing is not written for this port; configure it by hand")
         for family, acl, qos, direction in (("inet", iface.acl_in, iface.qos_policy_in, "input"),
                                             ("inet", iface.acl_out, iface.qos_policy_out, "output"),
                                             ("inet6", iface.acl6_in, "", "input"),
                                             ("inet6", iface.acl6_out, "", "output")):
             names = [self.filter_names.get(acl, acl)] if acl else []
+            if family == "inet" and direction == "input" and iface.pbr in self.pbr_filters:
+                names.append(self.pbr_filters[iface.pbr])
             names += [qos] if qos else []
             if len(names) == 1:
                 self.add(*path, f"family {family}", "filter", f"{direction} {names[0]}")
-            elif len(names) > 1:  # an ACL and a QoS policy: Junos runs the filters of a list in turn
+            elif len(names) > 1:  # an ACL and a QoS or PBR policy: Junos runs the filters of a list in turn
                 for name in names:
                     self.add(*path, f"family {family}", "filter", f"{direction}-list {name}")
+                self.report.add("interface", self.label(iface), Severity.REVIEW, "filter-list",
+                                f"the {direction} filters {', '.join(names)} are a filter list: Junos stops at the "
+                                "first filter that accepts or forwards a packet, so check the later ones still see "
+                                "the packets they should, or merge the terms into one filter")
 
     @staticmethod
     def is_switch_port(iface: Interface) -> bool:
@@ -623,11 +641,14 @@ class Writer:
         dev = self.device
         self.prefix_kinds = junospolicy.prefix_lists(dev, self.add, self.report)
         self.communities = junospolicy.lists(dev, self.add, self.report)
-        junospolicy.policies(dev, self.add, self.report, self.prefix_kinds, self.communities)
+        pbr_only = set(bfd_text.pbr_only(dev))
+        junospolicy.policies(dev, self.add, self.report, self.prefix_kinds, self.communities, skip=pbr_only)
         switching = {i.acl_in for i in dev.interfaces.values() if self.is_switch_port(i)} | \
             {i.acl_out for i in dev.interfaces.values() if self.is_switch_port(i)}
         self.filter_names = junospolicy.filters(dev, self.add, self.report, sorted(switching - {""}))
         junossec.mac_filters(dev, self.add, self.report)
+        self.pbr_filters = junosrouting.pbr(dev, self.add, self.report, lambda name: dev.interfaces[name].vrf,
+                                            self.instance)
 
     # SNMP --------------------------------------------------------------------------------------------------------
 
@@ -745,6 +766,8 @@ class Writer:
                 self.add(*path, f"next-hop {self.unit_name(route.interface)}")
             if route.distance is not None:
                 self.add(*path, f"preference {route.distance}")
+            if route.tag is not None:
+                self.add(*path, f"tag {route.tag}")
             if route.name:
                 self.report.add("route", label, Severity.APPROX, "route-name",
                                 f"the route's name '{route.name}' has no place on Junos and is left out")
@@ -752,6 +775,13 @@ class Writer:
                 self.report.add("route", label, Severity.REVIEW, "route-track",
                                 f"Junos does not track static routes (object {route.track}); the route is always on. "
                                 "IP monitoring (services ip-monitoring) can swap its next hop on a failed RPM probe")
+
+    def unused_bfd(self) -> None:
+        for iface in self.device.interfaces.values():
+            if bfd_text.has_timers(iface) and iface.name not in self.bfd_ports:
+                self.report.add("interface", self.label(iface), Severity.APPROX, "bfd-timers",
+                                "Junos sets BFD timers per protocol session and no OSPF or BGP session on this port "
+                                "runs BFD; the timers are left out")
 
     def router_id(self) -> str:
         if self.rid is not None:
@@ -773,6 +803,8 @@ class Writer:
         if rid:
             self.add("routing-options", f"router-id {rid}")
         seen: Dict[str, str] = {}
+        bfd_ports = set(bfd_text.ospf_interfaces(self.device))
+        junosrouting.graceful_restart(self.device, self.add, self.instance)
         for p in self.device.ospf:
             label = ospf_text.label(p)
             self.report.item("ospf", label)
@@ -805,6 +837,10 @@ class Writer:
                     self.add(*path, f"metric {iface.ospf_cost}")
                 if iface.ospf_network == "point-to-point":
                     self.add(*path, "interface-type p2p")
+                junosrouting.ospf_interface(self.device, iface, path, self.add, self.report, self.label(iface),
+                                            name in bfd_ports)
+                if name in bfd_ports:
+                    self.bfd_ports.add(name)
             if p.redistribute or p.default_originate:
                 name = f"{p.vrf}-OSPF-EXPORT" if p.vrf else "OSPF-EXPORT"
                 junospolicy.export_policy(self.add, name, p.redistribute, p.redistribute_maps,
@@ -817,9 +853,7 @@ class Writer:
                     self.report.add("ospf", label, Severity.APPROX, "default-always",
                                     "default-information originate always is written as a generated default route "
                                     "that OSPF exports")
-            if p.bfd_all:
-                self.report.add("ospf", label, Severity.REVIEW, "junos-not-yet",
-                                "BFD on every OSPF interface is not written for Junos yet")
+            junosrouting.ospf_options(self.device, p, base, self.add, self.report, label)
 
     def bgp(self) -> None:
         bgp = self.device.bgp
@@ -916,7 +950,7 @@ class Writer:
                 continue
             path = base + (f"group {name}",)
             fallback = sorted({bgp_text.family(n.address) for n in members} - {""})
-            self.peer(path, group, label, group_as=group.remote_as, fallback=fallback)
+            self.peer(path, group, label, group_as=group.remote_as, fallback=fallback, members=members)
             kind = "internal" if group.remote_as == local else "external"
             if not group.remote_as:
                 remotes = {n.remote_as or group.remote_as for n in members}
@@ -948,7 +982,7 @@ class Writer:
             self.add(*path, f"preference {value}")
 
     def peer(self, path: Tuple[str, ...], p: BgpNeighbor, label: str, group_as: str,
-             fallback: Sequence[str] = ()) -> None:
+             fallback: Sequence[str] = (), members: Sequence[BgpNeighbor] = ()) -> None:
         bgp = self.device.bgp
         assert bgp is not None
         if p.description:
@@ -965,8 +999,14 @@ class Writer:
         if p.ebgp_multihop:
             self.add(*path, "multihop", f"ttl {p.ebgp_multihop}")
         if p.bfd:
-            self.add(*path, "bfd-liveness-detection", "minimum-interval 300")
-            self.report.add("bgp", label, Severity.APPROX, "bfd", "BFD is written with a 300 ms interval")
+            timers, source, ports = junosrouting.bgp_timers(self.device, p, members)
+            junosrouting.detection(self.add, path, timers)
+            self.bfd_ports.update(ports)
+            self.bfd_multihop_used = self.bfd_multihop_used or source == "multihop"
+            if not source:
+                self.report.add("bgp", label, Severity.APPROX, "bfd",
+                                "Junos needs a BFD interval and the source sets none for this session: 300 ms x3 "
+                                "written (the EOS default)")
         if p.password:
             self.add(*path, f"authentication-key {quote(p.password)}")
         if p.hold is not None or p.keepalive is not None:

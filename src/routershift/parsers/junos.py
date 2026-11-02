@@ -25,6 +25,7 @@ from .. import junospolicy
 from .. import junosqos
 from .. import junossec
 from .. import junosauto, junosmon
+from .. import junosrouting
 from .. import junosmgmt
 from .. import monitor as monitor_text
 from .. import qos as qos_text
@@ -119,6 +120,16 @@ class Reader:
         self.macsec_ports: Dict[str, str] = {}  # port -> connectivity association
         self.mon = junosmon.MonitorReader(self.device)
         self.auto = junosauto.AutoReader(self.device)
+        self.pbr = junosrouting.PbrReader(self.device)
+        self.forwarding: Set[str] = set()  # forwarding instances (filter-based forwarding)
+        self.hash_seen = False
+        self.hash_removed: List[str] = []
+        self.ospf_bfd_timers: Dict[str, Dict[str, int]] = {}  # interface -> BFD timers of its OSPF sessions
+        self.spf: Dict[str, Dict[str, int]] = {}  # routing instance -> spf-options
+        self.db_protection: Dict[str, Dict[str, str]] = {}  # routing instance -> database-protection
+        self.ospf_gr_off: Set[str] = set()
+        self.bgp_gr_off = False
+        self.bgp_bfd: Dict[Tuple[str, str], Dict[str, int]] = {}  # (instance, group or neighbor) -> BFD timers
         self.lldp_timers: Dict[str, int] = {}
         self.mgmt = junosmgmt.MgmtReader(self.device)
         self.login_filter: Optional[Tuple[str, Optional[Interface]]] = None
@@ -173,6 +184,8 @@ class Reader:
             elif s.words and s.words[0] != "version":
                 active.append(s)
         for s in active:
+            if s.words[0] == "routing-instances" and s.words[2:] == ["instance-type", "forwarding"]:
+                self.forwarding.add(s.words[1])
             if s.words[0] == "interfaces" and len(s.words) >= 3 and s.words[2] in ("vlan-tagging",
                                                                                     "flexible-vlan-tagging"):
                 self.tagged.add(s.words[1])
@@ -711,6 +724,9 @@ class Reader:
     # forwarding options, switch options, PoE, access ----------------------------------------------------------------
 
     def forwarding_options(self, s: Statement, w: List[str], vrf: str) -> bool:
+        if w[0] == "enhanced-hash-key" and not vrf:
+            self.hash_seen = True
+            return junosrouting.read_ecmp(w[1:], self.hash_removed)
         if w[:2] == ["sampling", "instance"] and len(w) >= 5 and not vrf:
             return self.mon.sampling(w[3:])
         if w[0] == "analyzer" and len(w) >= 4 and not vrf:
@@ -867,6 +883,8 @@ class Reader:
     # routing -----------------------------------------------------------------------------------------------------
 
     def routing_options(self, s: Statement, w: List[str], vrf: str) -> bool:
+        if junosrouting.PbrReader.rib_group(w):
+            return True
         if w[0] == "router-id" and len(w) == 2:
             self.router_ids[vrf] = w[1]
             return True
@@ -915,12 +933,15 @@ class Reader:
             if rest[0] in ("discard", "reject") and len(rest) == 1:
                 self.device.static_routes.append(StaticRoute(prefix, discard=True, vrf=vrf))
                 return True
-            if rest[0] == "preference" and len(rest) == 2:
+            if rest[0] in ("preference", "tag") and len(rest) == 2:
                 if not routes:
                     routes = [StaticRoute(prefix, vrf=vrf)]
                     self.device.static_routes += routes
                 for r in routes:
-                    r.distance = int(rest[1])
+                    if rest[0] == "tag":
+                        r.tag = int(rest[1])
+                    else:
+                        r.distance = int(rest[1])
                 return True
         return False
 
@@ -938,6 +959,8 @@ class Reader:
         if len(w) < 4:
             return False
         vrf, rest = w[1], w[2:]
+        if vrf in self.forwarding:
+            return self.pbr.instance(vrf, rest)
         if rest[0] == "instance-type" and len(rest) == 2 and rest[1] in ("vrf", "virtual-router"):
             if vrf not in self.device.vrfs:
                 self.device.vrfs.append(vrf)
@@ -1256,6 +1279,18 @@ class Reader:
         if w[0] == "export" and len(w) == 2:
             self.ospf_exports.setdefault(vrf, []).append(w[1])
             return True
+        if w[0] == "import" and len(w) == 2:
+            p.distribute_list_in = w[1]
+            return True
+        if w[0] == "spf-options" and len(w) == 3 and w[1] in ("delay", "holddown", "rapid-runs"):
+            self.spf.setdefault(vrf, {})[w[1]] = int(w[2])
+            return True
+        if w[0] == "database-protection" and len(w) in (2, 3):
+            self.db_protection.setdefault(vrf, {})[w[1]] = w[2] if len(w) == 3 else ""
+            return True
+        if w == ["graceful-restart", "disable"]:
+            self.ospf_gr_off.add(vrf)
+            return True
         if w[0] != "area" or len(w) < 3:
             return False
         area = ospf_text.area(w[1])
@@ -1281,6 +1316,14 @@ class Reader:
                 iface.ospf_cost = int(more[1])
             elif more == ["interface-type", "p2p"]:
                 iface.ospf_network = "point-to-point"
+            elif more[:2] == ["authentication", "md5"] and len(more) == 5 and more[3] == "key":
+                iface.ospf_auth = "message-digest"
+                iface.ospf_keys[int(more[2])] = "md5"
+            elif more[:2] == ["authentication", "simple-password"] and len(more) == 3:
+                iface.ospf_auth = "simple"
+            elif more[0] == "bfd-liveness-detection" and len(more) >= 2:
+                iface.ospf_bfd = True
+                return junosrouting.read_detection(self.ospf_bfd_timers.setdefault(name, {}), more[1:])
             else:
                 return False
             return True
@@ -1296,6 +1339,9 @@ class Reader:
         if w[0] == "hold-time" and len(w) == 2 and not vrf:
             self.bgp_hold = int(w[1])
             return True
+        if w == ["graceful-restart", "disable"] and not vrf:
+            self.bgp_gr_off = True
+            return True
         if w[0] != "group" or len(w) < 3:
             return False
         groups = self.bgp_groups.setdefault(vrf, {})
@@ -1310,7 +1356,13 @@ class Reader:
         if rest[0] == "neighbor" and len(rest) >= 2:
             neighbors = self.bgp_neighbors.setdefault(vrf, {})
             neighbor = neighbors.setdefault(rest[1], BgpNeighbor(rest[1], peer_group=w[1]))
+            if rest[2:3] == ["bfd-liveness-detection"] and len(rest) >= 4:
+                neighbor.bfd = True
+                return junosrouting.read_detection(self.bgp_bfd.setdefault((vrf, rest[1]), {}), rest[3:])
             return len(rest) == 2 or self.bgp_setting(neighbor, rest[2:], vrf)
+        if rest[0] == "bfd-liveness-detection" and len(rest) >= 2:
+            group.bfd = True
+            return junosrouting.read_detection(self.bgp_bfd.setdefault((vrf, w[1]), {}), rest[1:])
         return self.bgp_setting(group, rest, vrf)
 
     def bgp_setting(self, peer: BgpNeighbor, w: List[str], vrf: str = "") -> bool:
@@ -1412,7 +1464,61 @@ class Reader:
             self.finish_bgp()
         unread = lambda line, text, why: dev.unparsed.append(Unparsed(line, text, why))  # noqa: E731
         self.policy.finish(unread)
+        self.pbr_maps = self.pbr.finish(self.policy.fbf_filters, unread)
         self.finish_cos(unread)
+        self.finish_routing()
+
+    def finish_routing(self) -> None:
+        """BFD timers back onto the ports (or the multihop timers), the OSPF options, the ECMP hash and PBR."""
+        dev = self.device
+        for iface in dev.interfaces.values():
+            if iface.acl_in in self.pbr_maps:
+                iface.pbr, iface.acl_in = self.pbr_maps[iface.acl_in], ""
+        if self.hash_seen:
+            dev.ecmp_hash = [f for f in junosrouting.FIELDS if f not in self.hash_removed]
+        for name, timers in self.ospf_bfd_timers.items():
+            self.port_bfd(dev.interfaces[name], junosrouting.as_timers(timers))
+        for p in dev.ospf:
+            in_ospf = [dev.interfaces[n] for n in p.interface_areas]
+            if in_ospf and all(i.ospf_bfd for i in in_ospf):
+                p.bfd_all = True
+                for i in in_ospf:
+                    i.ospf_bfd = False
+            p.graceful_restart = self.graceful_restart and p.vrf not in self.ospf_gr_off
+            spf = self.spf.get(p.vrf)
+            if spf and "delay" in spf:
+                p.spf_timers = (spf["delay"], spf["delay"], spf.get("holddown", spf["delay"]))
+            db = self.db_protection.get(p.vrf)
+            if db and "maximum-lsa" in db:
+                p.max_lsa = junosrouting.max_lsa_text(db)
+        bgp = dev.bgp
+        if bgp is None:
+            return
+        for (vrf, key), raw in self.bgp_bfd.items():
+            session = junosrouting.as_timers(raw)
+            place = bgp.vrfs.get(vrf) if vrf else None
+            groups = place.peer_groups if place is not None else bgp.peer_groups
+            neighbors = place.neighbors if place is not None else bgp.neighbors
+            group = groups.get(key) or bgp.peer_groups.get(key)
+            if group is not None:
+                peer, members = group, [n for n in neighbors if n.peer_group == key]
+            else:
+                found = next((n for n in neighbors if n.address == key), None)
+                if found is None:
+                    continue
+                peer, members = found, []
+            if junosrouting.multihop(dev, peer, members):
+                dev.bfd_multihop = dev.bfd_multihop or session
+                continue
+            for n in members or [peer]:
+                through = junosrouting.reached_through(dev, n.address)
+                if through is not None:
+                    self.port_bfd(through, session)
+
+    @staticmethod
+    def port_bfd(iface: Interface, timers: Tuple[int, int, int]) -> None:
+        if iface.bfd_interval is None:
+            iface.bfd_interval, iface.bfd_min_rx, iface.bfd_multiplier = timers
 
     def finish_cos(self, unread: Callable[[int, str, str], None]) -> None:
         dev = self.device
@@ -1424,6 +1530,9 @@ class Reader:
         for (name, direction), filters in self.filter_lists.items():
             iface = dev.interfaces[name]
             for f in filters:
+                if f in self.pbr_maps and direction == "input":
+                    iface.pbr = self.pbr_maps[f]
+                    continue
                 if f.endswith(junosmgmt.LOGIN_SUFFIX) and f[:-len(junosmgmt.LOGIN_SUFFIX)] in dev.acls:
                     self.login_filter = (f, iface)
                     continue
@@ -1729,7 +1838,7 @@ class Reader:
         bgp.origin.line = self.bgp_line
         if self.bgp_hold is not None:
             bgp.hold, bgp.keepalive = self.bgp_hold, self.bgp_hold // 3
-        bgp.graceful_restart = self.graceful_restart
+        bgp.graceful_restart = self.graceful_restart and not self.bgp_gr_off
         bgp.graceful_restart_time = self.restart_duration
         bgp.asdot = self.asdot
         for vrf in sorted(set(self.bgp_groups) | set(self.bgp_neighbors) | set(self.bgp_export), key=bool):
