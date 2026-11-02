@@ -26,6 +26,7 @@ from .. import nxosaccess
 from .. import nxosfabric
 from .. import nxosmcast
 from .. import nxosqos
+from .. import nxossec
 from .. import ospf as ospf_text
 from .. import partial
 from .. import routemap as routemap_text
@@ -45,7 +46,7 @@ HASHES = ("md5-crypt", "sha256-crypt", "sha512-crypt")
 MGMT_VRF = "management"
 PERMIT_ALL = "RS-PERMIT-ALL"  # the route map NX-OS needs for redistribution where the source had none
 WRITTEN = {"acl", "policy", "dhcp-relay", "fhrp", "speed", "storm", "stp-guards", "voice", "l2sec", "dot1x", "poe",
-           "dhcp", "aaa", "mlag", "vxlan", "multicast", "qos"}
+           "dhcp", "aaa", "mlag", "vxlan", "multicast", "qos", "nat", "vpn"}
 _MGMT_NAMES = {"mgmt-vrf", "mgmt-intf", "management", "mgmt"}
 
 
@@ -85,6 +86,7 @@ class Writer:
         self.acls()
         self.policies()
         self.qos_lines()
+        self.out += nxossec.nat_lines(self.device, self.report, self.port, self.vrf, self.features)
         self.vlans()
         self.spanning_tree()
         self.out += nxosfabric.vpc_lines(self.device, self.report, IND, self.vrf)
@@ -230,6 +232,7 @@ class Writer:
         self.out += nxosaccess.aaa_lines(self.device, self.report, IND, self.vrf, self.port, self.features)
         self.out += nxosaccess.snmp_lines(self.device, self.report, self.vrf, self.port)
         nxosaccess.unwritable(self.device, self.report)
+        nxossec.unwritable(self.device, self.report)
         self.out.append("!")
 
     # ACLs and policies -----------------------------------------------------------------------------------------------
@@ -245,6 +248,9 @@ class Writer:
                                          icmp_names=True)
             self.out += [IND + line for line in lines]
             self.out.append("!")
+        for mac_acl in self.device.mac_acls.values():
+            self.out += nxossec.mac_acl_lines(mac_acl, self.report, IND)
+        self.out += nxossec.macsec_lines(self.device, self.report, IND, self.features)
 
     def policies(self) -> None:
         routemap_text.items(self.device, self.report)
@@ -427,6 +433,7 @@ class Writer:
         if layer3 and not iface.lag:
             lines += self.layer3(iface, name)
         if not iface.lag:
+            lines += nxossec.interface_lines(self.device, iface, self.adder(label))
             lines += nxosqos.interface_policy_lines(self.device, iface, self.adder(label))
             lines += self.qos.interface(iface, self.adder(label))
         for key, value in sorted(iface.storm_control.items()):

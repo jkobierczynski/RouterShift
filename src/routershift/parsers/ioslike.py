@@ -31,6 +31,7 @@ from .. import vxlan as vxlan_text
 from .. import nxosfabric
 from .. import nxosmcast
 from .. import nxosqos
+from .. import nxossec
 from .. import evpn as evpn_text
 from .. import igp as igp_text
 from .. import routemap as routemap_text
@@ -270,6 +271,7 @@ class _Reader:
             "mac": self.mac,
             "key": self.key_chain,
             "mka": self.mka,
+            "macsec": self.macsec,
             "mpls": self.mpls,
             "wlan": self.wlan,
             "wireless": self.wireless,
@@ -1500,7 +1502,8 @@ class _Reader:
             self.device.mac_acls[acl.name] = acl
             for child in node.children:
                 try:
-                    ok = security_text.mac_acl_line(acl, child.words, len(w) == 4)
+                    ok = nxossec.mac_acl_line(acl, child.words) if self.nxos else \
+                        security_text.mac_acl_line(acl, child.words, len(w) == 4)
                 except (ValueError, IndexError):
                     ok = False
                 if not ok:
@@ -1545,7 +1548,10 @@ class _Reader:
                 cak = ""
                 for grand in child.children:
                     g = grand.words
-                    if g[0] == "key-string" and len(g) in (2, 3):
+                    octets = nxossec.octet_string(g) if self.nxos else None
+                    if octets is not None:
+                        cak = octets
+                    elif g[0] == "key-string" and len(g) in (2, 3):
                         cak = g[1] if len(g) == 2 else (g[2] if g[1] == "0" else "")
                     elif g[0] == "cryptographic-algorithm" or g[0] == "lifetime":
                         pass
@@ -1592,6 +1598,20 @@ class _Reader:
                 ok = False
             if not ok:
                 self.unparsed(child, node.text)
+        return True
+
+    def macsec(self, node: Node) -> bool:
+        """NX-OS: macsec policy NAME."""
+        w = node.words
+        if not self.nxos or w[1:2] != ["policy"] or len(w) != 3:
+            return False
+        try:
+            bad = nxossec.macsec_policy(self.device, w[2], [c.words for c in node.children])
+        except (ValueError, IndexError):
+            return False
+        self.device.macsec_profiles[w[2]].origin = Origin(node.line, node.text)
+        for n in bad:
+            self.unparsed(node.children[n], node.text)
         return True
 
     def _finish_macsec(self) -> None:
@@ -3984,6 +4004,11 @@ class _Reader:
             return self.eos_nat(iface, w[3:])
         elif w[:2] == ["crypto", "map"] and n == 3:
             iface.crypto_map = w[2]
+        elif self.nxos and w[:2] == ["macsec", "keychain"] and n == 5 and w[3] == "policy":
+            iface.macsec_profile = w[4]
+            self._macsec_ports[iface.name] = w[2]
+        elif self.nxos and w[:3] == ["mac", "port", "access-group"] and n == 4:
+            iface.mac_acl_in = w[3]
         elif w[0] == "tunnel" and n >= 3:
             return self.tunnel_line(iface, w[1:])
         elif w[:3] == ["dhcp", "server", "ipv4"] and n == 3:
