@@ -28,6 +28,7 @@ from .. import multicast as multicast_text
 from .. import monitor as monitor_text
 from .. import tracking as tracking_text
 from .. import vxlan as vxlan_text
+from .. import nxosfabric
 from .. import evpn as evpn_text
 from .. import igp as igp_text
 from .. import routemap as routemap_text
@@ -173,6 +174,8 @@ class _Reader:
         self._templates: Dict[Tuple[str, str], Tuple[BgpNeighbor, List[str]]] = {}  # IOS BGP peer templates
         self._inherits: List[Tuple[str, str, str]] = []  # neighbor, peer-session|peer-policy, template
         self._bgp_vrfs: Dict[str, Tuple[bgp_text.Builder, BgpVrf]] = {}
+        self._fabric = nxosfabric.Reader(self.device)  # NX-OS VXLAN, EVPN and vPC
+        self._host_flap: Optional[Tuple[int, int, int]] = None  # NX-OS l2rib dup-host-mac-detection
         self._bgp_router_id = ""  # EOS: a VRF that names the same router ID needs none of its own
         self._syslog_hosts: List[Tuple[Node, str, str]] = []  # every logging host line, its address and VRF
         self._pbr_policies: List[Node] = []
@@ -281,6 +284,10 @@ class _Reader:
             "flow": self.flow,
             "track": self.track,
             "l2vpn": self.l2vpn,
+            "fabric": lambda node: self.nxos and nxosfabric.read_anycast_mac(self.device, node.words),
+            "vpc": self.vpc,
+            "evpn": self.evpn,
+            "l2rib": self.l2rib,
         }
         for node in roots:
             if node.text.startswith(_NOISE) or node.text == "end":
@@ -302,6 +309,8 @@ class _Reader:
     def feature(self, node: Node) -> bool:
         """NX-OS: feature X switches a protocol on; the writer works out the features it needs."""
         w = node.words
+        if w[1:] in (["nv", "overlay"], ["fabric", "forwarding"]):
+            return True
         if len(w) != 2:
             return False
         m = self.device.management
@@ -2483,9 +2492,14 @@ class _Reader:
         for child in node.children:
             w = self._direct(child.words)
             af = ""
-            if self.nxos and w[0] == "neighbor" and len(w) in (2, 4) and (len(w) == 2 or w[2] == "remote-as"):
+            if self.nxos and (w[0] == "neighbor" and len(w) in (2, 4) and (len(w) == 2 or w[2] == "remote-as") or
+                              w[:2] == ["template", "peer"] and len(w) == 3):
                 self._nxos_neighbor(b, child)
                 continue
+            if self.nxos and w[0] == "bestpath":
+                w = ["bgp"] + w  # NX-OS: bestpath ... without the bgp
+                if self.bgp_line(b, w, ""):
+                    continue
             if w[0] == "vrf" and len(w) == 2 and self.device.platform in ("eos", "nxos"):
                 self._eos_bgp_vrf(w[1], child, local_as)
                 continue
@@ -2628,13 +2642,19 @@ class _Reader:
                 self.unparsed(child, f"{bgp_text_} / {node.text}")
 
     def _nxos_neighbor(self, b: bgp_text.Builder, node: Node) -> None:
-        """NX-OS: neighbor A [remote-as X], with its settings and address families inside."""
-        address = node.words[1]
-        b.peer(address)
-        if len(node.words) == 4:
+        """NX-OS: neighbor A [remote-as X] (or template peer NAME), with its settings and address families inside."""
+        template = node.words[0] == "template"
+        address = node.words[-1] if template else node.words[1]
+        b.peer(address, group=template)
+        if template:
+            b.declared.add(address)
+        if len(node.words) == 4 and not template:
             ioslike_neighbor(b, address, node.words[2:], "")
         for child in node.children:
             w = child.words
+            if w[:2] == ["inherit", "peer"] and len(w) == 3 and not template:
+                b.peer(address).peer_group = w[2]
+                continue
             families = {("ipv4", "unicast"): "ipv4", ("ipv6", "unicast"): "ipv6", ("l2vpn", "evpn"): "evpn"}
             if w[0] == "address-family" and len(w) == 3 and (w[1], w[2]) in families:
                 af = families[(w[1], w[2])]
@@ -2685,6 +2705,50 @@ class _Reader:
                 ok = False
             if not ok:
                 self.unparsed(child, node.text)
+
+    def _nxos_nve(self, node: Node) -> bool:
+        vx = vxlan_text.vtep(self.device)
+        vx.origin = Origin(node.line, node.text)
+        children = [(c.words, [g.words for g in c.children]) for c in node.children]
+        for n, k in self._fabric.nve(children):
+            child = node.children[n]
+            if k < 0:
+                self.unparsed(child, node.text)
+            else:
+                self.unparsed(child.children[k], f"{node.text} / {child.text}")
+        return True
+
+    def evpn(self, node: Node) -> bool:
+        """NX-OS: evpn / vni N l2 with rd and route-target lines; evpn esi multihoming."""
+        if not self.nxos:
+            return False
+        if node.words[1:] == ["esi", "multihoming"]:
+            return True
+        if len(node.words) != 1:
+            return False
+        children = [(c.words, [g.words for g in c.children]) for c in node.children]
+        for n, k in self._fabric.evpn_block(children):
+            child = node.children[n]
+            if k < 0:
+                self.unparsed(child, node.text)
+            else:
+                self.unparsed(child.children[k], f"{node.text} / {child.text}")
+        return True
+
+    def vpc(self, node: Node) -> bool:
+        w = node.words
+        if not self.nxos or w[1:2] != ["domain"] or len(w) != 3:
+            return False
+        for n in self._fabric.vpc_domain(w[2], [c.words for c in node.children]):
+            self.unparsed(node.children[n], node.text)
+        return True
+
+    def l2rib(self, node: Node) -> bool:
+        w = node.words
+        if self.nxos and w[1:2] == ["dup-host-mac-detection"] and len(w) == 4 and w[2].isdigit() and w[3].isdigit():
+            self._host_flap = (int(w[3]), int(w[2]), 0)
+            return True
+        return False
 
     def _vxlan_interface(self, node: Node) -> bool:
         """EOS interface Vxlan1 (vxlan source-interface, udp-port, vlan N vni V, vrf V vni N, flood vtep A..);
@@ -2812,7 +2876,7 @@ class _Reader:
             c = child.words
             if c[0] == "address-family" and c[1:] in (["ipv4"], ["ipv4", "unicast"], ["ipv6"], ["ipv6", "unicast"]):
                 lines += [(grand, c[1]) for grand in child.children]
-            elif self.nxos and c[0] == "neighbor" and len(c) in (2, 4):
+            elif self.nxos and (c[0] == "neighbor" and len(c) in (2, 4) or c[:2] == ["template", "peer"]):
                 self._nxos_neighbor(vb, child)
             else:
                 lines.append((child, ""))
@@ -2832,6 +2896,8 @@ class _Reader:
                     ok = True  # the same as the process's own
                 elif c[0] == "maximum-paths" and len(c) == 2:
                     v.maximum_paths, ok = int(c[1]), True
+                elif c == ["advertise", "l2vpn", "evpn"] and self.nxos:
+                    ok = True  # NX-OS: the VRF's routes go to EVPN as type 5 routes; the layer 3 VNI says so
                 elif c[0] in ("network", "redistribute", "neighbor", "aggregate-address") or \
                         c == ["bgp", "bestpath", "med", "missing-as-worst"]:
                     ok = self.bgp_line(vb, c, af)
@@ -2876,6 +2942,8 @@ class _Reader:
                 return True
             if rest[:1] == ["route-map"] and len(rest) == 2 and af != "ipv6":
                 bgp.redistribute_maps[w[1]] = rest[1]
+            elif rest == ["route-map", "RS-PERMIT-ALL"] and af == "ipv6":
+                pass  # NX-OS: the permit-all map RouterShift writes
             elif rest:
                 return False  # a metric
             (bgp.redistribute6 if af == "ipv6" else bgp.redistribute).append(w[1])
@@ -2892,6 +2960,8 @@ class _Reader:
             bgp.graceful_restart_time = int(w[-1])
         elif w[:2] == ["distance", "bgp"] and n == 5 and all(x.isdigit() for x in w[2:]):
             bgp.distance = (int(w[2]), int(w[3]), int(w[4]))
+        elif w[0] == "distance" and n == 4 and all(x.isdigit() for x in w[1:]) and af == "ipv4":  # NX-OS
+            bgp.distance = (int(w[1]), int(w[2]), int(w[3]))
         elif w == ["bgp", "bestpath", "as-path", "multipath-relax"]:
             bgp.multipath_relax = True
         elif w == ["bgp", "bestpath", "med", "missing-as-worst"]:
@@ -3068,15 +3138,21 @@ class _Reader:
             elif c[0] == "route-target" and len(c) == 3 and vrfs_text.route_target(
                     vrfs_text.info(self.device, name), c[1], c[2]):
                 pass
+            elif self.nxos and self._fabric.vrf_line(name, c):
+                pass
             elif c[0] in ("ip", "ipv6") and c[1:2] == ["route"] and len(c) >= 4:  # NX-OS: routes in vrf context
                 if not self.route(child, ["vrf", name] + c[2:], 4 if c[0] == "ip" else 6):
                     self.unparsed(child, node.text)
-            elif c[0] == "address-family" and c[1:2] == ["ipv4"] and child.children:
+            elif c[0] == "address-family" and c[1:2] == ["ipv4"] and child.children or \
+                    self.nxos and c[:2] == ["address-family", "ipv6"] and child.children:
                 info = vrfs_text.info(self.device, name)
+                six = c[1] == "ipv6"  # NX-OS: the same route targets again for IPv6
                 for g in child.children:
                     gw = g.words
-                    if gw[0] == "route-target" and len(gw) == 4 and gw[3] == "stitching":  # IOS XE EVPN
+                    if gw[0] == "route-target" and len(gw) == 4 and gw[3] in ("stitching", "evpn"):  # EVPN
                         info.rt_evpn, gw = True, gw[:3]
+                    if six and (gw[0] == "route-target" and len(gw) == 3 or gw[:2] == ["export", "map"]):
+                        continue
                     if gw == ["exit-address-family"] or gw[0] == "route-target" and len(gw) == 3 and \
                             vrfs_text.route_target(info, gw[1], gw[2]):
                         continue
@@ -3424,6 +3500,8 @@ class _Reader:
                     vlan.shutdown = True
                 elif child.words[:2] == ["trunk", "group"] and len(child.words) == 3:
                     vlan.trunk_groups.append(child.words[2])
+                elif self.nxos and self._fabric.vlan_line(vid, child.words):
+                    pass
                 elif vid == ids[0]:
                     self.unparsed(child, node.text)
         return True
@@ -3497,6 +3575,8 @@ class _Reader:
             self.interface(Node(node.line, f"interface {port}", node.children))
         if ports:
             return True
+        if source.lower().startswith("nve") and self.nxos:
+            return self._nxos_nve(node)
         if source.lower().startswith("vxlan" if self.device.platform == "eos" else "nve"):
             return self._vxlan_interface(node)
         canon, kind, media = names.canonical(source)
@@ -3524,6 +3604,12 @@ class _Reader:
                     child.words[1].isdigit():
                 self._nxos_fhrp(iface, child)
                 continue
+            if self.nxos:
+                done = self._fabric.interface_line(iface, child.words, [g.words for g in child.children])
+                if done is not None:
+                    if not done:
+                        self.unparsed(child, node.text)
+                    continue
             if child.children and self._interface_block(iface, child):
                 continue
             self._reason = None
@@ -4104,7 +4190,10 @@ class _Reader:
         self._finish_vpn()
         multicast_text.finish(self.device)
         self._finish_monitor()
-        if self.device.vxlan is not None:
+        if self.nxos:
+            self._fabric.finish()
+            self._finish_nxos_bgp()
+        elif self.device.vxlan is not None:
             self._finish_evpn(self.device.vxlan)
         for wl in self.device.wlans:
             wl.vlan = self._wlan_profiles.get(self._wlan_tags.get(wl.name, ""))
@@ -4117,7 +4206,7 @@ class _Reader:
             if pool.network:
                 pool.ranges = dhcp_text.subtract(pool.network, pool.ranges, self._dhcp_excluded.get(pool.vrf, []))
         for iface in self.device.interfaces.values():
-            if iface.virtual_ipv4 or iface.virtual_ipv6:
+            if (iface.virtual_ipv4 or iface.virtual_ipv6) and (self._varp_mac or not self.nxos):
                 self.device.anycast_mac = self._varp_mac
             for group in iface.fhrp:
                 if group.protocol == "anycast":
@@ -4164,6 +4253,23 @@ class _Reader:
         tags = {tag for tag, _ in self._ospf_vrfs}
         self.device.ospf = [p for p in self.device.ospf if not (
             p.process in tags and not p.vrf and p == Ospf(process=p.process, origin=p.origin))]
+
+    def _finish_nxos_bgp(self) -> None:
+        """NX-OS: MAC-move detection, and the permit-all route map RouterShift writes for redistribution."""
+        bgp = self.device.bgp
+        if bgp is not None and self._host_flap:
+            bgp.evpn_host_flap = self._host_flap
+        rm = self.device.route_maps.get("RS-PERMIT-ALL")
+        if rm is None or len(rm.entries) != 1 or rm.entries[0].action.value != "permit" or \
+                rm.entries[0] != type(rm.entries[0])(rm.entries[0].seq, rm.entries[0].action):
+            return
+        del self.device.route_maps["RS-PERMIT-ALL"]
+        holders = [p.redistribute_maps for p in self.device.ospf]
+        if bgp is not None:
+            holders += [bgp.redistribute_maps] + [v.redistribute_maps for v in bgp.vrfs.values()]
+        for maps in holders:
+            for source in [k for k, v in maps.items() if v == "RS-PERMIT-ALL"]:
+                del maps[source]
 
     def _finish_evpn(self, vx: Vxlan) -> None:
         """IOS: the VNIs of interface nve1 meet their VLANs, VRFs, EVPN instances and ethernet segments."""
@@ -4276,9 +4382,9 @@ def ioslike_neighbor(b: bgp_text.Builder, name: str, w: List[str], af: str) -> b
             b.note = ("BGP neighbor options", "the prefix limit is converted; its restart timer and warning-only "
                       "are not")
         return not rest
-    elif w[0] == "remove-private-as" and n <= 3 and w[1:] in ([], ["all"], ["all", "replace-as"]):
+    elif w[0] == "remove-private-as" and n <= 3 and w[1:] in ([], ["all"], ["all", "replace-as"], ["replace-as"]):
         peer.remove_private_as = True
-        peer.remove_private_as_mode = " ".join(w[1:])
+        peer.remove_private_as_mode = "all replace-as" if w[1:] == ["replace-as"] else " ".join(w[1:])
     elif w[0] == "local-as" and n >= 2 and w[1].replace(".", "").isdigit() and \
             set(w[2:]) <= {"no-prepend", "replace-as", "dual-as"}:
         peer.local_as, peer.local_as_options = w[1], " ".join(w[2:])

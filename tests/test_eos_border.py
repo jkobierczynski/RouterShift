@@ -314,12 +314,13 @@ def test_other_targets_report_what_they_leave_out(target: str) -> None:
         assert "    active-gateway ip 10.1.100.1\n" in out and "    ip address 10.1.100.1/24\n" in out
     elif target == "nxos":
         assert "ip community-list standard CL-BLACKHOLE seq 10 permit 65535:666\n" in out
-        assert "anycast gateway 10.1.100.1/24" in text
+        assert "  ip address 10.1.100.1/24\n  ipv6 address 2001:db8:1:100::1/64\n" \
+               "  fabric forwarding mode anycast-gateway\n" in out
     else:
         assert "anycast gateway 10.1.100.1/24" in text
         assert "community-list CL-BLACKHOLE: skipped" in text
     for (kind, name), item in rep.items.items():
-        if kind == "interface" and name.startswith("Vlan100 ->"):
+        if kind == "interface" and name.startswith("Vlan100 ->") and target != "nxos":  # NX-OS writes it all
             assert item.status in ("needs-review", "skipped"), target
 
 
