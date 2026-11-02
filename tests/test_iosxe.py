@@ -163,13 +163,13 @@ def test_report_groups_what_it_recognises() -> None:
     text = report.to_text()
     assert "Not understood" not in text
     known = {name for kind, name in report.items if kind == "known"}
-    assert {"Embedded Event Manager (EEM) applets", "Device housekeeping", "IP SLA options",
-            "Gateway redundancy options"} <= known
+    assert {"IP SLA options", "Gateway redundancy options"} <= known
+    # EEM applets are read now; a timer has no EOS event-handler trigger
+    assert "EOS event handlers have no 'timer' trigger" in text
     # converted now: no ip redirects, no ip proxy-arp, bgp graceful-restart, the static route's tag
     assert not {"Interface hardening (redirects, proxy ARP, uRPF)", "Routing protocol tuning",
                 "Static route options"} & known
-    eem = report.items[("known", "Embedded Event Manager (EEM) applets")]
-    assert eem.skipped and "(3 lines: " in eem.findings[0].message
+    assert report.items[("system", "event handler NIGHTLY")].skipped
 
 
 def test_unknown_lines_are_grouped_by_block() -> None:

@@ -6,7 +6,8 @@
 
 from __future__ import annotations
 
-from typing import List, Tuple
+import re
+from typing import Dict, List, Set, Tuple
 
 from .model import Device, VrfInfo
 from .report import Report, Severity
@@ -60,3 +61,16 @@ def mlag_unsupported(device: Device, report: Report, platform: str, alternative:
     report.add("interface", "multi-chassis LAG", Severity.REVIEW, "mlag-unsupported",
                f"{platform}: {alternative}; the pair (peer link {m.peer_link if m else '?'}, shared LAGs {members}) "
                "is left out")
+
+
+def svl_lags(device: Device) -> Dict[str, int]:
+    """IOS StackWise Virtual: the port-channels with members on both switches (1/x/y and 2/x/y), which become
+    MLAGs on a platform that pairs two switches; port-channel -> its number."""
+    if device.mlag is None or not device.mlag.stack:
+        return {}
+    switches: Dict[str, Set[str]] = {}
+    for iface in device.interfaces.values():
+        m = re.match(r"\D+(\d+)/\d+/\d+$", iface.name)
+        if iface.lag and m:
+            switches.setdefault(iface.lag, set()).add(m.group(1))
+    return {lag: int(re.sub(r"\D", "", lag) or 1) for lag, sw in switches.items() if len(sw) > 1}

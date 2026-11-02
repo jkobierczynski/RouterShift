@@ -199,7 +199,8 @@ def test_converts_and_reads_back(source: str, target: str) -> None:
     assert bool(m2.telnet) == bool(m1.telnet) and (m2.telnet is None) == (target == "aoscx" or m1.telnet is None
                                                                          and target not in ("ios", "comware"))
     assert m2.http == (None if target in ("aoscx", "eos") else m1.http)
-    assert m2.https == (None if target == "eos" else m1.https)
+    # RESTCONF, the IOS stand-in for the EOS eAPI, runs on the HTTPS server
+    assert m2.https == (None if target == "eos" else True if target == "ios" and "http" in m1.apis else m1.https)
     assert m2.vty_acl == (safe_name(m1.vty_acl) if target in ("ios", "eos") else "")
     assert m2.lldp == (None if target == "aoscx" and m1.lldp else m1.lldp)
     assert m2.cdp == (m1.cdp if target in ("ios", "aoss") else None)
@@ -288,6 +289,8 @@ def test_converts_and_reads_back(source: str, target: str) -> None:
         assert len(vrfs_text.mlag_members(back)) == len(vrfs_text.mlag_members(first))
         if back.mlag.peer_address:
             assert back.mlag.peer_address == first.mlag.peer_address
+    elif first.mlag is not None and target == "ios":  # StackWise Virtual, the nearest it has
+        assert back.mlag is not None and back.mlag.stack and "StackWise Virtual" in report.to_text()
     elif first.mlag is not None:
         assert back.mlag is None and "multi-chassis LAG" in report.to_text()
     # prefix lists and route maps keep every entry (AOS-CX route maps match no ACL), and BGP neighbors and
@@ -374,14 +377,27 @@ def test_converts_and_reads_back(source: str, target: str) -> None:
     mirrors = lambda dev: sorted((sorted(s.sources.values()), bool(s.destination))  # noqa: E731
                                  for s in dev.mirror_sessions)
     assert mirrors(back) == mirrors(first)
-    if first.sflow is None or target == "ios":
+    # IOS writes sFlow as sampled NetFlow and EOS NetFlow as sFlow, when the source has only the other
+    sflow_for_netflow = target == "ios" and first.sflow is not None and first.netflow is None
+    netflow_for_sflow = target == "eos" and first.netflow is not None and first.sflow is None
+    if netflow_for_sflow:
+        assert back.sflow is not None and back.netflow is None
+        assert [c.address for c in back.sflow.collectors] == [c.address for c in first.netflow.collectors]
+        assert len(monitor_text.sflow_ports(back)) == len([i for i in monitor_text.flow_ports(first)
+                                                           if i in monitor_text.physical(first)])
+    elif first.sflow is None or target == "ios":
         assert back.sflow is None
     else:
         assert back.sflow is not None
         sflow = lambda sf: ([c.address for c in sf.collectors], sf.sample_rate, sf.polling_interval)  # noqa: E731
         assert sflow(back.sflow) == sflow(first.sflow)
         assert len(monitor_text.sflow_ports(back)) == len(monitor_text.sflow_ports(first))
-    if first.netflow is None or target not in ("ios", "comware"):
+    if sflow_for_netflow:
+        assert back.netflow is not None and first.sflow is not None
+        assert [c.address for c in back.netflow.collectors] == [c.address for c in first.sflow.collectors]
+        assert back.netflow.sample_rate == first.sflow.sample_rate
+        assert len(monitor_text.flow_ports(back)) == len(monitor_text.sflow_ports(first))
+    elif netflow_for_sflow or first.netflow is None or target not in ("ios", "comware"):
         assert back.netflow is None
     else:
         assert back.netflow is not None
@@ -433,6 +449,6 @@ def test_converts_and_reads_back(source: str, target: str) -> None:
         assert bx is not None
         assert bool(bx.source_interface) == bool(fx.source_interface)
         assert bx.vlan_vnis == fx.vlan_vnis and sorted(bx.evpn_vlans) == sorted(fx.evpn_vlans)
-        assert sorted(bx.vrf_vnis.values()) == ([] if target == "ios" else sorted(fx.vrf_vnis.values()))
+        assert sorted(bx.vrf_vnis.values()) == sorted(fx.vrf_vnis.values())
         assert bx.flood_vteps == (fx.flood_vteps if set(fx.vlan_vnis) - set(fx.evpn_vlans) else bx.flood_vteps)
     assert report.counts()

@@ -22,18 +22,23 @@ from .. import qos as qos_text
 from .. import snmp as snmp_text
 from .. import stp as stp_text
 from .. import aaa as aaa_text
+from .. import access as access_text
+from .. import automation as automation_text
 from .. import vpn as vpn_text
 from .. import vrfs as vrfs_text
 from .. import multicast as multicast_text
 from .. import monitor as monitor_text
 from .. import tracking as tracking_text
 from .. import vxlan as vxlan_text
+from .. import queuing as queuing_text
+from .. import security as security_text
+from .. import evpn as evpn_text
 from .. import hosts as hosts_text
 from .. import igp as igp_text
 from .. import bfd as bfd_text
 from .. import routemap as routemap_text
 from .. import wlan as wlan_text
-from ..model import (AaaMethod, AaaServer, LocalUser, AclAction, Bgp, BgpAggregate, BgpNeighbor, BgpVrf, Device, DhcpPool, IkePolicy, IpsecPeer, NatRule, SnmpGroup, FhrpGroup, Interface, InterfaceKind, LacpMode, Ospf,
+from ..model import (Mlag, AaaMethod, AaaServer, LocalUser, AclAction, Bgp, BgpAggregate, BgpNeighbor, BgpVrf, Device, DhcpPool, IkePolicy, IpsecPeer, NatRule, SnmpGroup, FhrpGroup, Interface, InterfaceKind, LacpMode, Ospf,
                      StaticRoute, StpMode, SwitchportMode)
 from ..names import PortMapper
 from ..report import Report, Severity
@@ -83,6 +88,13 @@ class Writer:
             for name in nat_text.outside(self.device, rule):
                 self.nat_outside.setdefault(name, []).append(rule)
         self.key_chains: List[str] = []  # IOS: key chains the interfaces' OSPF authentication uses
+        self.svl_lags = vrfs_text.svl_lags(self.device) if not self.ios else {}
+        # IOS: the VLAN that carries each layer 3 VNI; EOS: the VLANs and SVIs an IOS source used for them, left out
+        self.l3vni_vlans: Dict[str, int] = evpn_text.ios_l3vni_vlans(self.device, self.report) if self.ios else {}
+        self.skip_vlans = set(self.device.vxlan.vrf_vlans.values()) if self.device.vxlan and not self.ios else set()
+        # sFlow on IOS and NetFlow on EOS are written as the other (the nearest each platform runs)
+        self.netflow_stand_in = monitor_text.netflow_from_sflow(self.device, self.report) if self.ios else None
+        self.sflow_stand_in = monitor_text.sflow_from_netflow(self.device, self.report) if not self.ios else None
         self.track_plan = tracking_text.plan(self.device, self.report, self.target, "IOS" if self.ios else "EOS")
         self.system()
         self.spanning_tree()
@@ -98,13 +110,23 @@ class Writer:
         self.mpls()
         mark = len(self.out)
         for iface in self.device.interfaces.values():
+            if iface.kind == InterfaceKind.VLAN and iface.name[4:].isdigit() and int(iface.name[4:]) in self.skip_vlans:
+                continue
             self.interface(iface)
+        self._l3vni_interfaces()
         self.out[mark:mark] = self.key_chains
         self.mirrors()
+        self.twamp()
+        self.out += automation_text.ptp_lines(self.device, self.report, self.ios)
+        self.out += bfd_text.global_lines(self.device, self.report, self.ios)
+        self.out += bfd_text.ecmp_lines(self.device, self.report, self.ios)
+        self.out += automation_text.ios_lines(self.device, self.report, self.port) if self.ios else \
+            automation_text.eos_lines(self.device, self.report, self.ind, self.port)
         self.vxlan()
         self.policies()
         self.routing()
         self.acls()
+        self.security()
         self.nat()
         self.dhcp()
         self.services()
@@ -203,6 +225,13 @@ class Writer:
                     self.out += [f"  route-target {d} {v}{stitching}" for d, v in vrfs_text.targets(info)]
                     if info.export_map:
                         self.out.append(f"  export map {info.export_map}")
+                    for source, rm in info.leaks.items():
+                        self.out.append(f"  route-replicate from vrf {self.vrf(source)} unicast all" +
+                                        (f" route-map {rm}" if rm else ""))
+                        self.report.add("system", f"vrf {name}", Severity.APPROX, "vrf-leak",
+                                        f"routes of VRF {source} leaked into it with route-replicate" +
+                                        (f" through route map {rm}" if rm else "") + "; check the platform supports "
+                                        "it, otherwise import the route target of " + source + " with an import map")
                     if info.rt_evpn and (info.rt_import or info.rt_export):
                         self.report.add("system", f"vrf {name}", Severity.APPROX, "vrf-evpn-rt",
                                         "EVPN route targets written with 'stitching', as IOS XE EVPN takes them; "
@@ -227,14 +256,30 @@ class Writer:
                 any("ipv6" in p.families for p in bgp.neighbors)))
 
     def vlans(self) -> None:
+        if self.skip_vlans:
+            self.report.add("interface", vxlan_text.LABEL, Severity.INFO, "evpn-l3vni-vlan",
+                            "the VLANs and SVIs that carried the layer 3 VNIs on IOS ("
+                            + ", ".join(str(v) for v in sorted(self.skip_vlans)) + ") are left out: EOS maps a VRF "
+                            "to its VNI directly")
+        for vrf, vid in self.l3vni_vlans.items():
+            if vid not in self.device.vlans:
+                self.out += [f"vlan {vid}", f"{self.ind}name L3VNI-{self.vrf(vrf)}", "!"]
         for vlan in sorted(self.device.vlans.values(), key=lambda v: v.vlan_id):
+            if vlan.vlan_id in self.skip_vlans:
+                continue
             self.out.append(f"vlan {vlan.vlan_id}")
             if vlan.name:
                 self.out.append(f"{self.ind}name {vlan.name}")
             if vlan.shutdown:
                 self.out.append(f"{self.ind}state suspend")
-            self.out.append("!")
             self.report.item("vlan", str(vlan.vlan_id))
+            if vlan.trunk_groups and self.ios:
+                self.report.add("vlan", str(vlan.vlan_id), Severity.APPROX, "trunk-group",
+                                f"trunk group {', '.join(vlan.trunk_groups)} left out: IOS has no trunk groups, so the "
+                                "VLAN rides every trunk that allows it; limit it with 'switchport trunk allowed vlan'")
+            elif vlan.trunk_groups:
+                self.out += [f"{self.ind}trunk group {g}" for g in vlan.trunk_groups]
+            self.out.append("!")
 
     # interfaces ------------------------------------------------------------------------------------------------------
 
@@ -252,9 +297,16 @@ class Writer:
         is_l2_capable = iface.kind in (InterfaceKind.ETHERNET, InterfaceKind.LAG)
         if is_l2_capable:
             lines += self._switchport(iface, add)
-        if iface.lag:
+        if iface.lag and self.ios and self.device.mlag and not self.device.mlag.stack and \
+                iface.lag == self.device.mlag.peer_link:
+            lines.append("stackwise-virtual link 1")  # the MLAG peer link becomes the StackWise Virtual link
+        elif iface.lag:
             word = {LacpMode.ACTIVE: "active", LacpMode.PASSIVE: "passive"}.get(iface.lacp_mode or LacpMode.STATIC, "on")
             lines.append(f"channel-group {iface.lag[len('Port-channel'):]} mode {word}")
+        if iface.svl_link is not None and self.ios:
+            lines.append(f"stackwise-virtual link {iface.svl_link}")
+        if iface.svl_dad and self.ios:
+            lines.append("stackwise-virtual dual-active-detection")
         if iface.kind == InterfaceKind.SUBINTERFACE and iface.encapsulation_vlan is not None:
             vid = iface.encapsulation_vlan
             lines.append(f"encapsulation dot1Q {vid}" if self.ios else f"encapsulation dot1q vlan {vid}")
@@ -262,6 +314,9 @@ class Writer:
             vrf = self.vrf(iface.vrf)
             lines.append(f"vrf forwarding {vrf}" if self.ios else f"vrf {vrf}")
         lines += self._addresses(iface, add)
+        if iface.unnumbered:
+            lines.append(f"ip unnumbered {self.port(iface.unnumbered)}" if self.ios else
+                         f"ip address unnumbered {self.port(iface.unnumbered)}")
         lines += self._acl_bindings(iface, add)
         lines += self._hardening(iface)
         lines += self._fhrp(iface, name)
@@ -271,6 +326,7 @@ class Writer:
         lines += self._isis_interface(iface)
         lines += self._multicast_interface(iface, add)
         lines += self._flow_interface(iface)
+        lines += automation_text.ptp_port_lines(iface, self.ios)
         lines += self._poe(iface, add)
         lines += bfd_text.joined_line(iface, "ios" if self.ios else "eos", self.report, label)
         if iface.pbr and not (self.device.route_maps.get(iface.pbr) and self.device.route_maps[iface.pbr].entries):
@@ -288,6 +344,7 @@ class Writer:
             lines.append(f"mtu {mtu}")
         lines += self._speed(iface, add)
         lines += self._dot1x(iface, add)
+        lines += self._security_interface(iface, add)
         lines += self._qos_interface(iface, add)
         if iface.mpls:
             lines.append("mpls ip" if self.ios else "mpls ldp interface")
@@ -295,6 +352,16 @@ class Writer:
         lines += self._l2sec_interface(iface, add, label)
         if iface.mlag_id is not None and not self.ios:
             lines.append(f"mlag {iface.mlag_id}")
+        elif not self.ios and iface.name in self.svl_lags:
+            lines.append(f"mlag {self.svl_lags[iface.name]}")
+            add(Severity.APPROX, "mlag-from-svl", "its members are on both switches of the StackWise Virtual pair: "
+                                                  f"written as MLAG {self.svl_lags[iface.name]}")
+        if iface.trunk_groups and not self.ios:
+            lines += [f"switchport trunk group {g}" for g in iface.trunk_groups]
+        elif iface.trunk_groups:
+            add(Severity.APPROX, "trunk-group", f"trunk group {', '.join(iface.trunk_groups)} left out: IOS has no "
+                                                "trunk groups; the port carries the VLANs it allows")
+        lines += self._evpn_interface(iface, add)
         if iface.cdp is not None and self.ios:
             lines.append("cdp enable" if iface.cdp else "no cdp enable")
         if iface.stp_portfast:
@@ -317,6 +384,55 @@ class Writer:
         if (iface.source_name or iface.name, name) in self.port.renumbered:
             add(Severity.APPROX, "port-renamed",
                 f"named {name} without a port map; check it against the cabling of the new device")
+
+    def _evpn_interface(self, iface: Interface, add: "_Add") -> List[str]:
+        """EVPN multihoming on a LAG, its LACP system ID, and SVI autostate."""
+        lines: List[str] = []
+        if iface.evpn_esi and self.ios:
+            lines.append(f"evpn ethernet-segment {evpn_text.es_number(iface)}")
+            notes = [f"EVPN multihoming written as ethernet segment {evpn_text.es_number(iface)} (l2vpn evpn "
+                     "ethernet-segment); check that the Catalyst model and release support it"]
+            if iface.evpn_es_rt:
+                notes.append(f"the ES-import route target {iface.evpn_es_rt} is derived from the identifier on IOS XE")
+            if iface.lacp_system_id:
+                notes.append(f"the LAG's LACP system ID {iface.lacp_system_id} has no per-LAG equivalent; both "
+                             "switches must present the same LACP system ID to the device")
+            add(Severity.REVIEW, "evpn-es", "; ".join(notes))
+        elif iface.evpn_esi:
+            lines.append("evpn ethernet-segment")
+            lines.append(f"{self.ind}identifier {iface.evpn_esi}")
+            if iface.evpn_single_active:
+                lines.append(f"{self.ind}redundancy single-active")
+            if iface.evpn_es_rt:
+                lines.append(f"{self.ind}route-target import {iface.evpn_es_rt}")
+            if iface.evpn_df_preference is not None:
+                lines.append(f"{self.ind}designated-forwarder election algorithm preference value "
+                             f"{iface.evpn_df_preference}")
+            if self.device.platform == "ios":
+                add(Severity.APPROX, "evpn-es", "EOS takes the ES-import route target from the identifier unless "
+                                                "one is set; check it matches the peer")
+        if iface.lacp_system_id and not self.ios:
+            lines.append(f"lacp system-id {iface.lacp_system_id}")
+        elif iface.lacp_system_id and not iface.evpn_esi:
+            add(Severity.REVIEW, "lacp-system-id", f"the LAG's LACP system ID {iface.lacp_system_id} has no per-LAG "
+                                                   "equivalent on IOS; left out")
+        if iface.mac_address:
+            digits = iface.mac_address.replace(":", "")
+            lines.append(f"mac-address {digits[0:4]}.{digits[4:8]}.{digits[8:12]}")
+        if iface.autostate is False:
+            lines.append("no autostate")
+        return lines
+
+    def _l3vni_interfaces(self) -> None:
+        """IOS: an SVI in the VRF for the VLAN of each layer 3 VNI."""
+        vx = self.device.vxlan
+        for vrf, vid in self.l3vni_vlans.items():
+            if f"Vlan{vid}" in self.device.interfaces:
+                continue
+            source = vx.source_interface if vx else ""
+            self.out += [f"interface Vlan{vid}", f" description L3VNI {self.vrf(vrf)}",
+                         f" vrf forwarding {self.vrf(vrf)}"] + \
+                ([f" ip unnumbered {self.port(source)}"] if source else []) + [" no autostate", " no shutdown", "!"]
 
     def _switchport(self, iface: Interface, add: "_Add") -> List[str]:
         lines: List[str] = []
@@ -985,6 +1101,33 @@ class Writer:
         self.isis()
         if self.device.bgp is not None:
             self.bgp(self.device.bgp)
+        self._router_general()
+
+    def _router_general(self) -> None:
+        """EOS router general: the global router ID and routes leaked between VRFs without route targets. IOS XE
+        leaks them with route-replicate in the VRF (see vrfs)."""
+        d = self.device
+        rid = d.system.router_id
+        if rid and self.ios:
+            set_ids = {p.router_id for p in d.ospf} | ({d.bgp.router_id} if d.bgp else set())
+            if set_ids - {rid} or not set_ids:
+                self.report.add("system", "router ID", Severity.REVIEW, "router-id",
+                                f"IOS has no global router ID ({rid}); set it in each routing protocol")
+            else:
+                self.report.item("system", "router ID")
+        leaks = {name: info.leaks for name, info in d.vrf_info.items() if info.leaks}
+        if self.ios or not (rid or leaks):
+            return
+        lines = ["router general"]
+        if rid:
+            self.report.item("system", "router ID")
+            lines.append(f"{self.ind}router-id ipv4 {rid}")
+        for name, sources in leaks.items():
+            lines.append(f"{self.ind}vrf {self.vrf(name)}")
+            for source, rm in sources.items():
+                lines.append(f"{self.ind * 2}leak routes source-vrf {self.vrf(source)}" +
+                             (f" subscribe-policy {rm}" if rm else ""))
+        self.out += lines + ["!"]
 
     def rip(self) -> None:
         rip = self.device.rip
@@ -1060,9 +1203,11 @@ class Writer:
         self.out.append("!")
 
     def multicast(self) -> None:
-        """IGMP snooping (on by default: the VLANs that do not snoop are named) and multicast routing."""
+        """IGMP snooping (on by default: the VLANs that do not snoop are named) with its querier, multicast routing
+        (also in VRFs), rendezvous points, anycast RP and MSDP."""
         d = self.device
         rep = self.report
+        ind = self.ind
         lines: List[str] = []
         if multicast_text.stated(d):
             rep.item("vlan", multicast_text.LABEL)
@@ -1072,22 +1217,82 @@ class Writer:
             else:
                 lines += [f"no ip igmp snooping vlan {vid}" for vid in sorted(d.vlans) if vid not in on]
             queriers = multicast_text.queriers(d)
+            addresses = {d.vlans[v].igmp_querier_address or d.igmp_querier_address for v in queriers} - {""}
+            versions = {d.vlans[v].igmp_querier_version or d.igmp_querier_version for v in queriers} - {None}
             if queriers and self.ios:
                 lines.append("ip igmp snooping querier")
                 if queriers != on:
                     rep.add("vlan", multicast_text.LABEL, Severity.APPROX, "igmp-querier",
                             f"IOS sets the querier for every snooping VLAN, not only {l2sec_text.vlan_text(queriers)}")
+                if addresses:
+                    address = sorted(addresses)[0]
+                    lines.append(f"ip igmp snooping querier address {address}")
+                    if len(addresses) > 1 or any(not d.vlans[v].igmp_querier_address and not
+                                                 d.igmp_querier_address for v in queriers):
+                        rep.add("vlan", multicast_text.LABEL, Severity.REVIEW, "igmp-querier-address",
+                                f"IOS takes one querier address for every VLAN; {address} is written (the source "
+                                f"sets {', '.join(sorted(addresses))} per VLAN)")
+                    elif any(d.vlans[v].igmp_querier_address for v in queriers):
+                        rep.add("vlan", multicast_text.LABEL, Severity.APPROX, "igmp-querier-address",
+                                f"the querier address {address} is set for every VLAN on IOS")
+                if versions:
+                    lines.append(f"ip igmp snooping querier version {max(v for v in versions if v is not None)}")
             elif queriers:
-                lines += [f"ip igmp snooping vlan {vid} querier" for vid in queriers]
-        if d.multicast_routing:
+                for vid in queriers:
+                    vl = d.vlans[vid]
+                    lines.append(f"ip igmp snooping vlan {vid} querier")
+                    address = vl.igmp_querier_address or d.igmp_querier_address
+                    version = vl.igmp_querier_version or d.igmp_querier_version
+                    if address:
+                        lines.append(f"ip igmp snooping vlan {vid} querier address {address}")
+                    if version:
+                        lines.append(f"ip igmp snooping vlan {vid} querier version {version}")
+        vrf_routing = [name for name, m in d.multicast_vrfs.items() if m.routing]
+        if d.multicast_routing or vrf_routing:
             rep.item("system", "multicast routing")
-            lines += ["ip multicast-routing"] if self.ios else ["router multicast", f"{self.ind}ipv4",
-                                                                 f"{self.ind * 2}routing", "!"]
-        if d.pim_rps and self.ios:
-            lines += [f"ip pim rp-address {rp}" for rp in d.pim_rps]
-        elif d.pim_rps:
-            lines += ["router pim sparse-mode", f"{self.ind}ipv4"] + \
-                [f"{self.ind * 2}rp address {rp}" for rp in d.pim_rps] + ["!"]
+        if self.ios:
+            if d.multicast_routing:
+                lines.append("ip multicast-routing")
+            lines += [f"ip multicast-routing vrf {self.vrf(v)}" for v in vrf_routing]
+            lines += multicast_text.ios_rp_lines(d.pim_rps, d.pim_rp_groups, "", "")
+            for name, m in d.multicast_vrfs.items():
+                lines += multicast_text.ios_rp_lines(m.rps, m.rp_groups, name, self.vrf(name))
+            msdp = dict(d.msdp_peers)
+            for anycast, peers in d.pim_anycast.items():
+                for peer in peers:
+                    msdp.setdefault(peer, "")
+                rep.add("system", "multicast routing", Severity.REVIEW, "anycast-rp",
+                        f"anycast RP {anycast} (shared with {', '.join(peers)}): IOS shares an anycast RP through "
+                        "MSDP, so the other RPs are written as MSDP peers; give them a connect-source (the loopback "
+                        "with this switch's own address) and an originator-id, and only the RPs need it")
+            lines += [f"ip msdp peer {peer}" + (f" connect-source {self.port(src)}" if src else "")
+                      for peer, src in msdp.items()]
+        else:
+            if d.multicast_routing or vrf_routing:
+                lines += ["router multicast"]
+                if d.multicast_routing:
+                    lines += [f"{ind}ipv4", f"{ind * 2}routing"]
+                for v in vrf_routing:
+                    lines += [f"{ind}vrf {self.vrf(v)}", f"{ind * 2}ipv4", f"{ind * 3}routing"]
+                lines.append("!")
+            vrf_rps = {name: m for name, m in d.multicast_vrfs.items() if m.rps}
+            if d.pim_rps or d.pim_anycast or vrf_rps:
+                lines.append("router pim sparse-mode")
+                if d.pim_rps or d.pim_anycast:
+                    lines.append(f"{ind}ipv4")
+                    lines += multicast_text.eos_rp_lines(d.pim_rps, d.pim_rp_groups, ind * 2)
+                    lines += [f"{ind * 2}anycast-rp {a} {p}" for a, peers in d.pim_anycast.items() for p in peers]
+                for name, m in vrf_rps.items():
+                    lines += [f"{ind}vrf {self.vrf(name)}", f"{ind * 2}ipv4"]
+                    lines += multicast_text.eos_rp_lines(m.rps, m.rp_groups, ind * 3)
+                lines.append("!")
+            if d.msdp_peers:
+                lines.append("router msdp")
+                for peer, src in d.msdp_peers.items():
+                    lines.append(f"{ind}peer {peer}")
+                    if src:
+                        lines.append(f"{ind * 2}local-interface {self.port(src)}")
+                lines.append("!")
         if lines:
             self.out += lines + (["!"] if lines[-1] != "!" else [])
 
@@ -1153,11 +1358,16 @@ class Writer:
         d = self.device
         rep = self.report
         lines: List[str] = []
-        if d.sflow is not None and self.ios:
+        sflow = self.sflow_stand_in or (d.sflow if not self.ios else None)
+        netflow = self.netflow_stand_in or (d.netflow if self.ios else None)
+        if d.sflow is not None and self.ios and self.netflow_stand_in is None:
             monitor_text.sflow_unsupported(d, rep, "IOS")
-        elif d.sflow is not None:
-            sf = d.sflow
-            rep.item(monitor_text.KIND, monitor_text.SFLOW)
+        if d.netflow is not None and not self.ios and self.sflow_stand_in is None:
+            monitor_text.netflow_unsupported(d, rep, "EOS")
+        if sflow is not None:
+            sf = sflow
+            if sf is d.sflow:
+                rep.item(monitor_text.KIND, monitor_text.SFLOW)
             if sf.sample_rate is not None:
                 lines.append(f"sflow sample {sf.sample_rate}")
             if sf.polling_interval is not None:
@@ -1169,14 +1379,15 @@ class Writer:
             if sf.agent:
                 lines.append(f"sflow source {sf.agent}")
             elif sf.source_interface:
-                lines.append(f"sflow source-interface {self.port(sf.source_interface)}")
-            if monitor_text.sflow_ports(d):
+                vrf = f"vrf {self.vrf(sf.source_vrf)} " if sf.source_vrf else ""
+                lines.append(f"sflow {vrf}source-interface {self.port(sf.source_interface)}")
+            lines += [f"sflow extension {e}" for e in sf.extensions]
+            if self._sflow_ports():
                 lines.append("sflow run")
-        if d.netflow is not None and not self.ios:
-            monitor_text.netflow_unsupported(d, rep, "EOS")
-        elif d.netflow is not None:
-            nf = d.netflow
-            monitor_text.netflow_item(nf, rep)
+        if netflow is not None:
+            nf = netflow
+            if nf is d.netflow:
+                monitor_text.netflow_item(nf, rep)
             exporters = []
             for n, c in enumerate(nf.collectors, 1):
                 name = f"RS-EXPORT-{n}"
@@ -1197,17 +1408,29 @@ class Writer:
                         f"flow record {nf.record} written as {record}")
             lines += ["flow monitor RS-MONITOR"] + [f"{self.ind}exporter {e}" for e in exporters] + \
                 [f"{self.ind}record {record}", "!"]
+            if nf.sample_rate:
+                lines += [f"sampler {monitor_text.SAMPLER}", f"{self.ind}mode random 1 out-of {nf.sample_rate}", "!"]
         if lines:
             self.out += lines + (["!"] if lines[-1] != "!" else [])
+
+    def _sflow_ports(self) -> List[Interface]:
+        """EOS: the ports sFlow samples (those NetFlow recorded when it stands in for it)."""
+        if self.sflow_stand_in is not None:
+            return [i for i in monitor_text.physical(self.device) if i.flow]
+        return monitor_text.sflow_ports(self.device) if self.device.sflow is not None else []
 
     def _flow_interface(self, iface: Interface) -> List[str]:
         d = self.device
         lines = []
-        if self.ios and d.netflow is not None and iface.flow:
-            lines += [f"ip flow monitor RS-MONITOR {way}" for way in ("input", "output") if iface.flow in (way, "both")]
-        if not self.ios and d.sflow is not None and monitor_text.sflow_ports(d) and not iface.sflow and \
-                iface in monitor_text.physical(d):
-            lines.append("no sflow enable")
+        nf = self.netflow_stand_in or d.netflow
+        way = "input" if self.netflow_stand_in is not None and iface.sflow else iface.flow
+        if self.ios and nf is not None and way:
+            sampler = f" sampler {monitor_text.SAMPLER}" if nf.sample_rate else ""
+            lines += [f"ip flow monitor RS-MONITOR{sampler} {w}" for w in ("input", "output") if way in (w, "both")]
+        if not self.ios:
+            ports = self._sflow_ports()
+            if ports and iface not in ports and iface in monitor_text.physical(d):
+                lines.append("no sflow enable")
         return lines
 
     def mirrors(self) -> None:
@@ -1229,6 +1452,12 @@ class Writer:
             for port, way in sources.items():
                 lines.append(f"{head} source{word} {self.port(port)}" + ("" if way == "both" else f" {way}"))
             lines.append(f"{head} destination{word} {self.port(s.destination)}")
+            if s.acl:
+                lines.append(f"{head} {'filter ' if self.ios else ''}ip access-group {s.acl}")
+                if d.platform != self.target:
+                    rep.add(monitor_text.KIND, monitor_text.label(s), Severity.REVIEW, "mirror-acl",
+                            f"the mirror is filtered by ACL {s.acl}; check that the target platform filters "
+                            "mirrored traffic with an ACL")
         if lines:
             self.out += lines + ["!"]
 
@@ -1375,6 +1604,15 @@ class Writer:
             lines.append(f"{prefix}graceful-restart restart-time {bgp.graceful_restart_time}")
         if bgp.multipath_relax:
             lines.append("bgp bestpath as-path multipath-relax")
+        if bgp.asdot:
+            lines.append("bgp asnotation dot" if self.ios else "bgp asn notation asdot")
+        vrf_med = [n for n, v in bgp.vrfs.items() if v.med_missing_as_worst]
+        if bgp.med_missing_as_worst or (self.ios and vrf_med):
+            lines.append("bgp bestpath med missing-as-worst")
+            if self.ios and vrf_med and not bgp.med_missing_as_worst:
+                self.report.add("bgp", f"bgp {bgp.local_as}", Severity.APPROX, "bgp-med",
+                                f"VRF {', '.join(vrf_med)} treats a missing MED as worst; IOS sets it for the whole "
+                                "BGP process, so it is written there")
         if bgp.distance and not self.ios:
             lines.append("distance bgp " + " ".join(str(x) for x in bgp.distance))
         for group in bgp.peer_groups.values():
@@ -1403,7 +1641,7 @@ class Writer:
                     body.append(f"network {net}")
             for source in bgp.redistribute6 if af == "ipv6" else bgp.redistribute:
                 rm = bgp.redistribute_maps.get(source) if af == "ipv4" else None
-                body.append(self._bgp_redistribute(source) + (f" route-map {rm}" if rm else ""))
+                body += self._bgp_redistribute_lines(source, bgp.ospf_match, rm)
             body += self._aggregates(bgp.aggregates, af)
             if af == "ipv4" and self.ios and bgp.distance:
                 body.append("distance bgp " + " ".join(str(x) for x in bgp.distance))
@@ -1449,6 +1687,8 @@ class Writer:
                         lines.append(f"{ind}route-target {d} {family} {value}")
                 if info and info.export_map:
                     lines.append(f"{ind}route-target export {family} route-map {info.export_map}")
+                if vrf_bgp is not None and vrf_bgp.med_missing_as_worst:
+                    lines.append(f"{ind}bgp bestpath med missing-as-worst")
                 if vrf_bgp is not None:
                     lines += [ind + line for line in self._eos_bgp_vrf(bgp, vrf_bgp, name)]
         self.out.append(f"router bgp {bgp.local_as}")
@@ -1481,7 +1721,7 @@ class Writer:
         body += self._aggregates(v.aggregates, af)
         for source in v.redistribute6 if af == "ipv6" else v.redistribute:
             rm = v.redistribute_maps.get(source) if af == "ipv4" else None
-            body.append(self._bgp_redistribute(source) + (f" route-map {rm}" if rm else ""))
+            body += self._bgp_redistribute_lines(source, v.ospf_match, rm)
         return body
 
     def _vrf_peers(self, bgp: Bgp, v: BgpVrf, name: str) -> List[BgpNeighbor]:
@@ -1513,6 +1753,8 @@ class Writer:
                     body += self._bgp_af_options(peer)
             if af == "ipv4":
                 body += self._maximum_paths(v.maximum_paths, None)
+            if self.device.vxlan and name in self.device.vxlan.vrf_vnis:
+                body.append("advertise l2vpn evpn")
             if body or af == "ipv4":
                 result[af] = body
         return result
@@ -1571,9 +1813,8 @@ class Writer:
         vx = self.device.vxlan
         lines: List[str] = []
         if not self.ios and vx is not None:
-            for vid in vx.evpn_vlans:
-                lines += [f"vlan {vid}", f"{self.ind}rd auto", f"{self.ind}route-target both auto",
-                          f"{self.ind}redistribute learned"]
+            lines += evpn_text.eos_instances(vx, self.ind)
+        evpn_text.domains_report(bgp, self.report, self.ios)
         if not peers:
             return lines
         if not self.ios:
@@ -1583,6 +1824,8 @@ class Writer:
             body.append(f"neighbor {p.address} activate")
             if self.ios:
                 body.append(f"neighbor {p.address} send-community extended")
+        if not self.ios:
+            body += evpn_text.eos_af_lines(bgp)
         lines.append("address-family l2vpn evpn" if self.ios else "address-family evpn")
         lines += [self.ind + line for line in body]
         if self.ios:
@@ -1597,39 +1840,70 @@ class Writer:
             return
         vxlan_text.item(d, self.report)
         ind = self.ind
+        rep = self.report
         if not self.ios:
             lines = ["interface Vxlan1"]
             if vx.source_interface:
                 lines.append(f"{ind}vxlan source-interface {self.port(vx.source_interface)}")
+            if vx.mlag_shared_mac:
+                lines.append(f"{ind}vxlan virtual-router encapsulation mac-address mlag-system-id")
             lines += [f"{ind}vxlan vlan {vid} vni {vni}" for vid, vni in vx.vlan_vnis.items()]
             lines += [f"{ind}vxlan vrf {self.vrf(vrf)} vni {vni}" for vrf, vni in vx.vrf_vnis.items()]
             if vx.flood_vteps:
                 lines.append(f"{ind}vxlan flood vtep {' '.join(vx.flood_vteps)}")
+            groups: Dict[str, List[int]] = {}
+            for vid, group in vx.mcast_groups.items():
+                groups.setdefault(group, []).append(vid)
+            lines += [f"{ind}vxlan mcast-group {g} vlan {evpn_text.vlan_text(v)}" for g, v in groups.items()]
+            if "ecn" in vx.qos_propagation:
+                lines.append(f"{ind}vxlan qos ecn propagation")
+            if "dscp" in vx.qos_propagation:
+                lines.append(f"{ind}vxlan qos dscp propagation encapsulation")
             self.out += lines + ["!"]
             return
         lines = []
         if vx.evpn_vlans:
-            lines += ["l2vpn evpn", f"{ind}replication-type ingress", "!"]
-            for vid in vx.evpn_vlans:
-                lines += [f"l2vpn evpn instance {vid} vlan-based", f"{ind}encapsulation vxlan", "!"]
+            lines += ["l2vpn evpn", f"{ind}replication-type ingress"]
+            if any(i.virtual_ipv4 or i.virtual_ipv6 for i in self.device.interfaces.values()):
+                lines.append(f"{ind}default-gateway advertise enable")
+            if self.device.bgp and self.device.bgp.evpn_host_flap:
+                window, moves, _ = self.device.bgp.evpn_host_flap
+                lines.append(f"{ind}mac duplication limit {moves} time {window}")
+            lines.append("!")
+            lines += evpn_text.ios_instances(vx, rep, ind)
+        lines += evpn_text.ios_segments(self.device, ind)
         for vid, vni in vx.vlan_vnis.items():
             member = f"member evpn-instance {vid} vni {vni}" if vid in vx.evpn_vlans else f"member vni {vni}"
             lines += [f"vlan configuration {vid}", f"{ind}{member}", "!"]
+        for vrf, vid in self.l3vni_vlans.items():
+            lines += [f"vlan configuration {vid}", f"{ind}member vni {vx.vrf_vnis[vrf]}", "!"]
         lines += ["interface nve1", f"{ind}no ip address"]
         if vx.source_interface:
             lines.append(f"{ind}source-interface {self.port(vx.source_interface)}")
         if vx.evpn_vlans:
             lines.append(f"{ind}host-reachability protocol bgp")
         for vid, vni in vx.vlan_vnis.items():
-            if vid in vx.evpn_vlans:
+            if vid in vx.mcast_groups:
+                lines.append(f"{ind}member vni {vni} mcast-group {vx.mcast_groups[vid]}")
+            elif vid in vx.evpn_vlans:
                 lines.append(f"{ind}member vni {vni} ingress-replication")
             else:
                 lines.append(f"{ind}member vni {vni}")
                 lines += [f"{ind * 2}ingress-replication {a}" for a in vx.flood_vteps]
-        if vx.vrf_vnis:
-            self.report.add("interface", vxlan_text.LABEL, Severity.REVIEW, "vxlan-l3vni",
-                            "IOS carries a layer 3 VNI in a VLAN of its own with an SVI in the VRF; the VNIs of "
-                            f"{', '.join(vx.vrf_vnis)} are not written")
+        for vrf in self.l3vni_vlans:
+            lines.append(f"{ind}member vni {vx.vrf_vnis[vrf]} vrf {self.vrf(vrf)}")
+        if vx.mcast_groups:
+            rep.add("interface", vxlan_text.LABEL, Severity.APPROX, "vxlan-mcast",
+                    "VLANs " + evpn_text.vlan_text(list(vx.mcast_groups)) + " flood through their multicast group "
+                    "(replication-type static); the underlay needs PIM towards the rendezvous point")
+        if vx.mlag_shared_mac:
+            rep.add("interface", vxlan_text.LABEL, Severity.APPROX, "vxlan-mlag-mac",
+                    "'vxlan virtual-router encapsulation mac-address mlag-system-id' has no IOS equivalent: without "
+                    "MLAG each switch routes with its own MAC")
+        if vx.qos_propagation:
+            rep.add("interface", vxlan_text.LABEL, Severity.APPROX, "vxlan-qos",
+                    "copying " + " and ".join(q.upper() for q in vx.qos_propagation) + " between the inner and outer "
+                    "header is left out: IOS XE copies the DSCP to the outer header by default")
         self.out += lines + ["!"]
 
     @staticmethod
@@ -1694,6 +1968,17 @@ class Writer:
                 if next_hop:
                     policy.append(f"{ind * 2}set nexthop {next_hop}")
             self.out += policy + ["!"]
+
+    def _bgp_redistribute_lines(self, source: str, match: List[str], rm: Optional[str]) -> List[str]:
+        """redistribute SOURCE [route-map RM]; OSPF with the route types it takes (IOS on one line, EOS one each)."""
+        tail = f" route-map {rm}" if rm else ""
+        if source != "ospf" or not match:
+            return [self._bgp_redistribute(source) + tail]
+        if self.ios:
+            words = {"internal": "internal", "external": "external 1 external 2",
+                     "nssa-external": "nssa-external 1 nssa-external 2"}
+            return [self._bgp_redistribute(source) + " match " + " ".join(words[m] for m in match) + tail]
+        return [f"redistribute ospf match {m}{tail}" for m in match]
 
     def _bgp_redistribute(self, source: str) -> str:
         if source == "ospf" and self.ios:
@@ -1819,18 +2104,30 @@ class Writer:
                 "the WLANs are mapped in policy tag RS-POLICY-TAG; assign it to the access points")
 
     def mlag(self) -> None:
-        """EOS: mlag configuration; IOS has no multi-chassis LAG (reported)."""
+        """EOS: mlag configuration. IOS has no multi-chassis LAG: the nearest is StackWise Virtual, which makes one
+        switch of the two (and NX-OS has vPC)."""
         d = self.device
-        if self.ios:
-            vrfs_text.mlag_unsupported(d, self.report, "IOS", "IOS has no multi-chassis LAG (StackWise Virtual makes "
-                                                              "one switch of two instead)")
-            return
         m = d.mlag
-        if m is None:
-            return
         rep = self.report
         label = "multi-chassis LAG"
+        if m is None:
+            if self.ios:
+                vrfs_text.mlag_unsupported(d, rep, "IOS", "IOS has no multi-chassis LAG (StackWise Virtual makes "
+                                                          "one switch of two instead)")
+            return
         rep.item("interface", label)
+        if self.ios:
+            self._ios_stackwise(m, label)
+            return
+        if m.stack:
+            links = [self.port(i.name) for i in d.interfaces.values() if i.svl_link is not None]
+            rep.add("interface", label, Severity.REVIEW, "mlag-from-svl",
+                    "StackWise Virtual makes one switch of two; EOS pairs two switches with MLAG instead. "
+                    f"Written: domain-id {m.domain or '1'}. Still to do on both switches: a peer-link port-channel of "
+                    f"the StackWise Virtual links ({', '.join(links) or 'none'}), an SVI on it for local-interface and "
+                    "peer-address, and the port numbers of the second switch (they become a switch of their own)")
+            self.out += ["mlag configuration", f"{self.ind}domain-id SVL{m.domain or '1'}", "!"]
+            return
         lines = [f"domain-id {m.domain or 'MLAG'}"]
         if not m.domain:
             rep.add("interface", label, Severity.REVIEW, "mlag-domain",
@@ -1839,8 +2136,18 @@ class Writer:
             lines.append(f"local-interface {self.port(m.local_interface)}")
         if m.peer_address:
             lines.append(f"peer-address {m.peer_address}")
+        if m.heartbeat:
+            lines.append(f"peer-address heartbeat {m.heartbeat}" + (f" vrf {self.vrf(m.heartbeat_vrf)}"
+                                                                    if m.heartbeat_vrf else ""))
         if m.peer_link:
             lines.append(f"peer-link {self.port(m.peer_link)}")
+        if m.dual_primary_delay is not None:
+            lines.append(f"dual-primary detection delay {m.dual_primary_delay}" +
+                         (f" action {m.dual_primary_action}" if m.dual_primary_action else ""))
+        if m.reload_delay is not None:
+            lines.append(f"reload-delay mlag {m.reload_delay}")
+        if m.reload_delay_non_mlag is not None:
+            lines.append(f"reload-delay non-mlag {m.reload_delay_non_mlag}")
         if d.platform == "aoscx":
             rep.add("interface", label, Severity.REVIEW, "mlag-keepalive",
                     "VSX keepalive peer and source are written as MLAG peer-address and local-interface: EOS expects "
@@ -1848,6 +2155,31 @@ class Writer:
         if m.role:
             rep.add("interface", label, Severity.APPROX, "mlag-role", f"EOS elects the primary itself (was {m.role})")
         self.out += ["mlag configuration"] + [self.ind + line for line in lines] + ["!"]
+
+    def _ios_stackwise(self, m: Mlag, label: str) -> None:
+        """IOS: stackwise-virtual with a domain; the MLAG peer link's ports become the StackWise Virtual link."""
+        rep = self.report
+        domain = m.domain if m.domain.isdigit() and 1 <= int(m.domain) <= 255 else "1"
+        self.out += ["stackwise-virtual", f" domain {domain}", "!"]
+        if m.stack:
+            return
+        members = ", ".join(vrfs_text.mlag_members(self.device)) or "none"
+        dropped = [w for w, v in (("the peer address and local interface (" + (m.peer_address or "-") + ", " +
+                                   (m.local_interface or "-") + ")", m.peer_address or m.local_interface),
+                                  ("the heartbeat " + m.heartbeat, m.heartbeat),
+                                  ("dual-primary detection (StackWise Virtual detects a dual-active pair on a "
+                                   "dedicated link: stackwise-virtual dual-active-detection)", m.dual_primary_delay),
+                                  ("the reload delays", m.reload_delay or m.reload_delay_non_mlag)) if v]
+        rep.add("interface", label, Severity.REVIEW, "mlag-to-svl",
+                "IOS has no multi-chassis LAG; written as StackWise Virtual, the nearest Catalyst feature, which "
+                f"makes one switch of the pair (domain {domain}"
+                + (f", was {m.domain}" if domain != m.domain else "") + "). The peer link "
+                f"{m.peer_link or '-'} becomes the StackWise Virtual link (its ports take 'stackwise-virtual link 1' "
+                "instead of the channel-group; the port-channel stays, without members), "
+                f"and the shared LAGs ({members}) become ordinary port-channels with members on both switches. "
+                "Both switches need a reload, and the second one's ports are numbered 2/x/y. "
+                + ("Left out: " + "; ".join(dropped) + ". " if dropped else "")
+                + "On NX-OS the same pair would be a vPC domain")
 
     def l2sec(self) -> None:
         """DHCP snooping and ARP inspection per VLAN (EOS snooping only adds option 82 and has no trusted ports)."""
@@ -1859,6 +2191,13 @@ class Writer:
             self.out.append("ip dhcp snooping")
             if vlans:
                 self.out.append(f"ip dhcp snooping vlan {l2sec_text.vlan_text(vlans)}")
+            if d.dhcp_option82:
+                self.out.append("ip dhcp snooping information option")
+            elif d.dhcp_option82 is False and self.ios:
+                self.out.append("no ip dhcp snooping information option")
+            elif d.dhcp_option82 is False:
+                rep.add("vlan", "DHCP snooping", Severity.REVIEW, "dhcp-option82",
+                        "the source switches option 82 off; EOS snooping does nothing but insert it")
             if not self.ios:
                 rep.add("vlan", "DHCP snooping", Severity.REVIEW, "dhcp-snooping",
                         "EOS DHCP snooping adds relay option 82 only; it does not drop server replies on untrusted "
@@ -1869,6 +2208,37 @@ class Writer:
             self.out.append(f"ip arp inspection vlan {l2sec_text.vlan_text(vlans)}")
         if d.dhcp_snooping or vlans:
             self.out.append("!")
+
+    def security(self) -> None:
+        """MAC ACLs, MACsec profiles and control-plane protection."""
+        d = self.device
+        for acl in d.mac_acls.values():
+            self.out += security_text.mac_acl_lines(acl, self.ios, self.report)
+        self.out += security_text.ios_macsec_lines(d, self.report) if self.ios else \
+            security_text.eos_macsec_lines(d, self.report, self.ind)
+        self.out += security_text.ios_lines(d, self.report, self.vrf) if self.ios else \
+            security_text.eos_lines(d, self.report, self.ind, self.vrf)
+
+    def _security_interface(self, iface: Interface, add: _Add) -> List[str]:
+        lines: List[str] = []
+        for name, way in ((iface.mac_acl_in, "in"), (iface.mac_acl_out, "out")):
+            if name and name not in self.device.mac_acls:
+                add(Severity.REVIEW, "mac-acl", f"MAC ACL {name} is applied but not defined; left out")
+            elif name:
+                lines.append(f"mac access-group {name} {way}")
+        p = self.device.macsec_profiles.get(iface.macsec_profile)
+        if iface.macsec_profile and p is None:
+            add(Severity.REVIEW, "macsec", f"MACsec profile {iface.macsec_profile} is applied but not defined")
+        elif p is not None and self.ios:
+            lines += ["macsec network-link", f"mka policy {p.name}"]
+            if p.ckn:
+                lines.append(f"mka pre-shared-key key-chain {security_text.keychain_name(p.name)}")
+        elif p is not None:
+            lines.append(f"mac security profile {p.name}")
+        if iface.dot1x_fail_vlan is not None:
+            lines.append(f"authentication event fail action authorize vlan {iface.dot1x_fail_vlan}" if self.ios else
+                         f"dot1x authentication failure action traffic allow vlan {iface.dot1x_fail_vlan}")
+        return lines
 
     def _l2sec_interface(self, iface: Interface, add: _Add, label: str) -> List[str]:
         lines = []
@@ -1961,6 +2331,8 @@ class Writer:
                             rep.add("qos", qos_text.action_label(p, a), Severity.APPROX, "qos-burst",
                                     "the source states no burst: written as 1/8 s of the rate")
             self.out.append("!")
+        self.out += queuing_text.ios_lines(self.device, rep) if self.ios else \
+            queuing_text.eos_lines(self.device, self.ind, rep)
 
     def _qos_interface(self, iface: Interface, add: _Add) -> List[str]:
         lines = []
@@ -1975,6 +2347,29 @@ class Writer:
             else:
                 lines.append(f"service-policy {direction} {name}" if self.ios else
                              f"service-policy type qos {direction} {name}")
+        if iface.qos_profile and iface.qos_profile not in self.device.qos_profiles:
+            add(Severity.REVIEW, "qos-profile", f"QoS profile {iface.qos_profile} is applied but not defined; left out")
+        elif iface.qos_profile and self.ios:
+            if iface.qos_policy_out:
+                add(Severity.REVIEW, "qos-profile", f"the port has an output policy already; queuing profile "
+                                                    f"{iface.qos_profile} left out")
+            else:
+                lines.append(f"service-policy output {queuing_text.ios_interface_policy(self.device, iface.qos_profile)}")
+            p = self.device.qos_profiles[iface.qos_profile]
+            if p.input_policy and not iface.qos_policy_in and p.input_policy in self.device.qos_policies:
+                lines.append(f"service-policy input {p.input_policy}")
+        elif iface.qos_profile:
+            lines.append(f"service-profile {iface.qos_profile}")
+        if iface.queues and self.ios:
+            add(Severity.REVIEW, "qos-port-queues", "queue settings of this port on top of its profile (" + ", ".join(
+                f"traffic class {tc}" + (" ECN" if q.ecn else "") for tc, q in sorted(iface.queues.items())) +
+                ") are not written: on IOS give the port a policy of its own")
+        elif iface.queues:
+            for tc, q in sorted(iface.queues.items(), reverse=True):
+                lines.append(f"tx-queue {tc}")
+                lines += [self.ind + line for line in queuing_text.eos_queue_lines(
+                    q, self.report, f"interface {iface.name}")
+                    if not line.endswith("priority") or q.priority]
         if iface.qos_trust and not self.ios:
             lines.append(f"qos trust {'disabled' if iface.qos_trust == 'none' else iface.qos_trust}")
         elif iface.qos_trust and iface.qos_trust != "dscp":
@@ -2014,21 +2409,48 @@ class Writer:
             if secret:
                 self.report.item("management", "enable secret")
                 self.out.append(f"enable {secret}" if self.ios else f"enable password {secret.split(' ', 1)[1]}")
+        for role in self.device.roles.values():
+            if self.ios:
+                self.out += access_text.ios_view_lines(role, self.report)
+            else:
+                self.report.item("management", f"role {role.name}")
+                self.out += access_text.eos_role_lines(role, self.ind)
+                if role.origin.text.startswith("parser view"):
+                    self.report.add("management", f"role {role.name}", Severity.APPROX, "role-view",
+                                    "the parser view's commands are written as EOS command patterns: check that "
+                                    "each matches the commands meant")
         for u in self.device.users:
             label = aaa_text.user_label(u)
-            secret = self._secret(u)
+            secret = self._secret(u) if u.password or u.password_hash or not u.ssh_keys else "nopassword"
             if not secret:
+                if u.ssh_keys and not self.ios:
+                    self.out += [f"username {u.name} ssh-key {key}" for key in u.ssh_keys]
                 continue
             self.report.item("management", label)
             words = [f"username {u.name}"]
             if u.privilege is not None:
                 words.append(f"privilege {u.privilege}")
+            if u.role and u.role not in self.device.roles:
+                self.report.add("management", label, Severity.REVIEW, "role-missing",
+                                f"role {u.role} is not defined in the source")
             if not self.ios:
-                words.append(f"role {aaa_text.role(u.privilege, self._EOS_ROLES)}")
-            if secret == "nopassword":
+                words.append(f"role {u.role or aaa_text.role(u.privilege, self._EOS_ROLES)}")
+            elif u.role:
+                words.append(f"view {u.role}")
+            if secret == "nopassword" and not u.ssh_keys:
                 self.report.add("management", label, Severity.REVIEW, "no-password",
                                 "the user has no password in the source; give it one")
             self.out.append(" ".join(words + [secret]))
+            if not self.ios:
+                self.out += [f"username {u.name} ssh-key {key}" for key in u.ssh_keys]
+        if self.ios:
+            self.out += access_text.ios_pubkey_lines(self.device, self.report)
+        m = self.device.management
+        if m.password_min_length is not None:
+            self.report.item("management", "password length")
+            self.out += [f"security passwords min-length {m.password_min_length}"] if self.ios else \
+                ["management security", f"{self.ind}password", f"{self.ind * 2}minimum length {m.password_min_length}",
+                 "!"]
 
     def _group_vrf(self, addresses: List[str], protocol: str) -> str:
         """The VRF the servers of a group share, if they do."""
@@ -2143,6 +2565,12 @@ class Writer:
         if s.contact:
             self.out.append(f"snmp-server contact {s.contact}")
             rep.item("management", "snmp contact")
+        if s.engine_id:
+            self.out.append(f"snmp-server engineID local {s.engine_id}")
+            rep.item("management", "SNMP engine ID")
+        for view, subtrees in s.views.items():
+            rep.item("management", f"SNMP view {view}")
+            self.out += [f"snmp-server view {view} {oid} {'included' if inc else 'excluded'}" for oid, inc in subtrees]
         groups = dict(s.groups)
         for u in s.users:
             if u.group not in groups:
@@ -2151,9 +2579,10 @@ class Writer:
             words = [f"snmp-server group {g.name} v3 {g.level}"]
             words += [f"read {g.read_view}"] if g.read_view else []
             words += [f"write {g.write_view}"] if g.write_view else []
-            if g.read_view or g.write_view:
+            missing = [v for v in (g.read_view, g.write_view) if v and v not in s.views]
+            if missing:
                 rep.add("management", f"SNMPv3 group {g.name}", Severity.REVIEW, "snmp-view",
-                        "MIB views are not converted; define them by hand")
+                        f"MIB view {', '.join(dict.fromkeys(missing))} is not defined in the source; define it by hand")
             rep.item("management", f"SNMPv3 group {g.name}")
             self.out.append(" ".join(words))
         for u in s.users:
@@ -2207,6 +2636,15 @@ class Writer:
         if self.device.aaa.dot1x:
             self.out.append("dot1x system-auth-control")
             self.report.item("management", "802.1X")
+        if self.device.aaa.coa:
+            self.report.item("management", "RADIUS change of authorization")
+            if self.ios:
+                self.out += ["aaa server radius dynamic-author", " auth-type any", "!"]
+                self.report.add("management", "RADIUS change of authorization", Severity.REVIEW, "coa-clients",
+                                "add the RADIUS servers that may send changes as 'client ADDRESS server-key KEY' "
+                                "under aaa server radius dynamic-author")
+            else:
+                self.out.append("dot1x dynamic-authorization")
         for protocol, source in s.transfer_source.items():
             self.out.append(f"ip {protocol}{'' if self.ios else ' client'} source-interface {self.port(source)}")
             self.report.item("system", f"{protocol} source")
@@ -2227,6 +2665,7 @@ class Writer:
         if s.logging_level is not None:
             self.out.append(f"logging trap {mgmt_text.LEVELS[s.logging_level]}")
             self.report.item("system", "syslog level")
+        self.out += access_text.logging_lines(self.device, self.report, self.ios)
         if s.logging_source:
             source = self.port(s.logging_source)
             owner = self.device.interfaces.get(s.logging_source)
@@ -2289,10 +2728,61 @@ class Writer:
                             "http-commands); left out")
         if m.lldp is not None:
             self.out.append("lldp run" if m.lldp else "no lldp run")
+        self._lldp_options()
         if m.cdp is not None and self.ios:
             self.out.append("cdp run" if m.cdp else "no cdp run")
         elif m.cdp:
             rep.add("management", "CDP", Severity.APPROX, "cdp-lldp", "EOS has no CDP; LLDP announces the switch")
+        if m.apis:
+            self.out.append("!")
+            self.out += access_text.ios_api_lines(self.device, rep, self.vrf) if self.ios else \
+                access_text.eos_api_lines(self.device, rep, ind, self.vrf)
+
+    def _lldp_options(self) -> None:
+        """LLDP timers (same meaning both sides) and the advertised management address (EOS only)."""
+        m = self.device.management
+        rep = self.report
+        if m.lldp_timer is not None:
+            self.out.append(f"lldp timer {m.lldp_timer}")
+        if m.lldp_holdtime is not None:
+            self.out.append(f"lldp {'holdtime' if self.ios else 'hold-time'} {m.lldp_holdtime}")
+        if not (m.lldp_mgmt_interface or m.lldp_mgmt_vrf):
+            return
+        if self.ios:
+            rep.item("management", "LLDP")
+            rep.add("management", "LLDP", Severity.REVIEW, "lldp-mgmt-address",
+                    f"IOS has no global LLDP management address (the source advertises "
+                    f"{m.lldp_mgmt_interface or 'the address in VRF ' + m.lldp_mgmt_vrf}); it advertises an address "
+                    "of the port, 'lldp tlv-select management-address' per port; left out")
+            return
+        if m.lldp_mgmt_interface:
+            self.out.append(f"lldp management-address {self.port(m.lldp_mgmt_interface)}")
+        if m.lldp_mgmt_vrf:
+            self.out.append(f"lldp management-address vrf {self.vrf(m.lldp_mgmt_vrf)}")
+
+    def twamp(self) -> None:
+        """A TWAMP reflector: EOS answers TWAMP light, IOS runs a full TWAMP server and responder."""
+        d = self.device
+        if d.twamp_port is None:
+            return
+        rep = self.report
+        rep.item(monitor_text.KIND, "TWAMP reflector")
+        port = d.twamp_port
+        if self.ios:
+            self.out += ["ip sla server twamp"] + ([f" port {port}"] if port != 862 else []) + \
+                ["ip sla responder twamp", "!"]
+            if d.twamp_mode == "light":
+                rep.add(monitor_text.KIND, "TWAMP reflector", Severity.REVIEW, "twamp-light",
+                        "the source reflects TWAMP light; IOS is written as a full TWAMP server and responder, "
+                        "so senders that skip the control session need the IOS TWAMP light responder where the "
+                        "release has it")
+        else:
+            ind = self.ind
+            self.out += ["monitor twamp", f"{ind}twamp-light", f"{ind * 2}reflector defaults",
+                         f"{ind * 3}listen port {port}", "!"]
+            if d.twamp_mode == "full":
+                rep.add(monitor_text.KIND, "TWAMP reflector", Severity.APPROX, "twamp-light",
+                        "EOS reflects TWAMP light only: senders must skip the TWAMP control session")
 
     def _timezone(self, tz: str) -> None:
         words = tz.split()
@@ -2316,15 +2806,19 @@ class Writer:
                         "zone of the tz database); set it by hand")
 
     def banner(self) -> None:
-        text = self.device.system.banner_motd
-        if not text:
-            return
-        if self.ios:
-            delim = "^C" if "^C" not in text else "%"
-            self.out += [f"banner motd {delim}", text, delim]
-        else:
-            self.out += ["banner motd", text, "EOF"]
-        self.report.item("system", "banner motd")
+        s = self.device.system
+        for kind, text in (("login", s.banner_login), ("motd", s.banner_motd), ("exec", s.banner_exec)):
+            if not text:
+                continue
+            self.report.item("system", f"banner {kind}")
+            if self.ios:
+                delim = "^C" if "^C" not in text else "%"
+                self.out += [f"banner {kind} {delim}", text, delim]
+            elif kind == "exec":
+                self.report.add("system", "banner exec", Severity.REVIEW, "banner-exec",
+                                "EOS has no banner after login; merge it into the motd banner if it matters; left out")
+            else:
+                self.out += [f"banner {kind}", text, "EOF"]
 
     def unparsed(self) -> None:
         self.report.unparsed(self.device.unparsed)

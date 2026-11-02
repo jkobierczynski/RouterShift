@@ -86,6 +86,8 @@ def unwritten(device: Device, report: Report, target: str, port: Callable[[str],
         if info.export_map or info.rt_evpn:
             add("system", f"vrf {name}", "the EVPN route targets and export route map:", Severity.APPROX)
     routemap_text.lists_unsupported(device, report, platform)
+    for kind, item, what, severity in later_features(device, report, port):
+        add(kind, item, what, severity)
     s = device.system
     if s.syslog_transport:
         add("system", "syslog servers", "the transport of " + ", ".join(
@@ -101,6 +103,135 @@ def unwritten(device: Device, report: Report, target: str, port: Callable[[str],
                 report.add("qos", f"policy {policy.name}", Severity.APPROX, "qos-burst",
                            f"class {action.qos_class}: the burst of {action.burst_bytes} bytes is not converted; the "
                            f"{platform} default is used")
+
+
+def later_features(device: Device, report: Report, port: Callable[[str], str]) -> List[Tuple[str, str, str, Severity]]:
+    """Settings of the data-centre and management features only the IOS and EOS writer writes: (report kind, item,
+    what is not written, severity)."""
+    found: List[Tuple[str, str, str, Severity]] = []
+    vx = device.vxlan
+    if vx is not None:
+        named = [i.name for i in vx.evpn_instances.values() if i.rd or i.rt_import or i.rt_export or i.bundle]
+        if named:
+            found.append(("interface", "VXLAN", "the route distinguishers and route targets of EVPN instances "
+                          + ", ".join(named) + ":", Severity.REVIEW))
+        if vx.mcast_groups:
+            found.append(("interface", "VXLAN", "the multicast groups of VLANs "
+                          + ", ".join(str(v) for v in vx.mcast_groups) + ":", Severity.REVIEW))
+    bgp = device.bgp
+    if bgp is not None and (bgp.evpn_domain or bgp.evpn_remote_peers or bgp.evpn_host_flap):
+        found.append(("bgp", f"bgp {bgp.local_as}", "the EVPN domain gateway and host-flap settings:",
+                      Severity.REVIEW))
+    m = device.mlag
+    if m is not None:
+        options = [w for w, v in (("the MLAG heartbeat", m.heartbeat), ("dual-primary detection", m.dual_primary_delay
+                                                                         is not None),
+                                  ("the reload delays", m.reload_delay or m.reload_delay_non_mlag),
+                                  ("StackWise Virtual", m.stack)) if v]
+        if options:
+            found.append(("interface", "multi-chassis LAG", ", ".join(options) + ":", Severity.REVIEW))
+    for vlan in device.vlans.values():
+        if vlan.trunk_groups:
+            found.append(("vlan", str(vlan.vlan_id), f"trunk group {', '.join(vlan.trunk_groups)}:", Severity.APPROX))
+    for name, info in device.vrf_info.items():
+        if info.leaks:
+            found.append(("system", f"vrf {name}", "the routes leaked from VRF " + ", ".join(info.leaks) + ":",
+                          Severity.REVIEW))
+    if device.system.router_id:
+        found.append(("system", "router ID", f"the global router ID {device.system.router_id}:", Severity.REVIEW))
+    options = [w for w, v in (("the groups of the rendezvous points", device.pim_rp_groups),
+                              ("anycast RP", device.pim_anycast), ("MSDP peers", device.msdp_peers),
+                              ("multicast routing in VRFs " + ", ".join(device.multicast_vrfs), device.multicast_vrfs))
+               if v]
+    if options:
+        found.append(("system", "multicast routing", ", ".join(options) + ":", Severity.REVIEW))
+    if device.igmp_querier_address or device.igmp_querier_version or any(
+            v.igmp_querier_address or v.igmp_querier_version for v in device.vlans.values()):
+        found.append(("vlan", "IGMP snooping", "the querier's address and version:", Severity.APPROX))
+    if device.qos_profiles or device.qos_dscp_tc or device.qos_tc_dscp:
+        found.append(("qos", "DSCP to traffic-class map", "the DSCP map and the queuing profiles " +
+                      ", ".join(device.qos_profiles) + ":", Severity.REVIEW))
+    cp = device.control_plane
+    if cp is not None and (cp.acls or cp.classes or cp.policy):
+        found.append(("system", "control plane", "the control-plane ACLs and policing:", Severity.REVIEW))
+    if device.macsec_profiles or device.macsec_fips:
+        found.append(("system", "MACsec", "the MACsec profiles " + ", ".join(device.macsec_profiles) + ":",
+                      Severity.REVIEW))
+    for acl_name in device.mac_acls:
+        found.append(("acl", f"mac access-list {acl_name}", "MAC access lists:", Severity.REVIEW))
+    if device.dhcp_option82 is not None:
+        found.append(("system", "DHCP snooping", "the DHCP option 82 setting:", Severity.APPROX))
+    if device.aaa.coa:
+        found.append(("system", "RADIUS CoA", "RADIUS change of authorization:", Severity.REVIEW))
+    m_ = device.management
+    options = [w for w, v in (("the LLDP timers", m_.lldp_timer is not None or m_.lldp_holdtime is not None),
+                              ("the LLDP management address", m_.lldp_mgmt_interface or m_.lldp_mgmt_vrf)) if v]
+    if options:
+        found.append(("management", "LLDP", ", ".join(options) + ":", Severity.APPROX))
+    if device.twamp_port is not None:
+        found.append(("monitor", "TWAMP reflector", "the TWAMP reflector:", Severity.REVIEW))
+    for session in device.mirror_sessions:
+        if session.acl:
+            found.append(("monitor", f"mirror session {session.name}", f"the mirror's ACL filter {session.acl}:",
+                          Severity.REVIEW))
+    sf = device.sflow
+    if sf is not None and (sf.extensions or sf.source_vrf):
+        found.append(("monitor", "sflow", "the sFlow extensions and the source interface's VRF:", Severity.APPROX))
+    if device.netflow is not None and device.netflow.sample_rate:
+        found.append(("monitor", "netflow", f"sampling 1 in {device.netflow.sample_rate}:", Severity.REVIEW))
+    sy = device.system
+    options = [w for w, v in (("the login banner", sy.banner_login), ("the exec banner", sy.banner_exec)) if v]
+    if options:
+        found.append(("system", "banners", ", ".join(options) + ":", Severity.REVIEW))
+    if sy.logging_buffer is not None or sy.logging_buffer_level is not None or sy.logging_console_level is not None \
+            or sy.logging_monitor_level is not None or sy.logging_timestamp or sy.logging_hostname \
+            or sy.logging_facility_levels:
+        found.append(("system", "local logging", "the logging buffer, console and syslog format:", Severity.APPROX))
+    if device.roles or any(u.role for u in device.users):
+        found.append(("management", "roles", "the CLI roles " + ", ".join(device.roles) + ":", Severity.REVIEW))
+    if any(u.ssh_keys for u in device.users):
+        found.append(("management", "SSH keys", "the users' SSH public keys:", Severity.REVIEW))
+    if device.snmp.views or device.snmp.engine_id:
+        found.append(("management", "SNMP views", "the SNMP views and engine ID:", Severity.REVIEW))
+    if m_.apis:
+        found.append(("management", "programmatic interfaces", "the APIs " + ", ".join(m_.apis) + ":",
+                      Severity.REVIEW))
+    if m_.password_min_length is not None:
+        found.append(("management", "password length", "the minimum password length:", Severity.APPROX))
+    if device.ptp is not None:
+        found.append(("system", "PTP", "PTP:", Severity.REVIEW))
+    for name in device.event_handlers:
+        found.append(("system", f"event handler {name}", "event handlers and EEM applets:", Severity.REVIEW))
+    if device.bfd_multihop is not None or device.bfd_slow_timer is not None:
+        found.append(("system", "BFD", "the BFD multihop and slow timers:", Severity.APPROX))
+    if device.ecmp_hash:
+        found.append(("system", "ECMP hashing", "the ECMP hash fields:", Severity.APPROX))
+    if bgp is not None:
+        options = [w for w, v in (("asdot notation", bgp.asdot),
+                                  ("missing-as-worst MED", bgp.med_missing_as_worst or any(
+                                      v.med_missing_as_worst for v in bgp.vrfs.values())),
+                                  ("the OSPF route types redistributed", bgp.ospf_match or any(
+                                      v.ospf_match for v in bgp.vrfs.values()))) if v]
+        if options:
+            found.append(("bgp", f"bgp {bgp.local_as}", ", ".join(options) + ":", Severity.APPROX))
+    # (new device-level settings go above this line)
+    for iface in device.interfaces.values():
+        label = _interface_item(report, iface, port)
+        options = [w for w, v in (("the EVPN ethernet segment", iface.evpn_esi),
+                                  ("the LACP system ID", iface.lacp_system_id),
+                                  ("the SVI MAC address", iface.mac_address), ("no autostate", iface.autostate is False),
+                                  ("the unnumbered address", iface.unnumbered),
+                                  ("the trunk groups", iface.trunk_groups),
+                                  ("the queuing profile " + iface.qos_profile, iface.qos_profile),
+                                  ("the port's own queue settings", iface.queues),
+                                  ("the 802.1X fail VLAN", iface.dot1x_fail_vlan),
+                                  ("the MAC access groups", iface.mac_acl_in or iface.mac_acl_out),
+                                  ("the MACsec profile", iface.macsec_profile),
+                                  ("PTP", iface.ptp is not None or iface.ptp_announce_interval is not None),
+                                  ("the StackWise Virtual link", iface.svl_link is not None or iface.svl_dad)) if v]
+        if options:
+            found.append(("interface", label, ", ".join(options) + ":", Severity.REVIEW))
+    return found
 
 
 # Section of the source -> the report item it belongs to --------------------------------------------------------------

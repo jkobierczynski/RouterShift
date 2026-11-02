@@ -127,3 +127,58 @@ def pbr_entries(device: Device, name: str, report: Report, platform: str) -> Lis
                        "and is written with those only")
         result.append((e.seq, list(e.match_acls), e.sets.get("next-hop", "")))
     return result
+
+
+# global BFD timers and ECMP hashing (IOS and EOS) ---------------------------------------------------------------------
+
+MULTIHOP_TEMPLATE = "RS-MULTIHOP"
+
+
+def global_lines(device: Device, report: Report, ios: bool) -> List[str]:
+    """Multihop session timers and the slow timer: EOS router bfd, IOS a multi-hop template and bfd slow-timers."""
+    hop, slow = device.bfd_multihop, device.bfd_slow_timer
+    if hop is None and slow is None:
+        return []
+    report.item("system", "BFD")
+    if not ios:
+        lines = ["router bfd"]
+        if hop is not None:
+            lines.append(f"   multihop interval {hop[0]} min-rx {hop[1]} multiplier {hop[2]}")
+        if slow is not None:
+            lines.append(f"   slow-timer {slow}")
+        return lines + ["!"]
+    lines = []
+    if hop is not None:
+        lines += [f"bfd-template multi-hop {MULTIHOP_TEMPLATE}",
+                  f" interval min-tx {hop[0]} min-rx {hop[1]} multiplier {hop[2]}", "!"]
+        if device.platform != "ios":
+            report.add("system", "BFD", Severity.REVIEW, "bfd-multihop",
+                       f"the multihop timers are written as template {MULTIHOP_TEMPLATE}; IOS applies it per "
+                       "destination with 'bfd map ipv4 DEST/LEN SOURCE/LEN " + MULTIHOP_TEMPLATE + "'")
+    if slow is not None:
+        lines += [f"bfd slow-timers {slow}", "!"]
+    return lines
+
+
+def ecmp_lines(device: Device, report: Report, ios: bool) -> List[str]:
+    """The fields the ECMP hash takes: EOS ip load-sharing PLATFORM fields ip, IOS ip cef load-sharing algorithm."""
+    fields = device.ecmp_hash
+    if not fields:
+        return []
+    report.item("system", "ECMP hashing")
+    ports = any(f.endswith("-port") for f in fields)
+    if ios:
+        if set(fields) not in ({"source-ip", "destination-ip"},
+                               {"source-ip", "destination-ip", "source-port", "destination-port"}):
+            report.add("system", "ECMP hashing", Severity.APPROX, "ecmp-fields",
+                       f"IOS hashes on addresses, or addresses and ports; the source hashes on {', '.join(fields)}")
+        if device.platform != "ios":
+            report.add("system", "ECMP hashing", Severity.REVIEW, "ecmp-platform",
+                       "Catalyst switches set the hash with their own commands (port-channel load-balance, and CEF on "
+                       "routers); check the target honours this line")
+        return [f"ip cef load-sharing algorithm {'include-ports source destination' if ports else 'universal'}", "!"]
+    platform = device.ecmp_platform or "trident"
+    if not device.ecmp_platform:
+        report.add("system", "ECMP hashing", Severity.REVIEW, "ecmp-platform",
+                   "EOS names the switch chip family in this line: trident written; use sand on 7280R/7500R")
+    return [f"ip load-sharing {platform} fields ip {' '.join(fields)}", "!"]

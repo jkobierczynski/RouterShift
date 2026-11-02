@@ -85,7 +85,7 @@ _RAW: List[Tuple[str, str, str]] = [
     (r"(aaa accounting |aaa authorization |aaa server radius dynamic-author|radius-server attribute |"
      r"radius-server dead-criteria |radius-server deadtime |aaa group server .*|radius server .*|tacacs server .*)",
      "AAA accounting, authorization and RADIUS tuning",
-     "accounting, authorization, change of authorization and RADIUS tuning are not converted yet; the servers and "
+     "accounting, authorization and RADIUS tuning are not converted yet; the servers and "
      "login authentication are"),
     (r"(authentication (event|open|order|priority|timer|violation|control-direction|periodic)|dot1x timeout |"
      r"dot1x max-reauth-req|dot1x max-req|access-session |mab eap)", "802.1X session options",

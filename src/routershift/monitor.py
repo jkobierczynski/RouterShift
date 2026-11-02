@@ -166,3 +166,44 @@ def finish(device: Device) -> None:
     """A reader's last step: ports that record flows mean NetFlow is configured, collectors or not."""
     if device.netflow is None and flow_ports(device):
         device.netflow = Netflow()
+
+
+# sFlow and NetFlow stand in for each other between EOS and IOS ------------------------------------------------------
+
+SAMPLER = "RS-SAMPLER"
+
+
+def netflow_from_sflow(device: Device, report: Report) -> Optional[Netflow]:
+    """IOS has no sFlow: the nearest is Flexible NetFlow sampling the same ports 1 in N, exported to the same
+    collectors."""
+    sf = device.sflow
+    if sf is None or device.netflow is not None:
+        return None
+    report.item(KIND, SFLOW)
+    report.add(KIND, SFLOW, Severity.REVIEW, "sflow-as-netflow",
+               "IOS has no sFlow: written as sampled Flexible NetFlow (v9) on the same ports to the same collectors; "
+               "the collectors must accept NetFlow, and the counter polling is not written")
+    if sf.extensions:
+        report.add(KIND, SFLOW, Severity.REVIEW, "sflow-extension",
+                   f"the sFlow extensions {', '.join(sf.extensions)} have no NetFlow equivalent; left out")
+    if sf.agent:
+        report.add(KIND, SFLOW, Severity.APPROX, "sflow-agent", f"the agent address {sf.agent} is not written; "
+                   "NetFlow exports from the source interface")
+    return Netflow([FlowCollector(c.address, c.port, c.vrf) for c in sf.collectors], 9, sf.source_interface,
+                   sample_rate=sf.sample_rate, origin=sf.origin)
+
+
+def sflow_from_netflow(device: Device, report: Report) -> Optional[Sflow]:
+    """The other way round: EOS samples with sFlow where IOS exported NetFlow."""
+    nf = device.netflow
+    if nf is None or device.sflow is not None:
+        return None
+    report.item(KIND, NETFLOW)
+    report.add(KIND, NETFLOW, Severity.REVIEW, "netflow-as-sflow",
+               "written as sFlow, the nearest EOS runs on every platform, on the same ports to the same collectors; "
+               "the collectors must accept sFlow, and the flow record and export format are not kept"
+               + ("" if nf.sample_rate else "; NetFlow saw every packet, sFlow samples at the EOS default rate"))
+    vrfs = {c.vrf for c in nf.collectors}
+    return Sflow([FlowCollector(c.address, c.port, c.vrf) for c in nf.collectors],
+                 source_interface=nf.source_interface, source_vrf=vrfs.pop() if len(vrfs) == 1 else "",
+                 sample_rate=nf.sample_rate, origin=nf.origin)

@@ -89,6 +89,7 @@ class System:
     syslog_servers: List[str] = field(default_factory=list)
     # VRF through which the device reaches its DNS, NTP and syslog servers ("" = the default VRF).
     service_vrf: str = ""
+    router_id: str = ""  # EOS router general: the router ID every routing protocol takes unless it sets its own
     ntp_prefer: str = ""  # the preferred NTP server
     ntp_server_keys: Dict[str, int] = field(default_factory=dict)  # NTP server -> authentication key number
     ntp_keys: Dict[int, "NtpKey"] = field(default_factory=dict)
@@ -99,6 +100,15 @@ class System:
     logging_source: str = ""  # canonical name of the interface syslog packets leave from
     # Syslog servers that do not use UDP port 514: address -> (protocol "udp", "tcp" or "tls", port)
     syslog_transport: Dict[str, Tuple[str, int]] = field(default_factory=dict)
+    banner_login: str = ""  # shown before the login prompt
+    banner_exec: str = ""  # IOS: shown after login (EOS has none)
+    logging_buffer: Optional[int] = None  # local log buffer size, bytes
+    logging_buffer_level: Optional[int] = None  # severity kept in it
+    logging_console_level: Optional[int] = None  # severity shown on the console; -1 = console logging off
+    logging_monitor_level: Optional[int] = None  # the same on remote terminals
+    logging_timestamp: str = ""  # "msec": timestamps with sub-second resolution (EOS high-resolution)
+    logging_hostname: str = ""  # what names the device in syslog messages: "hostname", "fqdn" or "ip"
+    logging_facility_levels: Dict[str, int] = field(default_factory=dict)  # EOS logging level FACILITY SEVERITY
 
 
 @dataclass
@@ -123,6 +133,13 @@ class Mlag:
     peer_address: str = ""  # the peer's address on the peer link (EOS) or keepalive (AOS-CX)
     local_interface: str = ""  # the SVI on the peer link (EOS) or the keepalive source (AOS-CX)
     role: str = ""  # primary or secondary (AOS-CX)
+    stack: bool = False  # IOS StackWise Virtual: two switches that act as one (links: Interface.svl_link)
+    heartbeat: str = ""  # EOS peer-address heartbeat: the peer's address on another path (management)
+    heartbeat_vrf: str = ""
+    dual_primary_delay: Optional[int] = None  # EOS dual-primary detection delay, seconds
+    dual_primary_action: str = ""  # "errdisable all-interfaces" or "" (none)
+    reload_delay: Optional[int] = None  # seconds the MLAG ports stay down after a reload
+    reload_delay_non_mlag: Optional[int] = None  # the same for the other ports
 
 
 @dataclass
@@ -139,6 +156,15 @@ class Management:
     console_login: str = ""  # the login method list the console uses (EOS: aaa authentication login console)
     lldp: Optional[bool] = None
     cdp: Optional[bool] = None
+    lldp_timer: Optional[int] = None  # seconds between LLDP advertisements
+    lldp_holdtime: Optional[int] = None  # how long neighbours keep them
+    lldp_mgmt_interface: str = ""  # EOS lldp management-address IF: the address advertised (canonical)
+    lldp_mgmt_vrf: str = ""  # EOS lldp management-address vrf V
+    # Programmatic interfaces: "netconf", "gnmi", "http" (EOS eAPI / IOS RESTCONF) -> the VRF it serves in ("" = the
+    # default VRF)
+    apis: Dict[str, str] = field(default_factory=dict)
+    api_acls: Dict[str, str] = field(default_factory=dict)  # api -> the IPv4 ACL that limits its clients
+    password_min_length: Optional[int] = None  # local passwords at least this long
 
 
 @dataclass
@@ -158,6 +184,9 @@ class Vlan:
     arp_inspection: bool = False  # dynamic ARP inspection on the VLAN
     igmp_snooping: Optional[bool] = None  # IGMP snooping switched on or off for the VLAN; None = not stated
     igmp_querier: bool = False  # the switch sends IGMP queries in the VLAN
+    igmp_querier_address: str = ""  # their source address in this VLAN
+    igmp_querier_version: Optional[int] = None
+    trunk_groups: List[str] = field(default_factory=list)  # EOS: the VLAN only rides trunks of these groups
     origin: Origin = field(default_factory=Origin)
 
 
@@ -211,6 +240,8 @@ class Interface:
     qos_trust: str = ""  # "dscp", "cos" or "none"; "" = the platform default
     qos_policy_in: str = ""  # QosPolicy names
     qos_policy_out: str = ""
+    qos_profile: str = ""  # QosProfile name (EOS service-profile, IOS service-policy output of a queuing policy)
+    queues: Dict[int, "QosQueue"] = field(default_factory=dict)  # queue settings of this port on top of its profile
     mpls: bool = False  # MPLS label switching with LDP on the interface
     lldp_tx: bool = True  # LLDP sends on the port (where LLDP runs)
     lldp_rx: bool = True  # LLDP listens on the port
@@ -223,6 +254,19 @@ class Interface:
     port_security_violation: str = ""  # shutdown, restrict (drop and report) or protect (drop)
     storm_control: Dict[str, float] = field(default_factory=dict)  # broadcast|multicast|unicast|unknown-unicast -> %
     mlag_id: Optional[int] = None  # the multi-chassis LAG this port-channel is (EOS mlag N, AOS-CX multi-chassis)
+    # EVPN multihoming: the ethernet segment identifier of the LAG, 10 bytes as EOS writes them
+    # ("0000:0000:0021:0022:0020"); "" = none
+    evpn_esi: str = ""
+    evpn_es_rt: str = ""  # the ES-import route target (a MAC address, EOS form 00:21:00:22:00:20)
+    evpn_df_preference: Optional[int] = None  # designated-forwarder election by preference
+    evpn_single_active: bool = False  # single-active redundancy instead of all-active
+    lacp_system_id: str = ""  # the LACP system ID the LAG uses (EOS form 0021.0022.0020)
+    mac_address: str = ""  # SVI: the MAC it routes with ("" = the switch's own), xx:xx:xx:xx:xx:xx
+    trunk_groups: List[str] = field(default_factory=list)  # EOS switchport trunk group: VLANs of these groups ride it
+    svl_link: Optional[int] = None  # IOS: the port is a StackWise Virtual link (stackwise-virtual link N)
+    svl_dad: bool = False  # IOS: the port detects a dual-active StackWise Virtual pair
+    autostate: Optional[bool] = None  # SVI: down while no port of its VLAN is up; None = the default (on)
+    unnumbered: str = ""  # borrows the address of this interface (canonical name)
     fhrp: List["FhrpGroup"] = field(default_factory=list)
     nat: str = ""  # "inside", "outside" or ""
     ospf_cost: Optional[int] = None
@@ -255,6 +299,16 @@ class Interface:
     dot1x_host_mode: str = ""  # "single-host", "multi-host" (one login opens the port), "multi-auth", "multi-domain"
     dot1x_reauth: bool = False
     dot1x_reauth_period: Optional[int] = None  # seconds; None = the platform default
+    dot1x_fail_vlan: Optional[int] = None  # a client that fails authentication is put in this VLAN
+    mac_acl_in: str = ""  # MacAcl names
+    mac_acl_out: str = ""
+    macsec_profile: str = ""  # MacsecProfile name
+    ptp: Optional[bool] = None  # PTP runs on the port (None: not stated)
+    ptp_announce_interval: Optional[int] = None  # log2 seconds
+    ptp_sync_interval: Optional[int] = None  # log2 seconds
+    ptp_delay_req_interval: Optional[int] = None  # log2 seconds
+    ptp_delay_mechanism: str = ""  # "e2e" or "p2p"
+    ptp_transport: str = ""  # "ipv4", "ipv6" or "layer2"
     origin: Origin = field(default_factory=Origin)
 
 
@@ -418,6 +472,8 @@ class BgpVrf:
     peer_groups: Dict[str, BgpNeighbor] = field(default_factory=dict)  # defined in the VRF (EOS)
     aggregates: List[BgpAggregate] = field(default_factory=list)
     redistribute6: List[str] = field(default_factory=list)  # IPv6
+    ospf_match: List[str] = field(default_factory=list)  # OSPF routes redistributed: internal, external, nssa-external
+    med_missing_as_worst: bool = False
 
 
 @dataclass
@@ -439,7 +495,19 @@ class Bgp:
     graceful_restart_time: Optional[int] = None  # seconds
     distance: Optional[Tuple[int, int, int]] = None  # administrative distance of external, internal, local routes
     multipath_relax: bool = False  # equal-cost paths through different neighbor ASes (bestpath as-path multipath-relax)
+    asdot: bool = False  # 4-byte AS numbers shown as X.Y
+    med_missing_as_worst: bool = False  # a route without MED loses (bgp bestpath med missing-as-worst)
+    ospf_match: List[str] = field(default_factory=list)  # OSPF routes redistributed: internal, external, nssa-external
     vrfs: Dict[str, BgpVrf] = field(default_factory=dict)
+    # EVPN gateway between two domains (EOS domain identifier, neighbor X domain remote): the domain IDs and the
+    # neighbors in the remote domain
+    evpn_domain: str = ""
+    evpn_remote_domain: str = ""
+    evpn_remote_peers: List[str] = field(default_factory=list)
+    evpn_inter_domain_nhs: bool = False  # next-hop-self on IP-prefix routes passed between the domains
+    evpn_import_discard: bool = False  # routes no VRF imports are dropped (EOS route import match-failure action
+    # discard)
+    evpn_host_flap: Optional[Tuple[int, int, int]] = None  # MAC moves: window seconds, moves, expiry seconds
     origin: Origin = field(default_factory=Origin)
 
 
@@ -647,6 +715,8 @@ class Snmp:
     users: List["SnmpUser"] = field(default_factory=list)
     source: str = ""  # canonical name of the interface SNMP packets leave from
     vrf: str = ""  # VRF the agent answers in, where the platform sets one for all of SNMP
+    views: Dict[str, List[Tuple[str, bool]]] = field(default_factory=dict)  # view -> (OID subtree, included)
+    engine_id: str = ""  # the local SNMPv3 engine ID (hex)
 
 
 @dataclass
@@ -699,6 +769,24 @@ class LocalUser:
     password: str = ""  # clear text, when the source has it (or a reversible type 7)
     password_hash: str = ""  # carried only when the target accepts the same hash
     hash_type: str = ""  # "md5-crypt" ($1$), "sha512-crypt" ($6$), or a platform's own form ("ios-scrypt", ...)
+    role: str = ""  # a role of the device's own (Device.roles): EOS role, IOS parser view
+    ssh_keys: List[str] = field(default_factory=list)  # public keys: "TYPE BASE64 [COMMENT]"
+    origin: Origin = field(default_factory=Origin)
+
+
+@dataclass
+class RoleRule:
+    action: str  # "permit" or "deny"
+    mode: str  # "exec" or "config" (EOS config-all and named modes are kept as written)
+    command: str  # EOS: a regular expression; IOS parser view: the command words, | between alternatives
+    sequence: Optional[int] = None
+
+
+@dataclass
+class Role:
+    """Role-based CLI access: the commands a user of the role may run (EOS role, IOS parser view)."""
+    name: str
+    rules: List[RoleRule] = field(default_factory=list)
     origin: Origin = field(default_factory=Origin)
 
 
@@ -751,6 +839,7 @@ class Aaa:
     source: Dict[str, str] = field(default_factory=dict)  # protocol -> canonical source interface
     enable_secret: Optional[LocalUser] = None  # IOS/EOS enable secret, as a user named "enable"
     dot1x: bool = False  # 802.1X port authentication switched on for the device
+    coa: bool = False  # RADIUS change of authorization accepted (EOS dot1x dynamic-authorization, IOS dynamic-author)
 
 
 @dataclass
@@ -778,6 +867,92 @@ class QosAction:
 class QosPolicy:
     name: str
     actions: List[QosAction] = field(default_factory=list)
+    origin: Origin = field(default_factory=Origin)
+
+
+@dataclass
+class QosQueue:
+    """One egress queue (EOS tx-queue, an IOS queuing class), by the traffic class it serves (0-7)."""
+
+    traffic_class: int
+    priority: bool = False  # strict priority
+    priority_level: Optional[int] = None  # IOS priority level 1 or 2
+    priority_percent: Optional[int] = None  # IOS priority level N percent P: the share it may take under congestion
+    bandwidth_percent: Optional[int] = None  # the share of the port it is guaranteed (EOS bandwidth percent)
+    bandwidth_remaining: Optional[int] = None  # the share of what the priority queues leave (IOS bandwidth remaining)
+    shape_percent: Optional[int] = None  # the most of the port it may use
+    shape_kbps: Optional[int] = None
+    wred: bool = False  # weighted random early drop (IOS random-detect [dscp-based])
+    ecn: Optional[Tuple[int, int, int]] = None  # ECN marking: minimum and maximum threshold (kbytes), mark percent
+    queue_limit: Optional[int] = None  # IOS queue-limit, packets
+    fair_queue: bool = False  # IOS fair-queue
+    source_class: str = ""  # the IOS class it was read from
+
+
+@dataclass
+class QosProfile:
+    """Egress queuing and trust of a port (EOS qos profile, IOS output policy-map with queuing classes)."""
+
+    name: str
+    trust: str = ""  # "dscp", "cos", "none"; "" = the platform default
+    queues: Dict[int, QosQueue] = field(default_factory=dict)
+    shape_kbps: Optional[int] = None  # the whole port is shaped (IOS parent policy shape average)
+    input_policy: str = ""  # EOS: service-policy type qos input inside the profile
+    origin: Origin = field(default_factory=Origin)
+
+
+@dataclass
+class CoppClass:
+    """A class of control-plane traffic and the rate it is limited to."""
+
+    name: str
+    acl: str = ""  # the ACL that picks the traffic ("" for a platform's own class, EOS copp-system-*)
+    pps: Optional[int] = None  # packets per second
+    kbps: Optional[int] = None
+
+
+@dataclass
+class ControlPlane:
+    """Protection of the device's CPU: ACLs on traffic to the device (EOS system control-plane, per VRF) and policing
+    by class (EOS policy-map type copp, IOS control-plane / service-policy input)."""
+
+    acls: Dict[str, str] = field(default_factory=dict)  # VRF ("" = default) -> ACL
+    policy: str = ""  # the name of the policing policy
+    classes: List[CoppClass] = field(default_factory=list)
+    origin: Origin = field(default_factory=Origin)
+
+
+@dataclass
+class MacsecProfile:
+    """MACsec with a pre-shared key (MKA): EOS mac security profile, IOS mka policy with a macsec key chain."""
+
+    name: str
+    cipher: str = ""  # "aes128-gcm", "aes256-gcm", "aes128-gcm-xpn", "aes256-gcm-xpn"; "" = the default
+    ckn: str = ""  # the connectivity association key name (hex)
+    cak: str = ""  # the key; "" when the source holds it encrypted
+    key_server_priority: Optional[int] = None
+    rekey_period: Optional[int] = None  # seconds
+    sci: bool = False  # the SCI is sent in every frame
+    lldp_bypass: bool = False  # LLDP passes unencrypted
+    origin: Origin = field(default_factory=Origin)
+
+
+@dataclass
+class MacAclEntry:
+    action: AclAction
+    sequence: Optional[int] = None
+    source: str = "any"  # "any", or "MAC MASK" in EOS colon form (00:11:22:33:44:55 00:00:00:00:00:00 = host)
+    destination: str = "any"
+    ethertype: Optional[int] = None
+    vlan: Optional[int] = None
+    log: bool = False
+    remark: str = ""
+
+
+@dataclass
+class MacAcl:
+    name: str
+    entries: List[MacAclEntry] = field(default_factory=list)
     origin: Origin = field(default_factory=Origin)
 
 
@@ -822,6 +997,7 @@ class MirrorSession:
     name: str  # the session number (a name on EOS)
     sources: Dict[str, str] = field(default_factory=dict)  # canonical interface -> "both", "rx" or "tx"
     destination: str = ""  # canonical interface
+    acl: str = ""  # only the traffic this IPv4 ACL permits is mirrored
     origin: Origin = field(default_factory=Origin)
 
 
@@ -839,8 +1015,10 @@ class Sflow:
     collectors: List[FlowCollector] = field(default_factory=list)
     agent: str = ""  # the agent address in the datagrams
     source_interface: str = ""  # or the interface (canonical) whose address it is
+    source_vrf: str = ""  # EOS: the VRF of the source interface (sflow vrf V source-interface X)
     sample_rate: Optional[int] = None  # one packet in N
     polling_interval: Optional[int] = None  # counter polling, seconds
+    extensions: List[str] = field(default_factory=list)  # EOS sflow extension bgp | router | switch
     origin: Origin = field(default_factory=Origin)
 
 
@@ -853,6 +1031,7 @@ class Netflow:
     version: Optional[int] = None  # export format: 5, 9 or 10 (IPFIX)
     source_interface: str = ""  # canonical
     record: str = ""  # IOS: the flow record of the monitor
+    sample_rate: Optional[int] = None  # IOS: the monitor samples one packet in N (sampler mode random 1 out-of N)
     origin: Origin = field(default_factory=Origin)
 
 
@@ -866,7 +1045,38 @@ class Vxlan:
     vrf_vnis: Dict[str, int] = field(default_factory=dict)  # VRF -> layer 3 VNI (symmetric routing)
     flood_vteps: List[str] = field(default_factory=list)  # static head-end replication peers
     evpn_vlans: List[int] = field(default_factory=list)  # VLANs whose MAC addresses BGP EVPN advertises (rd and
-    # route targets auto)
+    # route targets auto unless an instance of evpn_instances names them)
+    evpn_instances: Dict[str, "EvpnInstance"] = field(default_factory=dict)  # by name
+    mcast_groups: Dict[int, str] = field(default_factory=dict)  # VLAN -> underlay multicast group its BUM traffic uses
+    # IOS: the VLAN that carries the layer 3 VNI of a VRF (vlan configuration N / member vni V, with an SVI in the VRF)
+    vrf_vlans: Dict[str, int] = field(default_factory=dict)
+    mlag_shared_mac: bool = False  # EOS: vxlan virtual-router encapsulation mac-address mlag-system-id
+    qos_propagation: List[str] = field(default_factory=list)  # EOS vxlan qos: "ecn", "dscp" (copied to the outer
+    # header)
+    origin: Origin = field(default_factory=Origin)
+
+
+@dataclass
+class VrfMulticast:
+    """Multicast routing in a VRF: switched on, and its static rendezvous points (RP -> groups, as in Device)."""
+
+    routing: bool = False
+    rps: List[str] = field(default_factory=list)
+    rp_groups: Dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class EvpnInstance:
+    """An EVPN instance: VLANs whose MAC routes share a route distinguisher and route targets (EOS router bgp / vlan N
+    or vlan-aware-bundle NAME; IOS l2vpn evpn instance N vlan-based)."""
+
+    name: str  # the VLAN of a VLAN-based instance, or the bundle name
+    vlans: List[int] = field(default_factory=list)
+    bundle: bool = False  # one instance for several VLANs (EOS vlan-aware-bundle)
+    rd: str = ""  # "" = auto
+    rt_import: List[str] = field(default_factory=list)  # [] = auto
+    rt_export: List[str] = field(default_factory=list)
+    igmp: bool = False  # IGMP joins are advertised as EVPN routes (EOS redistribute igmp)
     origin: Origin = field(default_factory=Origin)
 
 
@@ -893,6 +1103,44 @@ class Track:
     interface: str = ""  # or the interface (canonical) whose line protocol it follows
     delay_up: Optional[int] = None  # seconds a change waits before it counts
     delay_down: Optional[int] = None
+    origin: Origin = field(default_factory=Origin)
+
+
+@dataclass
+class Ptp:
+    """Precision Time Protocol: the clock's role and dataset."""
+
+    mode: str = ""  # boundary, e2etransparent, p2ptransparent, gptp, disabled
+    domain: Optional[int] = None
+    priority1: Optional[int] = None
+    priority2: Optional[int] = None
+    clock_identity: str = ""
+    source_ip: str = ""  # EOS: the source address of PTP messages
+    dscp_general: Optional[int] = None
+    dscp_event: Optional[int] = None
+    origin: Origin = field(default_factory=Origin)
+
+
+@dataclass
+class EventAction:
+    kind: str  # "syslog" (a message at a severity), "cli" (a CLI command), "script" (a shell command line)
+    text: str
+    level: Optional[int] = None  # syslog: severity 0-7
+
+
+@dataclass
+class EventHandler:
+    """Run actions when something happens: an EOS event handler, an IOS EEM applet."""
+
+    name: str
+    trigger: str  # startup-config, boot, interface, cpu, logging, track, timer, other
+    interface: str = ""  # interface: the canonical port whose state changes
+    pattern: str = ""  # logging: the regular expression a syslog message matches; cpu: the comparison ("> 85")
+    poll_interval: Optional[int] = None  # cpu: seconds between checks
+    track: str = ""  # track: the tracked object, and its state in pattern ("up" / "down")
+    delay: Optional[int] = None  # seconds between the trigger and the actions
+    actions: List[EventAction] = field(default_factory=list)
+    description: str = ""
     origin: Origin = field(default_factory=Origin)
 
 
@@ -945,17 +1193,43 @@ class Device:
     anycast_mac: str = ""  # the MAC every switch of a fabric answers on for Interface.virtual_ipv4 (EOS VARP MAC)
     multicast_routing: bool = False
     pim_rps: List[str] = field(default_factory=list)  # static PIM rendezvous point addresses
+    pim_rp_groups: Dict[str, str] = field(default_factory=dict)  # RP -> the groups it serves: a prefix
+    # (239.1.0.0/16) or "acl NAME"; an RP not listed serves every group
+    pim_anycast: Dict[str, List[str]] = field(default_factory=dict)  # anycast RP address -> the RPs that share it
+    msdp_peers: Dict[str, str] = field(default_factory=dict)  # MSDP peer -> the interface (canonical) it is reached
+    # from ("" = the outgoing one)
+    multicast_vrfs: Dict[str, "VrfMulticast"] = field(default_factory=dict)  # multicast routing in VRFs
+    igmp_querier_address: str = ""  # the source address of the IGMP queries ("" = the SVI's)
+    igmp_querier_version: Optional[int] = None
     mlag: Optional[Mlag] = None
     mirror_sessions: List[MirrorSession] = field(default_factory=list)
     sflow: Optional[Sflow] = None
     netflow: Optional[Netflow] = None
+    twamp_port: Optional[int] = None  # a TWAMP reflector answers on this UDP port (862 by default)
+    twamp_mode: str = ""  # "light" (EOS monitor twamp / twamp-light) or "full" (IOS ip sla server/responder twamp)
     vxlan: Optional[Vxlan] = None
     ip_slas: Dict[str, IpSla] = field(default_factory=dict)
     tracks: Dict[str, Track] = field(default_factory=dict)
     qos_classes: Dict[str, QosClass] = field(default_factory=dict)
     qos_policies: Dict[str, QosPolicy] = field(default_factory=dict)
+    qos_profiles: Dict[str, QosProfile] = field(default_factory=dict)
+    control_plane: Optional[ControlPlane] = None
+    macsec_profiles: Dict[str, MacsecProfile] = field(default_factory=dict)
+    macsec_fips: bool = False  # EOS mac security / fips restrictions
+    mac_acls: Dict[str, MacAcl] = field(default_factory=dict)
+    dhcp_option82: Optional[bool] = None  # DHCP snooping inserts option 82; None = the platform default
+    qos_dscp_tc: Dict[int, int] = field(default_factory=dict)  # DSCP -> traffic class (queue) it is put in
+    qos_tc_dscp: Dict[int, int] = field(default_factory=dict)  # traffic class -> DSCP it is rewritten to
     snmp: Snmp = field(default_factory=Snmp)
     users: List[LocalUser] = field(default_factory=list)
+    roles: Dict[str, Role] = field(default_factory=dict)
+    ptp: Optional[Ptp] = None
+    bfd_multihop: Optional[Tuple[int, int, int]] = None  # multihop sessions: transmit ms, receive ms, multiplier
+    bfd_slow_timer: Optional[int] = None  # ms, while a session is down or echo runs
+    ecmp_hash: List[str] = field(default_factory=list)  # fields of the ECMP hash: source-ip, destination-ip,
+    # source-port, destination-port ([] = the platform default)
+    ecmp_platform: str = ""  # EOS: the chip family the load-sharing line names (trident, sand, arad, ...)
+    event_handlers: Dict[str, EventHandler] = field(default_factory=dict)
     aaa: Aaa = field(default_factory=Aaa)
     unparsed: List[Unparsed] = field(default_factory=list)
 
