@@ -20,6 +20,7 @@ from .. import igp as igp_text
 from .. import aoscxfabric as fabric
 from .. import aoscxqos
 from .. import aoscxsec
+from .. import aoscxmon
 from .. import routemap as routemap_text
 from .. import bgp as bgp_text
 from .. import dhcp as dhcp_text
@@ -84,6 +85,8 @@ class Writer:
         for p in self.device.ospf:
             self.ospf(p)
         self._icmp_globals()
+        self.track_plan = tracking_text.plan(self.device, self.report, "aoscx", "AOS-CX")
+        self.out += aoscxmon.track_lines(self.device, self.report, self.track_plan, self.port)
         # a LAG exists before the ports that join it
         order = {InterfaceKind.MANAGEMENT: 0, InterfaceKind.LAG: 1}
         for iface in sorted(self.device.interfaces.values(), key=lambda i: order.get(i.kind, 2)):
@@ -91,7 +94,6 @@ class Writer:
         self.vsx()
         self.vxlan()
         self.monitor()
-        tracking_text.plan(self.device, self.report, "aoscx", "AOS-CX")
         self.routes()
         self.dhcp()
         nat_text.skip_all(self.device, self.report, "AOS-CX")
@@ -236,6 +238,7 @@ class Writer:
             self.out += ["cli-session", f"    timeout {m.exec_timeout}"]
         if m.lldp is False:
             self.out.append("no lldp")
+        self.out += aoscxmon.lldp_lines(self.device, rep, self.port)
         if m.cdp:
             rep.add("management", "CDP", Severity.APPROX, "cdp-lldp", "AOS-CX has no CDP; LLDP announces the switch")
 
@@ -722,9 +725,10 @@ class Writer:
             rep.item(monitor_text.KIND, monitor_text.SFLOW)
             if monitor_text.sflow_ports(d):
                 self.out.append("sflow")
+            source_vrf = aoscxmon.sflow_vrf(d, rep)
             for c in sf.collectors:
                 port = f" port {c.port}" if c.port is not None else ""
-                vrf = f" vrf {self.vrf(c.vrf)}" if c.vrf else ""
+                vrf = f" vrf {self.vrf(c.vrf or source_vrf)}" if c.vrf or source_vrf else ""
                 self.out.append(f"sflow collector {c.address}{port}{vrf}")
             agent = monitor_text.agent(d, sf, rep, "AOS-CX")
             if agent:
@@ -733,6 +737,7 @@ class Writer:
                 self.out.append(f"sflow sampling {sf.sample_rate}")
             if sf.polling_interval is not None:
                 self.out.append(f"sflow polling {sf.polling_interval}")
+        aoscxmon.unwritable(d, rep)
         monitor_text.netflow_unsupported(d, rep, "AOS-CX")
 
     # interfaces ------------------------------------------------------------------------------------------------------
@@ -848,6 +853,12 @@ class Writer:
                 body.append("version 3")
             if g.hello_ms is not None:
                 body.append(f"timers advertise {fhrp.interval(g.hello_ms, 1, add, 100, 40950)}")
+            tracks = self.track_plan.fhrp_tracks(g.tracks)
+            body += [f"track {t}" for t, _ in tracks]
+            if tracks:
+                add(Severity.APPROX, "fhrp-track",
+                    "AOS-CX takes the group down while a tracked object is down, instead of lowering its priority by "
+                    + ", ".join(str(dec) for _, dec in tracks))
             if g.name:
                 add(Severity.APPROX, "fhrp-name", f"description '{g.name}' left out: AOS-CX has none for a group")
             body.append("shutdown" if g.shutdown else "no shutdown")

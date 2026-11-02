@@ -14,9 +14,9 @@ from .report import Report, Severity
 
 KIND = "track"
 SLA_PLATFORMS = ("ios", "comware")  # IP SLA / NQA
-TRACK_PLATFORMS = ("ios", "eos", "comware")
+TRACK_PLATFORMS = ("ios", "eos", "comware", "aoscx")
 ROUTE_TRACK_PLATFORMS = ("ios", "comware")
-NUMBERED = ("ios", "comware")  # the others name their tracked objects
+NUMBERED = ("ios", "comware", "aoscx")  # the others name their tracked objects
 DEFAULT_DECREMENT = 10
 
 

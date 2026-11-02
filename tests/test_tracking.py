@@ -45,5 +45,5 @@ def test_reports() -> None:
     assert "static route 0.0.0.0/0 is written without it" in text
     _, report = convert(sample("comware_access.cfg"), "comware", "aoscx")
     text = report.to_text()
-    assert "AOS-CX: tracked objects are not written" in text and "AOS-CX has no IP SLA probes" in text
+    assert "AOS-CX has no IP SLA probes" in text and "follows ip sla" in text
     assert "VRRP group 10 on Vlan10 is written without it" in text

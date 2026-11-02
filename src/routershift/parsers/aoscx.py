@@ -28,6 +28,7 @@ from .. import bfd as bfd_text
 from .. import aoscxfabric as fabric
 from .. import aoscxqos
 from .. import aoscxsec
+from .. import aoscxmon
 from .. import multicast as multicast_text
 from .. import routemap as routemap_text
 from .. import bgp as bgp_text
@@ -90,6 +91,7 @@ class _Reader:
         self._gateways6: Dict[str, List[str]] = {}  # interface -> active-gateway ipv6 addresses
         self._vsf_links: Dict[str, int] = {}  # vsf member link ports -> link number
         self._schedule: Dict[str, str] = {}  # port -> the schedule profile it applies
+        self._lldp: Dict[str, int] = {}  # lldp holdtime-multiplier and management address, resolved at the end
 
     def unparsed(self, node: Node, section: str = "") -> None:
         self.device.unparsed.append(Unparsed(node.line, node.text, section))
@@ -147,7 +149,10 @@ class _Reader:
             "ssh": self.server,
             "https-server": self.server,
             "cli-session": self.cli_session,
-            "lldp": lambda node: node.words == ["lldp"] and self._set_lldp(True),
+            "lldp": lambda node: node.words == ["lldp"] and self._set_lldp(True) or
+            aoscxmon.read_lldp(self.device, node.words, self._lldp),
+            "track": lambda node: aoscxmon.read_track(self.device, node.words, lambda x: canonical(x)[0], node.line,
+                                                      node.text),
             "no": self.no,
         }
         for node in roots:
@@ -1164,6 +1169,8 @@ class _Reader:
                 group.shutdown = True
             elif w == ["no", "shutdown"]:
                 group.shutdown = False
+            elif aoscxmon.vrrp_track(group.tracks, w):
+                pass
             else:
                 self.unparsed(child, node.text)
 
@@ -1369,6 +1376,7 @@ class _Reader:
         self._anycast()
         qos_text.adopt(self.device, self._class_acls)
         aoscxqos.finish(self.device, self._schedule)
+        aoscxmon.finish_lldp(self.device, self._lldp)
         if self.device.vxlan is not None and self._vxlan_source:
             self.device.vxlan.source_interface = vxlan_text.interface_of(self.device, self._vxlan_source)
         if self._sflow_global and not monitor_text.sflow_ports(self.device):
