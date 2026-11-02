@@ -29,6 +29,7 @@ from .. import monitor as monitor_text
 from .. import tracking as tracking_text
 from .. import vxlan as vxlan_text
 from .. import nxosfabric
+from .. import nxosmcast
 from .. import evpn as evpn_text
 from .. import igp as igp_text
 from .. import routemap as routemap_text
@@ -320,6 +321,8 @@ class _Reader:
             m.ssh = True
         elif w[1] == "lldp":
             m.lldp = True
+        elif w[1] == "pim":
+            self.device.multicast_routing = True  # NX-OS: no ip multicast-routing; the feature routes multicast
         return True
 
     @staticmethod
@@ -843,6 +846,8 @@ class _Reader:
         if w[1:3] == ["multicast-routing", "vrf"] and len(w) in (4, 5) and w[4:] in ([], ["distributed"]):
             multicast_text.vrf(self.device, w[3]).routing = True
             return True
+        if w[1:2] == ["pim"] and self.nxos and len(w) >= 3:
+            return nxosmcast.read_pim(self.device, "", w[2:])
         if w[1:2] == ["pim"] and "rp-address" in w:
             return multicast_text.ios_rp(self.device, w[2:])
         if w[1:3] == ["msdp", "peer"] and len(w) >= 4:
@@ -3140,6 +3145,8 @@ class _Reader:
                 pass
             elif self.nxos and self._fabric.vrf_line(name, c):
                 pass
+            elif self.nxos and c[:2] == ["ip", "pim"] and len(c) >= 3 and nxosmcast.read_pim(self.device, name, c[2:]):
+                pass
             elif c[0] in ("ip", "ipv6") and c[1:2] == ["route"] and len(c) >= 4:  # NX-OS: routes in vrf context
                 if not self.route(child, ["vrf", name] + c[2:], 4 if c[0] == "ip" else 6):
                     self.unparsed(child, node.text)
@@ -3485,6 +3492,12 @@ class _Reader:
         w = node.words
         if w[1:2] == ["configuration"] and len(w) == 3 and w[2].isdigit() and self.device.platform == "ios":
             return self.vlan_configuration(node)
+        if w[1:2] == ["configuration"] and len(w) == 3 and self.nxos:
+            for vid in _vlan_ids(w[2]):
+                for child in node.children:
+                    if not nxosmcast.read_vlan_configuration(self.device, vid, child.words):
+                        self.unparsed(child, node.text)
+            return True
         if len(w) != 2:
             return False
         try:

@@ -13,7 +13,7 @@ from . import names
 from .model import Device, VrfMulticast
 from .report import Report, Severity
 
-SNOOPS_BY_DEFAULT = ("ios", "eos")  # the others snoop only the VLANs they are told to
+SNOOPS_BY_DEFAULT = ("ios", "eos", "nxos")  # the others snoop only the VLANs they are told to
 PIM_MODES = ("sparse", "dense", "sparse-dense")
 LABEL = "IGMP snooping"
 
@@ -77,7 +77,7 @@ def vrf(device: Device, name: str) -> VrfMulticast:
     return device.multicast_vrfs[name]
 
 
-def _add_rp(device: Device, vrf_name: str, rp: str, groups: str) -> None:
+def add_rp(device: Device, vrf_name: str, rp: str, groups: str) -> None:
     rps, rp_groups = (device.pim_rps, device.pim_rp_groups) if not vrf_name else \
         (vrf(device, vrf_name).rps, vrf(device, vrf_name).rp_groups)
     if rp not in rps:
@@ -99,7 +99,7 @@ def eos_pim_line(device: Device, vrf_name: str, w: List[str]) -> bool:
             groups = f"acl {w[4]}"
         else:
             return False
-        _add_rp(device, vrf_name, rp, groups)
+        add_rp(device, vrf_name, rp, groups)
         return True
     if w[0] == "anycast-rp" and n == 3 and not vrf_name:
         device.pim_anycast.setdefault(str(ipaddress.IPv4Address(w[1])), []).append(
@@ -118,7 +118,7 @@ def ios_rp(device: Device, w: List[str]) -> bool:
     rest = [x for x in w[2:] if x != "override"]
     if len(rest) > 1:
         return False
-    _add_rp(device, vrf_name, str(ipaddress.IPv4Address(w[1])), f"acl {rest[0]}" if rest else "")
+    add_rp(device, vrf_name, str(ipaddress.IPv4Address(w[1])), f"acl {rest[0]}" if rest else "")
     return True
 
 

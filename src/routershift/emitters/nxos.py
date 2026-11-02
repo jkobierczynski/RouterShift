@@ -24,6 +24,7 @@ from .. import fhrp
 from .. import hosts as hosts_text
 from .. import nxosaccess
 from .. import nxosfabric
+from .. import nxosmcast
 from .. import ospf as ospf_text
 from .. import partial
 from .. import routemap as routemap_text
@@ -43,7 +44,7 @@ HASHES = ("md5-crypt", "sha256-crypt", "sha512-crypt")
 MGMT_VRF = "management"
 PERMIT_ALL = "RS-PERMIT-ALL"  # the route map NX-OS needs for redistribution where the source had none
 WRITTEN = {"acl", "policy", "dhcp-relay", "fhrp", "speed", "storm", "stp-guards", "voice", "l2sec", "dot1x", "poe",
-           "dhcp", "aaa", "mlag", "vxlan"}
+           "dhcp", "aaa", "mlag", "vxlan", "multicast"}
 _MGMT_NAMES = {"mgmt-vrf", "mgmt-intf", "management", "mgmt"}
 
 
@@ -263,14 +264,17 @@ class Writer:
             vni = nxosfabric.vlan_vni(self.device, vid)
             if vni is not None:
                 self.out.append(f"{IND}vn-segment {vni}")
-            if vlan.igmp_querier:
-                self.report.add("vlan", str(vid), Severity.REVIEW, partial.CODE,
-                                "the IGMP querier is not written for NX-OS yet")
         self.out += nxosfabric.l3vni_vlan_lines(self.device, self.l3, IND)
         nxosfabric.trunk_groups(self.device, self.report)
         if self.device.vlans or self.l3:
             self.out.append("!")
         self.out += nxosfabric.anycast_mac_lines(self.device)
+        snooping = nxosmcast.snooping_lines(self.device, self.report, IND)
+        if snooping:
+            self.out += snooping + ["!"]
+        pim = nxosmcast.lines(self.device, self.report, self.port, self.features)
+        if pim:
+            self.out += pim + ["!"]
         l2sec = nxosaccess.l2sec_lines(self.device, self.report, self.features)
         if l2sec:
             self.out += l2sec + ["!"]
@@ -321,6 +325,7 @@ class Writer:
             elif name != MGMT_VRF:
                 self.out += nxosfabric.vrf_lines(self.device, sources[0], info, self.report, IND,
                                                  self._vrf_has_ipv6(sources[0]))
+                self.out += nxosmcast.vrf_lines(self.device, sources[0], self.report, IND)
             self.routes([r for r in self.device.static_routes if r.vrf and self.vrf(r.vrf) == name], IND)
         if names:
             self.out.append("!")
@@ -492,6 +497,7 @@ class Writer:
             self.features.add("dhcp")
         lines += nxosaccess.relay_lines(iface, self.vrf, self.port)
         lines += self.ospf_interface(iface)
+        lines += nxosmcast.interface_lines(iface, self.adder(label))
         lines += self.fhrp_lines(iface, name)
         return lines
 
