@@ -45,6 +45,7 @@ _ICMP_READ = {"inet": {**{v: k for k, v in _ICMP4.items()}, "echo": 8, "destinat
               "inet6": {v: k for k, v in _ICMP6.items()}}
 
 Add = Callable[..., None]
+MAC_MATCHES = ("source-mac-address", "destination-mac-address", "ether-type", "learn-vlan-id", "user-vlan-id")
 
 
 # writing ------------------------------------------------------------------------------------------------------------
@@ -285,8 +286,9 @@ def _ports(ports: str) -> List[str]:
     return [p for p in ports.split(",") if p]
 
 
-def filters(device: Device, add: Add, report: Report) -> Dict[str, str]:
-    """Each ACL as a firewall filter; returns ACL -> filter name."""
+def filters(device: Device, add: Add, report: Report, switching: Sequence[str] = ()) -> Dict[str, str]:
+    """Each ACL as a firewall filter, and as an ethernet-switching filter too when it is on a switch port (named in
+    ``switching``); returns ACL -> filter name."""
     names: Dict[str, str] = {}
     for acl in device.acls.values():
         name = acl_text.safe_name(acl.name)
@@ -294,34 +296,39 @@ def filters(device: Device, add: Add, report: Report) -> Dict[str, str]:
         names[acl.name] = name
         report.item("acl", label)
         family = "inet6" if acl.family == 6 else "inet"
-        base = ("firewall", f"family {family}", f"filter {name}")
-        remarks = 0
-        used = set()
-        for n, entry in enumerate(acl.entries, 1):
-            seq = entry.sequence or n * 10
-            while seq in used:
-                seq += 1
-            used.add(seq)
-            if entry.action == AclAction.REMARK:
-                remarks += 1
-                continue
-            if entry.unsupported:
-                report.add("acl", label, Severity.REVIEW, "acl-entry",
-                           f"entry '{entry.unsupported}' not converted; add it to the filter by hand")
-                continue
-            term = base + (f"term {seq}",)
-            words = from_words(entry, acl.family, label, report)
-            for word in words:
-                add(*term, "from", word)
-            if entry.log:
-                add(*term, "then log")
-            add(*term, "then", "accept" if entry.action == AclAction.PERMIT else "discard")
-        if remarks:
-            report.add("acl", label, Severity.APPROX, "acl-remark",
-                       "Junos filter terms have no remarks; the remarks are left out")
-        if not acl.entries:
-            add(*base, "term default", "then discard")
+        _filter(acl, ("firewall", f"family {family}", f"filter {name}"), add, report, label, False)
+        if acl.name in switching and acl.family != 6:
+            _filter(acl, ("firewall", "family ethernet-switching", f"filter {name}"), add, report, label, True)
     return names
+
+
+def _filter(acl: Acl, base: Tuple[str, ...], add: Add, report: Report, label: str, switch: bool) -> None:
+    remarks = 0
+    used = set()
+    for n, entry in enumerate(acl.entries, 1):
+        seq = entry.sequence or n * 10
+        while seq in used:
+            seq += 1
+        used.add(seq)
+        if entry.action == AclAction.REMARK:
+            remarks += 1
+            continue
+        if entry.unsupported:
+            report.add("acl", label, Severity.REVIEW, "acl-entry",
+                       f"entry '{entry.unsupported}' not converted; add it to the filter by hand")
+            continue
+        term = base + (f"term {seq}",)
+        words = from_words(entry, acl.family, label, report)
+        for word in to_switching(words) if switch else words:
+            add(*term, "from", word)
+        if entry.log:
+            add(*term, "then log")
+        add(*term, "then", "accept" if entry.action == AclAction.PERMIT else "discard")
+    if remarks and not switch:
+        report.add("acl", label, Severity.APPROX, "acl-remark",
+                   "Junos filter terms have no remarks; the remarks are left out")
+    if not acl.entries:
+        add(*base, "term default", "then discard")
 
 
 def from_words(entry: AclEntry, family: int, label: str, report: Report) -> List[str]:
@@ -344,6 +351,19 @@ def from_words(entry: AclEntry, family: int, label: str, report: Report) -> List
         out.append(f"icmp-type {names.get(entry.icmp_type, str(entry.icmp_type))}")
     if entry.established:
         out.append("tcp-established")
+    return out
+
+
+_TO_SWITCHING = {"source-address": "ip-source-address", "destination-address": "ip-destination-address",
+                 "protocol": "ip-protocol"}
+
+
+def to_switching(words: List[str]) -> List[str]:
+    """The matches of an inet filter term in the words of an ethernet-switching filter."""
+    out = []
+    for word in words:
+        key, _, value = word.partition(" ")
+        out.append(f"{_TO_SWITCHING.get(key, key)} {value}".strip())
     return out
 
 
@@ -389,6 +409,7 @@ class Reader:
         self.community_lines: Dict[str, int] = {}
         self.filters: Dict[Tuple[str, str], Policy] = {}  # (family, name)
         self.qos_filters: Dict[Tuple[str, str], Policy] = {}  # filters with QoS actions
+        self.mac_filters: Dict[str, Policy] = {}  # ethernet-switching filters that match MAC addresses
         self.route_filters: Dict[str, str] = {}  # route-filter-list or prefix-list name -> kind
         self.used_as_export: Dict[str, str] = {}  # policy -> what exports it ("bgp", "ospf", ...)
         self.aggregates: Dict[str, List[BgpAggregate]] = {}  # export policy -> the aggregates it announces
@@ -471,6 +492,10 @@ class Reader:
             if any(t and t[0] in ("policer", "dscp", "forwarding-class", "loss-priority")
                    for term in policy.terms.values() for t in term.thens):
                 self.qos_filters[(family, name)] = policy  # a QoS policy: read with class of service
+                continue
+            if family == "ethernet-switching" and any(f and f[0] in MAC_MATCHES for term in policy.terms.values()
+                                                      for f in term.froms):
+                self.mac_filters[name] = policy  # a MAC ACL
                 continue
             if family == "ethernet-switching":
                 if ("inet", name) in self.filters:

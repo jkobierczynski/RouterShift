@@ -23,7 +23,9 @@ from .. import evpn as evpn_text
 from .. import fhrp as fhrp_text
 from .. import junospolicy
 from .. import junosqos
+from .. import junossec
 from .. import qos as qos_text
+from .. import security as security_text
 from .. import multicast as multicast_text
 from .. import ospf as ospf_text
 from .. import vrfs as vrfs_text
@@ -111,6 +113,7 @@ class Reader:
         self.switch_target = ""
         self.cos = junosqos.CosReader(self.device)
         self.filter_lists: Dict[Tuple[str, str], List[str]] = {}  # (interface, input|output) -> filters
+        self.macsec_ports: Dict[str, str] = {}  # port -> connectivity association
         self.rp_ranges: Dict[Tuple[str, str], List[str]] = {}  # (VRF, RP) -> group ranges
         self.local_rp = ""
         self.local_rp_ranges: List[str] = []
@@ -186,6 +189,8 @@ class Reader:
             "policy-options": lambda s: self.policy.policy_options(s.line, s.words[1:]),
             "firewall": self.firewall,
             "class-of-service": lambda s: self.cos.statement(s.words[1:]),
+            "security": lambda s: s.words[1:2] == ["macsec"] and len(s.words) > 3 and
+            junossec.read_macsec(self.device, s.words[2:], self.macsec_ports),
             "forwarding-options": lambda s: self.forwarding_options(s, s.words[1:], ""),
             "switch-options": self.switch_options, "poe": self.poe_line, "multi-chassis": self.multi_chassis, "access": lambda s: self.access(s.words[1:], ""),
         }
@@ -486,6 +491,8 @@ class Reader:
         sy = self.device.system
         if not w:
             return False
+        if w[:2] == ["ddos-protection", "protocols"]:
+            return junossec.read_ddos(self.device, w[2:])
         if w[0] == "host-name" and len(w) == 2:
             sy.hostname = w[1]
         elif w[0] == "domain-name" and len(w) == 2:
@@ -746,6 +753,9 @@ class Reader:
         return True
 
     def access(self, w: List[str], vrf: str) -> bool:
+        if w[0] == "radius-disconnect-port" and len(w) == 2 and not vrf:
+            self.device.aaa.coa = True
+            return True
         if w[0] == "profile" and len(w) >= 3:
             # the access profile 802.1X uses: its servers are the system's RADIUS servers
             return w[2] in ("authentication-order", "radius") or w[2:3] == ["radius-server"]
@@ -1358,12 +1368,33 @@ class Reader:
                 else:
                     unread(0, f"set interfaces {name} family inet filter {direction}-list {f}",
                            "RouterShift keeps one ACL and one QoS policy per direction")
+        for name, policy in self.policy.mac_filters.items():
+            junossec.read_mac_filter(dev, policy, unread)
         for iface in dev.interfaces.values():
             for way in ("in", "out"):
                 acl = getattr(iface, f"acl_{way}")
                 if acl and acl in dev.qos_policies and acl not in dev.acls:
                     setattr(iface, f"qos_policy_{way}", acl)
                     setattr(iface, f"acl_{way}", "")
+                elif acl and acl in dev.mac_acls and acl not in dev.acls:
+                    setattr(iface, f"mac_acl_{way}", acl)
+                    setattr(iface, f"acl_{way}", "")
+            # the loopback's input filter guards the routing engine; so does the management port's
+            if iface.kind in (InterfaceKind.LOOPBACK, InterfaceKind.MANAGEMENT) and iface.acl_in:
+                cp = security_text.control_plane(dev)
+                cp.acls[iface.vrf if iface.vrf or iface.kind == InterfaceKind.LOOPBACK else MGMT_INSTANCE] = \
+                    iface.acl_in
+                iface.acl_in = ""
+        if dev.control_plane is not None:
+            cp = dev.control_plane
+            cp.acls = dict(sorted(cp.acls.items(), key=lambda kv: kv[0] != ""))
+        for port, profile in self.macsec_ports.items():
+            secured = self.canonical(port)
+            if secured is None:
+                unread(0, f"set security macsec interfaces {port} connectivity-association {profile}",
+                       "an interface RouterShift does not know")
+            else:
+                secured.macsec_profile = profile
 
     def canonical(self, unit: str) -> Optional[Interface]:
         name = self.units.get(unit) or self.units.get(f"{unit}.0") or self.ifds.get(unit)

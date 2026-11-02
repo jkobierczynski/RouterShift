@@ -101,5 +101,5 @@ def test_ios_security_to_eos() -> None:
 
 
 def test_security_is_reported_on_other_targets() -> None:
-    out, report = convert(EOS, "eos", "junos")
+    out, report = convert(EOS, "eos", "comware")
     assert "not written for" in report.to_text()

@@ -26,7 +26,7 @@ from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from . import qos as qos_text
 from . import queuing as queuing_text
-from .junospolicy import Policy, Reader as PolicyReader, Term, from_words, to_inet
+from .junospolicy import Policy, Reader as PolicyReader, Term, from_words, to_inet, to_switching
 from .model import Acl, AclAction, Device, Interface, QosAction, QosClass, QosPolicy, QosProfile, QosQueue
 from .report import Report, Severity
 
@@ -298,18 +298,6 @@ def _policy_filter(device: Device, policy: QosPolicy, family: str, add: Add, rep
         report.add(KIND, label, Severity.APPROX, "qos-mark",
                    "marking is the filter action 'dscp'; switches that cannot rewrite DSCP in a filter (QFX) mark "
                    "through a forwarding class and a DSCP rewrite rule instead")
-
-
-_TO_SWITCHING = {"source-address": "ip-source-address", "destination-address": "ip-destination-address",
-                 "protocol": "ip-protocol"}
-
-
-def to_switching(words: List[str]) -> List[str]:
-    out = []
-    for word in words:
-        key, _, value = word.partition(" ")
-        out.append(f"{_TO_SWITCHING.get(key, key)} {value}".strip())
-    return out
 
 
 # reading ------------------------------------------------------------------------------------------------------------

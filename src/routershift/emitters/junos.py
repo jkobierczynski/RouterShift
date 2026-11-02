@@ -27,6 +27,7 @@ from .. import l2sec as l2sec_text
 from .. import multicast as multicast_text
 from .. import junospolicy
 from .. import junosqos
+from .. import junossec
 from .. import ospf as ospf_text
 from .. import partial
 from .. import snmp as snmp_text
@@ -112,6 +113,7 @@ class Writer:
         self.snooping()
         self.multicast()
         self.cos()
+        self.security()
         self.dhcp_relay()
         self.dhcp_server()
         self.aaa()
@@ -590,17 +592,31 @@ class Writer:
                 for name in names:
                     self.add(*path, f"family {family}", "filter", f"{direction}-list {name}")
 
+    @staticmethod
+    def is_switch_port(iface: Interface) -> bool:
+        return iface.mode != SwitchportMode.ROUTED and iface.kind in (InterfaceKind.ETHERNET, InterfaceKind.LAG)
+
     def switch_filters(self, iface: Interface, switching: Tuple[str, ...]) -> None:
-        """QoS policies of a switch port, as ethernet-switching filters."""
-        for qos, direction in ((iface.qos_policy_in, "input"), (iface.qos_policy_out, "output")):
-            if qos:
-                self.add(*switching, "filter", f"{direction} {qos}")
+        """The ACL, MAC ACL or QoS policy of a switch port, as an ethernet-switching filter: a port takes one each
+        way."""
+        label = self.label(iface)
+        for acl, mac, qos, acl6, direction in (
+                (iface.acl_in, iface.mac_acl_in, iface.qos_policy_in, iface.acl6_in, "input"),
+                (iface.acl_out, iface.mac_acl_out, iface.qos_policy_out, iface.acl6_out, "output")):
+            names = [n for n in (self.filter_names.get(acl, acl) if acl else "", mac, qos) if n]
+            if names:
+                self.add(*switching, "filter", f"{direction} {names[0]}")
+            if names[1:]:
+                self.report.add("interface", label, Severity.REVIEW, "switch-filters",
+                                f"a Junos switch port takes one {direction} filter: {names[0]} is applied, "
+                                + ", ".join(names[1:]) + " not; merge their terms into one filter")
+            if acl6:
+                self.report.add("interface", label, Severity.REVIEW, "switch-filters",
+                                f"the IPv6 ACL {acl6} has no ethernet-switching form; not applied")
 
     def leftovers(self, iface: Interface) -> None:
         """What a port carries that this writer does not write yet."""
-        written = set(PORT_WRITTEN)
-        if iface.mode == SwitchportMode.ROUTED or iface.kind not in (InterfaceKind.ETHERNET, InterfaceKind.LAG):
-            written.add("acl")
+        written = set(PORT_WRITTEN) | {"acl"}
         partial.port(iface, self.report, self.label(iface), PLATFORM, written)
         if iface.cdp:
             self.report.add("interface", self.label(iface), Severity.APPROX, "cdp", "Junos has no CDP")
@@ -612,7 +628,10 @@ class Writer:
         self.prefix_kinds = junospolicy.prefix_lists(dev, self.add, self.report)
         self.communities = junospolicy.lists(dev, self.add, self.report)
         junospolicy.policies(dev, self.add, self.report, self.prefix_kinds, self.communities)
-        self.filter_names = junospolicy.filters(dev, self.add, self.report)
+        switching = {i.acl_in for i in dev.interfaces.values() if self.is_switch_port(i)} | \
+            {i.acl_out for i in dev.interfaces.values() if self.is_switch_port(i)}
+        self.filter_names = junospolicy.filters(dev, self.add, self.report, sorted(switching - {""}))
+        junossec.mac_filters(dev, self.add, self.report)
 
     # SNMP --------------------------------------------------------------------------------------------------------
 
@@ -1244,13 +1263,27 @@ class Writer:
                 vids += [v for v in range(int(low), int(high or low) + 1) if v in self.vlan_names]
         return vids
 
+    # security ----------------------------------------------------------------------------------------------------
+
+    def security(self) -> None:
+        dev = self.device
+
+        def loopback_unit(vrf: str) -> Optional[str]:
+            lo = next((i for i in dev.interfaces.values() if i.kind == InterfaceKind.LOOPBACK and i.vrf == vrf), None)
+            return self.unit_name(lo.name).split(".", 1)[1] if lo is not None else None
+
+        junossec.control_plane(dev, self.add, self.report, sorted(self.mgmt_vrfs), loopback_unit,
+                               lambda acl: self.filter_names.get(acl, acl))
+        junossec.macsec(dev, self.add, self.report, self.port)
+        junossec.coa(dev, self.add, self.report)
+
     # class of service --------------------------------------------------------------------------------------------
 
     def cos(self) -> None:
         dev = self.device
         families: Dict[str, Set[str]] = {}
         for iface in dev.interfaces.values():
-            switch = iface.mode != SwitchportMode.ROUTED and iface.kind in (InterfaceKind.ETHERNET, InterfaceKind.LAG)
+            switch = self.is_switch_port(iface)
             for name in (iface.qos_policy_in, iface.qos_policy_out):
                 if name:
                     families.setdefault(name, set()).add("ethernet-switching" if switch else "inet")
