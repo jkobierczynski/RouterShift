@@ -29,6 +29,7 @@ from .. import aoscxfabric as fabric
 from .. import aoscxqos
 from .. import aoscxsec
 from .. import aoscxmon
+from .. import aoscxmgmt
 from .. import multicast as multicast_text
 from .. import routemap as routemap_text
 from .. import bgp as bgp_text
@@ -91,6 +92,9 @@ class _Reader:
         self._gateways6: Dict[str, List[str]] = {}  # interface -> active-gateway ipv6 addresses
         self._vsf_links: Dict[str, int] = {}  # vsf member link ports -> link number
         self._schedule: Dict[str, str] = {}  # port -> the schedule profile it applies
+        self._user_keys: Dict[str, List[str]] = {}  # user -> authorized-key lines
+        self._user_groups: Dict[str, str] = {}  # user -> a user group of the switch's own
+        self._rest_api = False
         self._lldp: Dict[str, int] = {}  # lldp holdtime-multiplier and management address, resolved at the end
 
     def unparsed(self, node: Node, section: str = "") -> None:
@@ -105,6 +109,8 @@ class _Reader:
         for banner in banners:
             if banner.kind == "motd":
                 self.device.system.banner_motd = banner.text
+            elif banner.kind == "exec":
+                self.device.system.banner_exec = banner.text
             else:
                 self.device.unparsed.append(Unparsed(banner.line, f"banner {banner.kind}", "banner"))
         handlers: Dict[str, Callable[[Node], bool]] = {
@@ -151,6 +157,9 @@ class _Reader:
             "cli-session": self.cli_session,
             "lldp": lambda node: node.words == ["lldp"] and self._set_lldp(True) or
             aoscxmon.read_lldp(self.device, node.words, self._lldp),
+            "user-group": lambda node: len(node.words) == 2 and self.policy_node(
+                node, aoscxmgmt.read_user_group(self.device, node.words[1], [c.words for c in node.children])),
+            "password": self.password,
             "track": lambda node: aoscxmon.read_track(self.device, node.words, lambda x: canonical(x)[0], node.line,
                                                       node.text),
             "no": self.no,
@@ -327,16 +336,20 @@ class _Reader:
     def user(self, node: Node) -> bool:
         """user U group G password plaintext|ciphertext X"""
         w = node.words
+        if aoscxmgmt.read_user_line(self.device, w, self._user_keys):
+            return True
         if len(w) != 7 or w[2] != "group" or w[4] != "password" or w[5] not in ("plaintext", "ciphertext"):
             return False
         privilege = aaa_text.privilege(w[3], AOSCX_ROLES)
+        if privilege is None:  # a user group of the switch's own
+            self._user_groups[w[1]] = w[3]
         user = LocalUser(w[1], privilege, origin=Origin(node.line, node.text))
         if w[5] == "plaintext":
             user.password = w[6]
         else:
             user.password_hash, user.hash_type = w[6], "aoscx-ciphertext"
         self.device.users.append(user)
-        return privilege is not None
+        return True
 
     def _key(self, args: List[str]) -> str:
         """key plaintext|ciphertext K: the key, '' when encrypted."""
@@ -421,6 +434,8 @@ class _Reader:
             else:
                 a.methods.append(AaaMethod(w[1], w[2], methods, w[3], 15 if w[2] == "commands" else None,
                                            origin=origin))
+                if w[1:4] == ["authentication", "login", "console"]:
+                    self.device.management.console_login = "console"  # the console's own list
             return True
         return False
 
@@ -447,6 +462,9 @@ class _Reader:
     def server(self, node: Node) -> bool:
         """ssh server vrf V, https-server vrf V."""
         w = node.words
+        if w == ["https-server", "rest", "access-mode", "read-write"]:
+            self._rest_api = True
+            return True
         args = w[2:] if w[:2] == ["ssh", "server"] else w[1:] if w[0] == "https-server" else []
         if len(args) != 2 or args[0] != "vrf":
             return False
@@ -454,6 +472,18 @@ class _Reader:
         setattr(m, "ssh" if w[0] == "ssh" else "https", True)
         if w[0] == "ssh" and (not m.vrf or args[1] != "default"):
             m.vrf = "" if args[1] == "default" else args[1]
+        return True
+
+    def password(self, node: Node) -> bool:
+        """password complexity / minimum-length N / enable."""
+        if node.words != ["password", "complexity"]:
+            return False
+        for child in node.children:
+            c = child.words
+            if c[0] == "minimum-length" and len(c) == 2 and c[1].isdigit():
+                self.device.management.password_min_length = int(c[1])
+            elif c != ["enable"]:
+                self.unparsed(child, node.text)
         return True
 
     def cli_session(self, node: Node) -> bool:
@@ -500,8 +530,14 @@ class _Reader:
 
     def logging(self, node: Node) -> bool:
         args = self._service_vrf(node.words[1:])
-        if len(args) == 3 and args[1] == "severity" and mgmt_text.level(args[2]) is not None:
-            self.device.system.logging_level = mgmt_text.level(args[2])
+        if len(args) >= 3 and args[-2] == "severity" and mgmt_text.level(args[-1]) is not None:
+            self.device.system.logging_level = mgmt_text.level(args[-1])
+            args = args[:-2]
+        if len(args) in (2, 3) and args[1] in ("udp", "tcp", "tls") and _is_address(args[0]):
+            default = {"udp": 514, "tcp": 1470, "tls": 6514}[args[1]]
+            port = int(args[2]) if len(args) == 3 else default
+            if args[1] != "udp" or port != default:
+                self.device.system.syslog_transport[args[0]] = (args[1], port)
             args = args[:1]
         if len(args) == 1 and _is_address(args[0]):
             self.device.system.syslog_servers.append(args[0])
@@ -1377,6 +1413,7 @@ class _Reader:
         qos_text.adopt(self.device, self._class_acls)
         aoscxqos.finish(self.device, self._schedule)
         aoscxmon.finish_lldp(self.device, self._lldp)
+        aoscxmgmt.finish(self.device, self._user_keys, self._user_groups, self._rest_api)
         if self.device.vxlan is not None and self._vxlan_source:
             self.device.vxlan.source_interface = vxlan_text.interface_of(self.device, self._vxlan_source)
         if self._sflow_global and not monitor_text.sflow_ports(self.device):

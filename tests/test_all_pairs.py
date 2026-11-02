@@ -200,7 +200,8 @@ def test_converts_and_reads_back(source: str, target: str) -> None:
                                                                          and target not in ("ios", "comware"))
     assert m2.http == (None if target in ("aoscx", "eos") else m1.http)
     # RESTCONF, the IOS stand-in for the EOS eAPI, runs on the HTTPS server
-    assert m2.https == (None if target == "eos" else True if target == "ios" and "http" in m1.apis else m1.https)
+    assert m2.https == (None if target == "eos" else
+                        True if target in ("ios", "aoscx") and "http" in m1.apis else m1.https)
     assert m2.vty_acl == (safe_name(m1.vty_acl) if target in ("ios", "eos") else "")
     assert m2.lldp == (None if target == "aoscx" and m1.lldp else m1.lldp)
     assert m2.cdp == (m1.cdp if target in ("ios", "aoss") else None)

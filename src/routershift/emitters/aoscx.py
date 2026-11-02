@@ -21,6 +21,7 @@ from .. import aoscxfabric as fabric
 from .. import aoscxqos
 from .. import aoscxsec
 from .. import aoscxmon
+from .. import aoscxmgmt
 from .. import routemap as routemap_text
 from .. import bgp as bgp_text
 from .. import dhcp as dhcp_text
@@ -138,10 +139,7 @@ class Writer:
                 rep.add("system", "time zone", Severity.REVIEW, "timezone",
                         f"time zone '{s.timezone}' is a name with an offset; AOS-CX takes a zone of the tz database "
                         "(clock timezone europe/brussels); set it by hand")
-        if s.banner_motd:
-            delim = "^" if "^" not in s.banner_motd else "%"
-            self.out += [f"banner motd {delim}", s.banner_motd, delim]
-            rep.item("system", "banner motd")
+        self.out += aoscxmgmt.banner_lines(self.device, rep)
         via = f" vrf {self.vrf(s.service_vrf)}" if s.service_vrf else ""
         for key in s.ntp_keys.values():
             rep.item("system", f"ntp key {key.number}")
@@ -176,7 +174,11 @@ class Writer:
         self.out += [f"ip dns host {name} {address}" for name, address in s.dns_hosts.items()]
         severity = f" severity {mgmt_text.SHORT[s.logging_level]}" if s.logging_level is not None else ""
         for host in s.syslog_servers:
-            self.out.append(f"logging {host}{severity}{via}")
+            self.out.append(f"logging {host}{aoscxmgmt.syslog_transport(self.device, host)}{severity}{via}")
+        for host, (protocol, _) in s.syslog_transport.items():
+            if protocol == "tls":
+                rep.add("system", "syslog servers", Severity.APPROX, "syslog-tls",
+                        f"TLS to {host} also needs the server's CA certificate on the switch (crypto pki ta-profile)")
         if s.syslog_servers:
             rep.item("system", "syslog servers")
         if s.logging_level is not None:
@@ -189,6 +191,8 @@ class Writer:
             rep.item("system", "syslog source")
         self.management()
         self.snmp()
+        aoscxmgmt.unwritable(self.device, rep)
+        self.out += aoscxmgmt.role_lines(self.device, rep, _IND)
         self.users()
         self.aaa()
         self.out.append("!")
@@ -226,8 +230,10 @@ class Writer:
         vrf = self.vrf(m.vrf) if m.vrf else MGMT_VRF if mgmt else "default"
         if m.ssh:
             self.out.append(f"ssh server vrf {vrf}")
-        if m.https:
+        if m.https or "http" in m.apis:
             self.out.append(f"https-server vrf {vrf}")
+        self.out += aoscxmgmt.api_lines(d, rep, vrf)
+        self.out += aoscxmgmt.password_lines(d, rep, _IND)
         mgmt_text.no_server(rep, "telnet server", "AOS-CX", m.telnet)
         mgmt_text.no_server(rep, "http server", "AOS-CX", m.http)
         if m.vty_acl:
@@ -250,19 +256,24 @@ class Writer:
             label = aaa_text.user_label(u)
             found = aaa_text.password(u, ("aoscx-ciphertext",), self.report)
             if found is None:
+                left = [w for w, v in ((f"its role {u.role}", u.role), ("its SSH public keys", u.ssh_keys)) if v]
+                if left:
+                    self.report.add("management", label, Severity.REVIEW, "user-left-out",
+                                    f"{' and '.join(left)} go with it")
                 continue
             form, value = found
             if form == "none":
                 self.report.skip("management", label, "no-password",
                                  "the user has no password in the source; AOS-CX needs one, create it by hand")
                 continue
-            group = aaa_text.role(u.privilege, AOSCX_ROLES)
+            group = aoscxmgmt.user_group(self.device, u) or aaa_text.role(u.privilege, AOSCX_ROLES)
             self.report.item("management", label)
-            if u.privilege not in (None, 1, 15):
+            if u.privilege not in (None, 1, 15) and not aoscxmgmt.user_group(self.device, u):
                 self.report.add("management", label, Severity.APPROX, "privilege",
                                 f"privilege {u.privilege} becomes group {group}; AOS-CX has no levels in between")
             self.out.append(f"user {u.name} group {group} password "
                             f"{'plaintext' if form == 'plain' else 'ciphertext'} {value}")
+            self.out += aoscxmgmt.ssh_key_lines(u)
 
     def aaa(self) -> None:
         a = self.device.aaa
@@ -325,7 +336,14 @@ class Writer:
             service = {"login": "login", "commands": "commands", "exec": "all-mgmt"}[m.service]
             if m.kind == "accounting":
                 service, accounting_written = "all-mgmt", True
-            words = [f"aaa {m.kind} {service} {m.name}"] + ([m.record] if m.record else [])
+            name = m.name
+            console = self.device.management.console_login
+            if m.kind == "authentication" and m.service == "login" and console and m.name == console:
+                name = "console"  # AOS-CX names the list by the channel it serves
+                if console != "console":
+                    rep.add("management", label, Severity.APPROX, "console-login",
+                            f"the console's list {console} is written as the AOS-CX console list")
+            words = [f"aaa {m.kind} {service} {name}"] + ([m.record] if m.record else [])
             if groups:
                 words.append("group " + " ".join(groups + rest))
             else:
