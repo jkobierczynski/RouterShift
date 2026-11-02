@@ -983,6 +983,10 @@ class _Reader:
             peer.route_reflector_client = True
         elif args == ["remove-private-as"]:
             peer.remove_private_as = True
+        elif args[0] == "local-as" and len(args) >= 2:
+            peer.local_as, peer.local_as_options = args[1], " ".join(args[2:])
+        elif args[0] == "ttl-security-hops" and len(args) == 2:
+            peer.ttl_security = int(args[1])
         elif args[0] == "maximum-prefix" and len(args) in (2, 3):
             peer.maximum_prefix = int(args[1])
             peer.maximum_prefix_warning = int(args[2]) if len(args) == 3 else None

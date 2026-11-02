@@ -1026,7 +1026,8 @@ class Writer:
             label = f"neighbor {peer.address}{where}"
             self.report.item("bgp", label)
             bgp_text.unwritten(peer, {"password", "timers", "route_reflector_client", "remove_private_as",
-                                      "allowas_in", "maximum_prefix", "maximum_prefix_warning"}, self.report, label,
+                                      "remove_private_as_mode", "allowas_in", "maximum_prefix",
+                                      "maximum_prefix_warning", "local_as", "ttl_security"}, self.report, label,
                                "AOS-CX")
             pre = f"neighbor {peer.address}"
             if peer.remote_as:
@@ -1048,6 +1049,15 @@ class Writer:
                              f"{peer.hold if peer.hold is not None else 180}")
             if peer.remove_private_as:
                 lines.append(f"{pre} remove-private-as")
+                if peer.remove_private_as_mode:
+                    self.report.add("bgp", label, Severity.APPROX, "bgp-remove-private",
+                                    f"remove-private-as {peer.remove_private_as_mode} is written as remove-private-as: "
+                                    "AOS-CX takes out the private AS numbers at the start of the path only")
+            if peer.local_as:
+                lines.append(f"{pre} local-as {peer.local_as}" +
+                             (f" {peer.local_as_options}" if peer.local_as_options else ""))
+            if peer.ttl_security is not None:
+                lines.append(f"{pre} ttl-security-hops {peer.ttl_security}")
         for af in ("ipv4", "ipv6"):
             body: List[str] = []
             for peer in neighbors:

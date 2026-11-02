@@ -3,6 +3,7 @@ written and read back."""
 
 from helpers import sample
 
+from routershift import bgp as bgp_text
 from routershift.convert import convert, parse
 
 EOS = sample("eos_border_leaf.cfg")
@@ -96,3 +97,15 @@ def test_global_router_id() -> None:
     first, out, report, back = _back(eos, "eos")
     assert "bgp router-id 10.9.9.9" in out
     assert _findings(report, "router-id")
+
+
+def test_neighbor_options() -> None:
+    first, out, report, back = _back(EOS, "eos")
+    isp = {n.address: n for n in back.bgp.vrfs["INET"].neighbors}
+    src = {n.address: n for n in first.bgp.vrfs["INET"].neighbors}
+    for address, peer in isp.items():
+        want = bgp_text.effective(first.bgp, src[address], first.bgp.vrfs["INET"])
+        assert (peer.local_as, peer.ttl_security, peer.remove_private_as) == \
+            (want.local_as, want.ttl_security, want.remove_private_as), address
+    assert not _findings(report, "bgp-option")
+    assert _findings(report, "bgp-remove-private")
