@@ -30,6 +30,7 @@ from .. import tracking as tracking_text
 from .. import vxlan as vxlan_text
 from .. import nxosfabric
 from .. import nxosmcast
+from .. import nxosqos
 from .. import evpn as evpn_text
 from .. import igp as igp_text
 from .. import routemap as routemap_text
@@ -181,6 +182,7 @@ class _Reader:
         self._syslog_hosts: List[Tuple[Node, str, str]] = []  # every logging host line, its address and VRF
         self._pbr_policies: List[Node] = []
         self._policy_nodes: Dict[str, Node] = {}
+        self._nxos_queuing: Dict[str, str] = {}  # NX-OS: port -> its service-policy type queuing output
         self._copp_classes: Dict[str, str] = {}  # EOS class-map type copp -> its ACL  # IOS: every policy-map, for the control-plane policy
         self._macsec_chains: Dict[str, List[Tuple[str, str]]] = {}  # IOS key chain NAME macsec -> (CKN, CAK)
         self._macsec_ports: Dict[str, str] = {}  # IOS: port -> its mka pre-shared-key key chain
@@ -1200,7 +1202,7 @@ class _Reader:
             c = child.words
             try:
                 if c[:2] == ["match", "dscp"] or c[:3] == ["match", "ip", "dscp"]:
-                    qos_class.dscp += [qos_text.dscp(x) for x in c[2 + (c[1] == "ip"):]]
+                    qos_class.dscp += [qos_text.dscp(x) for v in c[2 + (c[1] == "ip"):] for x in v.split(",") if x]
                     continue
                 if c[:2] == ["match", "access-group"] and len(c) in (3, 4) or \
                         c[:3] == ["match", "ip", "access-group"] and len(c) == 4:
@@ -1234,6 +1236,16 @@ class _Reader:
                     if not ok:
                         self.unparsed(line, f"{node.text} / {child.text}")
                 cp.classes.append(cls)
+            return True
+        if self.nxos and w[:1] == ["type"] and len(w) == 3 and w[1] in ("qos", "queuing"):
+            children = [(c.words, [g.words for g in c.children]) for c in node.children]
+            read = nxosqos.read_policy if w[1] == "qos" else nxosqos.read_queuing
+            for n, k in read(self.device, w[2], children):
+                child = node.children[n]
+                if k < 0:
+                    self.unparsed(child, node.text)
+                else:
+                    self.unparsed(child.children[k], f"{node.text} / {child.text}")
             return True
         if w[:2] == ["type", "quality-of-service"]:
             w = w[2:]
@@ -4048,6 +4060,8 @@ class _Reader:
             iface.isis_metric = int(w[2])
         elif w == ["isis", "network", "point-to-point"]:
             iface.isis_network = "point-to-point"
+        elif self.nxos and w[:4] == ["service-policy", "type", "queuing", "output"] and n == 5:
+            self._nxos_queuing[iface.name] = w[4]
         elif w[0] == "service-policy" and n in (3, 5):
             # IOS: service-policy input|output P; EOS: service-policy type qos input P
             args = w[3:] if w[1:3] == ["type", "qos"] else w[1:]
@@ -4185,6 +4199,8 @@ class _Reader:
         self._finish_syslog()
         self._finish_copp()
         self._finish_qos()
+        if self.nxos:
+            nxosqos.finish(self.device, self._nxos_queuing)
         self._finish_macsec()
         for name, template in self._bfd_ports.items():
             port_ = self.device.interfaces.get(name)

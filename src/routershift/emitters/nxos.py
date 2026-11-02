@@ -25,6 +25,7 @@ from .. import hosts as hosts_text
 from .. import nxosaccess
 from .. import nxosfabric
 from .. import nxosmcast
+from .. import nxosqos
 from .. import ospf as ospf_text
 from .. import partial
 from .. import routemap as routemap_text
@@ -44,7 +45,7 @@ HASHES = ("md5-crypt", "sha256-crypt", "sha512-crypt")
 MGMT_VRF = "management"
 PERMIT_ALL = "RS-PERMIT-ALL"  # the route map NX-OS needs for redistribution where the source had none
 WRITTEN = {"acl", "policy", "dhcp-relay", "fhrp", "speed", "storm", "stp-guards", "voice", "l2sec", "dot1x", "poe",
-           "dhcp", "aaa", "mlag", "vxlan", "multicast"}
+           "dhcp", "aaa", "mlag", "vxlan", "multicast", "qos"}
 _MGMT_NAMES = {"mgmt-vrf", "mgmt-intf", "management", "mgmt"}
 
 
@@ -61,6 +62,7 @@ class Writer:
         self.evpn = False  # nv overlay evpn, for the EVPN address family
         self.ospf_tags: Dict[int, str] = {}  # id of an Ospf -> the router ospf tag it is written under
         self.l3: Dict[str, int] = {}  # VRF -> the VLAN of its layer 3 VNI
+        self.qos = nxosqos.Writer(device, report, IND)
 
     def vrf(self, name: str) -> str:
         return MGMT_VRF if name in self.mgmt_vrfs else name
@@ -82,6 +84,7 @@ class Writer:
         self.snmp()
         self.acls()
         self.policies()
+        self.qos_lines()
         self.vlans()
         self.spanning_tree()
         self.out += nxosfabric.vpc_lines(self.device, self.report, IND, self.vrf)
@@ -251,6 +254,14 @@ class Writer:
         for rm in self.device.route_maps.values():
             self.out += routemap_text.ios_route_map_lines(rm, "nxos", self.report, IND)
 
+    def qos_lines(self) -> None:
+        lines = nxosqos.class_lines(self.device, self.report, IND)
+        lines += self.qos.lines()
+        lines += nxosqos.policy_lines(self.device, self.report, IND)
+        lines += nxosqos.copp(self.device, self.report)
+        if lines:
+            self.out += lines + ["!"]
+
     # layer 2 ---------------------------------------------------------------------------------------------------------
 
     def vlans(self) -> None:
@@ -415,6 +426,9 @@ class Writer:
         layer3 = iface.mode == SwitchportMode.ROUTED or not physical
         if layer3 and not iface.lag:
             lines += self.layer3(iface, name)
+        if not iface.lag:
+            lines += nxosqos.interface_policy_lines(self.device, iface, self.adder(label))
+            lines += self.qos.interface(iface, self.adder(label))
         for key, value in sorted(iface.storm_control.items()):
             if key in ("broadcast", "multicast", "unicast"):
                 lines.append(f"storm-control {key} level {value:.2f}")
