@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Dict, List, Tuple
 
-from . import known
+from . import __version__, known
 from .model import Unparsed
 
 
@@ -176,7 +176,7 @@ class Report:
         return result
 
     def to_text(self) -> str:
-        lines = [f"RouterShift report: {self.source} -> {self.target}", ""]
+        lines = [f"RouterShift {__version__} report: {self.source} -> {self.target}", ""]
         counts = self.counts()
         lines.append(", ".join(f"{counts[s]} {s}" for s in ("exact", "approximated", "needs-review", "skipped")
                                if s in counts) or "nothing converted")
@@ -195,6 +195,7 @@ class Report:
 
     def to_json(self) -> str:
         data = {
+            "version": __version__,
             "source": self.source,
             "target": self.target,
             "counts": self.counts(),

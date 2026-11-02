@@ -1,5 +1,11 @@
 # Changelog
 
+Every release of RouterShift, newest first. Versions follow [semantic versioning](https://semver.org): see
+[DEVELOPMENT.md](DEVELOPMENT.md#versions-and-releases) for what bumps which number while RouterShift is below 1.0.
+Each release is tagged `vX.Y.Z` in git.
+
+Add a line under "Unreleased" in every pull request that changes what RouterShift reads, writes or reports.
+
 ## Unreleased
 
 * Junos is written and read to the same depth as IOS and EOS: policy statements and firewall filters, port
@@ -24,34 +30,10 @@
   sample converts to NX-OS and back with no line left unread; what NX-OS lacks is flagged instead of labelled exact.
 * The EOS reader reads `ip address unnumbered`.
 * The text report shows the device security section (CoPP, MACsec).
+* The report names the RouterShift version that wrote it: in the first line of the text report and as `version` in
+  the JSON report.
 
-* The report lists what RouterShift recognises but does not convert once per feature, with the reason and the line
-  numbers ("Recognised, not converted"), and groups the remaining "Not understood" lines by block. A real IOS XE
-  core router went from 558 separate "not understood" items to none.
-* IOS XE: BGP peer templates, `address-family ipv4 vrf`, scrypt (`algorithm-type`) users and enable secret,
-  `interface range`, `spanning-tree portfast [bpduguard] default`, syslog hosts and sources in a VRF, RADIUS source
-  in a VRF, static NAT in a VRF with `extendable`.
-* BGP, on every platform that has it: BGP inside VRFs, session passwords, timers, route-reflector clients,
-  maximum-prefix, allowas-in, remove-private-as and maximum-paths.
-* Fixes: a static route's `tag` was read as its distance; per-VLAN spanning-tree priorities for a whole range
-  (`spanning-tree vlan 1-4094 priority`) became one line per VLAN; Junos IPv6 static routes and the management
-  port's description did not read back; AOS-S did not read a QoS policy on a VLAN; IP SLA lines were listed twice.
-
-* An item of the report is never "exact" when part of it was not converted: an interface, route map, BGP VRF, OSPF
-  process, VLAN or QoS policy with an unconverted line in its block is marked needs-review and names the lines, and
-  settings only the IOS and EOS writers write are listed on the other targets.
-* EOS to IOS, from a border leaf: anycast gateways (`ip address virtual`, written as the SVI's address with the
-  shared MAC), DHCP relay to a server in another VRF with its source interface, interface ranges such as
-  `Ethernet1/1-4/1`, SSH that runs only in a VRF (it was written as `transport input none`; `access-class` gets
-  `vrf-also`), the console login list (`line con 0`), `ntp local-interface vrf`, syslog hosts with port and
-  protocol, the notification types of `snmp-server enable traps`, the policer's burst, `storm-control all`, unicast
-  RPF, redirects, unreachables and proxy ARP, prefix lists with `eq`, community and AS-path lists and the route-map
-  clauses that use them, EVPN route targets and the export route map of a VRF, BGP and OSPF options (see SCOPE),
-  BGP peer groups defined in a VRF, the IPv6 address family of a BGP VRF, and static route tags.
-* Fixes: a route-map entry with an unread match clause was written without it (a deny that matched every route); an
-  EOS pbr policy written before its class maps was lost; `maximum-routes 0` (no limit) became a limit of 0.
-
-## 0.1.0 (first release)
+## 0.1.0 (2026-11-02, first release)
 
 The first release converts configurations between seven platforms: Cisco IOS / IOS XE, Cisco NX-OS, Arista EOS,
 Juniper Junos, HPE Aruba AOS-CX, AOS-S (ProCurve) and HPE Comware 7. It writes a fidelity report beside every
@@ -78,3 +60,31 @@ conversion.
   * HSRP and VRRP, DHCP relay, OSPF, BGP, spanning tree and LLDP
 * **Everything else** a platform cannot express, or that Junos and NX-OS do not write yet, is reported. Lines no
   reader understands are listed by line number, with secrets masked.
+
+Also in 0.1.0, beyond the list above:
+
+* The report lists what RouterShift recognises but does not convert once per feature, with the reason and the line
+  numbers ("Recognised, not converted"), and groups the remaining "Not understood" lines by block. A real IOS XE
+  core router went from 558 separate "not understood" items to none.
+* IOS XE: BGP peer templates, `address-family ipv4 vrf`, scrypt (`algorithm-type`) users and enable secret,
+  `interface range`, `spanning-tree portfast [bpduguard] default`, syslog hosts and sources in a VRF, RADIUS source
+  in a VRF, static NAT in a VRF with `extendable`.
+* BGP, on every platform that has it: BGP inside VRFs, session passwords, timers, route-reflector clients,
+  maximum-prefix, allowas-in, remove-private-as and maximum-paths.
+* Fixes: a static route's `tag` was read as its distance; per-VLAN spanning-tree priorities for a whole range
+  (`spanning-tree vlan 1-4094 priority`) became one line per VLAN; Junos IPv6 static routes and the management
+  port's description did not read back; AOS-S did not read a QoS policy on a VLAN; IP SLA lines were listed twice.
+
+* An item of the report is never "exact" when part of it was not converted: an interface, route map, BGP VRF, OSPF
+  process, VLAN or QoS policy with an unconverted line in its block is marked needs-review and names the lines, and
+  settings only the IOS and EOS writers write are listed on the other targets.
+* EOS to IOS, from a border leaf: anycast gateways (`ip address virtual`, written as the SVI's address with the
+  shared MAC), DHCP relay to a server in another VRF with its source interface, interface ranges such as
+  `Ethernet1/1-4/1`, SSH that runs only in a VRF (it was written as `transport input none`; `access-class` gets
+  `vrf-also`), the console login list (`line con 0`), `ntp local-interface vrf`, syslog hosts with port and
+  protocol, the notification types of `snmp-server enable traps`, the policer's burst, `storm-control all`, unicast
+  RPF, redirects, unreachables and proxy ARP, prefix lists with `eq`, community and AS-path lists and the route-map
+  clauses that use them, EVPN route targets and the export route map of a VRF, BGP and OSPF options (see SCOPE),
+  BGP peer groups defined in a VRF, the IPv6 address family of a BGP VRF, and static route tags.
+* Fixes: a route-map entry with an unread match clause was written without it (a deny that matched every route); an
+  EOS pbr policy written before its class maps was lost; `maximum-routes 0` (no limit) became a limit of 0.

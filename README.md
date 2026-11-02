@@ -19,7 +19,8 @@ which does the same for firewall policies.
 
 ## Status
 
-Alpha (0.1.0). Cisco IOS / IOS XE, Arista EOS, HPE Aruba AOS-CX, AOS-S (ProCurve) and
+Alpha: the current release is the top entry of [CHANGELOG.md](CHANGELOG.md), and `routershift --version` prints
+the one installed. Cisco IOS / IOS XE, Arista EOS, HPE Aruba AOS-CX, AOS-S (ProCurve) and
 HPE Comware 7 convert in every direction for the system settings (hostname,
 domain, DNS, NTP with authentication keys, syslog, banner, spanning tree (mode, priorities, MST region, port guards), SNMP
 communities, v3 users and notification hosts), VLANs, interfaces
