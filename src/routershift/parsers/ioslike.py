@@ -544,13 +544,17 @@ class _Reader:
         if w[1:2] == ["multicast-routing"] and w[2:] in ([], ["distributed"]):
             self.device.multicast_routing = True
             return True
+        if w[1:3] == ["multicast-routing", "vrf"] and len(w) in (4, 5) and w[4:] in ([], ["distributed"]):
+            multicast_text.vrf(self.device, w[3]).routing = True
+            return True
+        if w[1:2] == ["pim"] and "rp-address" in w:
+            return multicast_text.ios_rp(self.device, w[2:])
+        if w[1:3] == ["msdp", "peer"] and len(w) >= 4:
+            return multicast_text.ios_msdp(self.device, w[3:])
         if w[1:2] == ["community-list"] and not node.children:
             return routemap_text.ios_community_list(self.device, w)
         if w[1:3] == ["as-path", "access-list"] and not node.children:
             return routemap_text.ios_as_path_list(self.device, w)
-        if w[1:3] == ["pim", "rp-address"] and len(w) == 4:
-            self.device.pim_rps.append(str(ipaddress.IPv4Address(w[3])))
-            return True
         if w[1:2] == ["prefix-list"]:
             return self.policy_node(node, routemap_text.ios_prefix_list_node(
                 self.device, w, [c.words for c in node.children]))
@@ -1674,6 +1678,8 @@ class _Reader:
             return self._eos_multicast(node)
         if w[1:] == ["pim", "sparse-mode"] and self.device.platform == "eos":
             return self._eos_pim(node)
+        if w[1:] == ["msdp"] and self.device.platform == "eos":
+            return self._eos_msdp(node)
         if w[1:] == ["general"] and self.device.platform == "eos":
             return self._router_general(node)
         if w[1:] == ["rip"] and self.device.rip is None:
@@ -1687,14 +1693,30 @@ class _Reader:
         return False
 
     def _eos_multicast(self, node: Node) -> bool:
-        """EOS: router multicast / ipv4 / routing."""
+        """EOS: router multicast / ipv4 / routing, and the same under vrf V."""
+        def ipv4(block: Node, section: str, vrf: str) -> None:
+            for line in block.children:
+                if line.words == ["routing"]:
+                    if vrf:
+                        multicast_text.vrf(self.device, vrf).routing = True
+                    else:
+                        self.device.multicast_routing = True
+                elif line.words[0] == "software-forwarding":
+                    self._reason = ("Device housekeeping", "the forwarding engine of the platform; the target "
+                                                           "forwards multicast its own way")
+                    self.unparsed(line, section)
+                else:
+                    self.unparsed(line, section)
+
         for child in node.children:
             if child.words == ["ipv4"]:
-                for line in child.children:
-                    if line.words == ["routing"]:
-                        self.device.multicast_routing = True
+                ipv4(child, f"{node.text} / {child.text}", "")
+            elif child.words[0] == "vrf" and len(child.words) == 2:
+                for grand in child.children:
+                    if grand.words == ["ipv4"]:
+                        ipv4(grand, f"{node.text} / {child.text}", child.words[1])
                     else:
-                        self.unparsed(line, f"{node.text} / {child.text}")
+                        self.unparsed(grand, f"{node.text} / {child.text}")
             else:
                 self.unparsed(child, node.text)
         return True
@@ -1718,14 +1740,43 @@ class _Reader:
         return True
 
     def _eos_pim(self, node: Node) -> bool:
-        """EOS: router pim sparse-mode / ipv4 / rp address A."""
+        """EOS: router pim sparse-mode / ipv4 / rp address A [GROUPS | access-list ACL] and anycast-rp A PEER, and
+        the same under vrf V."""
+        def ipv4(block: Node, section: str, vrf: str) -> None:
+            for line in block.children:
+                try:
+                    ok = multicast_text.eos_pim_line(self.device, vrf, line.words)
+                except (ValueError, IndexError):
+                    ok = False
+                if not ok:
+                    self.unparsed(line, section)
+
         for child in node.children:
             if child.words == ["ipv4"]:
-                for line in child.children:
-                    if line.words[:2] == ["rp", "address"] and len(line.words) == 3:
-                        self.device.pim_rps.append(str(ipaddress.IPv4Address(line.words[2])))
+                ipv4(child, f"{node.text} / {child.text}", "")
+            elif child.words[0] == "vrf" and len(child.words) == 2:
+                for grand in child.children:
+                    if grand.words == ["ipv4"]:
+                        ipv4(grand, f"{node.text} / {child.text}", child.words[1])
                     else:
-                        self.unparsed(line, f"{node.text} / {child.text}")
+                        self.unparsed(grand, f"{node.text} / {child.text}")
+            else:
+                self.unparsed(child, node.text)
+        return True
+
+    def _eos_msdp(self, node: Node) -> bool:
+        """EOS: router msdp / peer A / local-interface I."""
+        for child in node.children:
+            c = child.words
+            if c[0] == "peer" and len(c) == 2:
+                peer = str(ipaddress.IPv4Address(c[1]))
+                self.device.msdp_peers[peer] = ""
+                for grand in child.children:
+                    g = grand.words
+                    if g[0] == "local-interface" and len(g) == 2:
+                        self.device.msdp_peers[peer] = names.canonical(g[1])[0]
+                    else:
+                        self.unparsed(grand, f"{node.text} / {child.text}")
             else:
                 self.unparsed(child, node.text)
         return True
@@ -2436,6 +2487,17 @@ class _Reader:
             d.igmp_snooping = on
         elif w == ["querier"] and on:
             d.igmp_querier = True
+        elif w[:2] == ["querier", "address"] and len(w) == 3 and on:
+            d.igmp_querier_address = str(ipaddress.IPv4Address(w[2]))
+        elif w[:2] == ["querier", "version"] and len(w) == 3 and on:
+            d.igmp_querier_version = int(w[2])
+        elif w[0] == "vlan" and len(w) == 5 and w[2] == "querier" and w[3] in ("address", "version") and on:
+            for vid in _vlan_ids(w[1]):
+                vlan = d.vlans.setdefault(vid, Vlan(vid))
+                if w[3] == "address":
+                    vlan.igmp_querier_address = str(ipaddress.IPv4Address(w[4]))
+                else:
+                    vlan.igmp_querier_version = int(w[4])
         elif w[0] == "vlan" and len(w) in (2, 3) and w[2:] in ([], ["querier"]):
             for vid in _vlan_ids(w[1]):
                 vlan = d.vlans.setdefault(vid, Vlan(vid))

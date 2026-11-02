@@ -1187,9 +1187,11 @@ class Writer:
         self.out.append("!")
 
     def multicast(self) -> None:
-        """IGMP snooping (on by default: the VLANs that do not snoop are named) and multicast routing."""
+        """IGMP snooping (on by default: the VLANs that do not snoop are named) with its querier, multicast routing
+        (also in VRFs), rendezvous points, anycast RP and MSDP."""
         d = self.device
         rep = self.report
+        ind = self.ind
         lines: List[str] = []
         if multicast_text.stated(d):
             rep.item("vlan", multicast_text.LABEL)
@@ -1199,22 +1201,82 @@ class Writer:
             else:
                 lines += [f"no ip igmp snooping vlan {vid}" for vid in sorted(d.vlans) if vid not in on]
             queriers = multicast_text.queriers(d)
+            addresses = {d.vlans[v].igmp_querier_address or d.igmp_querier_address for v in queriers} - {""}
+            versions = {d.vlans[v].igmp_querier_version or d.igmp_querier_version for v in queriers} - {None}
             if queriers and self.ios:
                 lines.append("ip igmp snooping querier")
                 if queriers != on:
                     rep.add("vlan", multicast_text.LABEL, Severity.APPROX, "igmp-querier",
                             f"IOS sets the querier for every snooping VLAN, not only {l2sec_text.vlan_text(queriers)}")
+                if addresses:
+                    address = sorted(addresses)[0]
+                    lines.append(f"ip igmp snooping querier address {address}")
+                    if len(addresses) > 1 or any(not d.vlans[v].igmp_querier_address and not
+                                                 d.igmp_querier_address for v in queriers):
+                        rep.add("vlan", multicast_text.LABEL, Severity.REVIEW, "igmp-querier-address",
+                                f"IOS takes one querier address for every VLAN; {address} is written (the source "
+                                f"sets {', '.join(sorted(addresses))} per VLAN)")
+                    elif any(d.vlans[v].igmp_querier_address for v in queriers):
+                        rep.add("vlan", multicast_text.LABEL, Severity.APPROX, "igmp-querier-address",
+                                f"the querier address {address} is set for every VLAN on IOS")
+                if versions:
+                    lines.append(f"ip igmp snooping querier version {max(v for v in versions if v is not None)}")
             elif queriers:
-                lines += [f"ip igmp snooping vlan {vid} querier" for vid in queriers]
-        if d.multicast_routing:
+                for vid in queriers:
+                    vl = d.vlans[vid]
+                    lines.append(f"ip igmp snooping vlan {vid} querier")
+                    address = vl.igmp_querier_address or d.igmp_querier_address
+                    version = vl.igmp_querier_version or d.igmp_querier_version
+                    if address:
+                        lines.append(f"ip igmp snooping vlan {vid} querier address {address}")
+                    if version:
+                        lines.append(f"ip igmp snooping vlan {vid} querier version {version}")
+        vrf_routing = [name for name, m in d.multicast_vrfs.items() if m.routing]
+        if d.multicast_routing or vrf_routing:
             rep.item("system", "multicast routing")
-            lines += ["ip multicast-routing"] if self.ios else ["router multicast", f"{self.ind}ipv4",
-                                                                 f"{self.ind * 2}routing", "!"]
-        if d.pim_rps and self.ios:
-            lines += [f"ip pim rp-address {rp}" for rp in d.pim_rps]
-        elif d.pim_rps:
-            lines += ["router pim sparse-mode", f"{self.ind}ipv4"] + \
-                [f"{self.ind * 2}rp address {rp}" for rp in d.pim_rps] + ["!"]
+        if self.ios:
+            if d.multicast_routing:
+                lines.append("ip multicast-routing")
+            lines += [f"ip multicast-routing vrf {self.vrf(v)}" for v in vrf_routing]
+            lines += multicast_text.ios_rp_lines(d.pim_rps, d.pim_rp_groups, "", "")
+            for name, m in d.multicast_vrfs.items():
+                lines += multicast_text.ios_rp_lines(m.rps, m.rp_groups, name, self.vrf(name))
+            msdp = dict(d.msdp_peers)
+            for anycast, peers in d.pim_anycast.items():
+                for peer in peers:
+                    msdp.setdefault(peer, "")
+                rep.add("system", "multicast routing", Severity.REVIEW, "anycast-rp",
+                        f"anycast RP {anycast} (shared with {', '.join(peers)}): IOS shares an anycast RP through "
+                        "MSDP, so the other RPs are written as MSDP peers; give them a connect-source (the loopback "
+                        "with this switch's own address) and an originator-id, and only the RPs need it")
+            lines += [f"ip msdp peer {peer}" + (f" connect-source {self.port(src)}" if src else "")
+                      for peer, src in msdp.items()]
+        else:
+            if d.multicast_routing or vrf_routing:
+                lines += ["router multicast"]
+                if d.multicast_routing:
+                    lines += [f"{ind}ipv4", f"{ind * 2}routing"]
+                for v in vrf_routing:
+                    lines += [f"{ind}vrf {self.vrf(v)}", f"{ind * 2}ipv4", f"{ind * 3}routing"]
+                lines.append("!")
+            vrf_rps = {name: m for name, m in d.multicast_vrfs.items() if m.rps}
+            if d.pim_rps or d.pim_anycast or vrf_rps:
+                lines.append("router pim sparse-mode")
+                if d.pim_rps or d.pim_anycast:
+                    lines.append(f"{ind}ipv4")
+                    lines += multicast_text.eos_rp_lines(d.pim_rps, d.pim_rp_groups, ind * 2)
+                    lines += [f"{ind * 2}anycast-rp {a} {p}" for a, peers in d.pim_anycast.items() for p in peers]
+                for name, m in vrf_rps.items():
+                    lines += [f"{ind}vrf {self.vrf(name)}", f"{ind * 2}ipv4"]
+                    lines += multicast_text.eos_rp_lines(m.rps, m.rp_groups, ind * 3)
+                lines.append("!")
+            if d.msdp_peers:
+                lines.append("router msdp")
+                for peer, src in d.msdp_peers.items():
+                    lines.append(f"{ind}peer {peer}")
+                    if src:
+                        lines.append(f"{ind * 2}local-interface {self.port(src)}")
+                lines.append("!")
         if lines:
             self.out += lines + (["!"] if lines[-1] != "!" else [])
 

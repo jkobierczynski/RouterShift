@@ -156,6 +156,15 @@ def later_features(device: Device, report: Report, port: Callable[[str], str]) -
                           Severity.REVIEW))
     if device.system.router_id:
         found.append(("system", "router ID", f"the global router ID {device.system.router_id}:", Severity.REVIEW))
+    options = [w for w, v in (("the groups of the rendezvous points", device.pim_rp_groups),
+                              ("anycast RP", device.pim_anycast), ("MSDP peers", device.msdp_peers),
+                              ("multicast routing in VRFs " + ", ".join(device.multicast_vrfs), device.multicast_vrfs))
+               if v]
+    if options:
+        found.append(("system", "multicast routing", ", ".join(options) + ":", Severity.REVIEW))
+    if device.igmp_querier_address or device.igmp_querier_version or any(
+            v.igmp_querier_address or v.igmp_querier_version for v in device.vlans.values()):
+        found.append(("vlan", "IGMP snooping", "the querier's address and version:", Severity.APPROX))
     # (new device-level settings go above this line)
     for iface in device.interfaces.values():
         label = _interface_item(report, iface, port)

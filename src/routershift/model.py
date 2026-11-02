@@ -166,6 +166,8 @@ class Vlan:
     arp_inspection: bool = False  # dynamic ARP inspection on the VLAN
     igmp_snooping: Optional[bool] = None  # IGMP snooping switched on or off for the VLAN; None = not stated
     igmp_querier: bool = False  # the switch sends IGMP queries in the VLAN
+    igmp_querier_address: str = ""  # their source address in this VLAN
+    igmp_querier_version: Optional[int] = None
     trunk_groups: List[str] = field(default_factory=list)  # EOS: the VLAN only rides trunks of these groups
     origin: Origin = field(default_factory=Origin)
 
@@ -909,6 +911,15 @@ class Vxlan:
 
 
 @dataclass
+class VrfMulticast:
+    """Multicast routing in a VRF: switched on, and its static rendezvous points (RP -> groups, as in Device)."""
+
+    routing: bool = False
+    rps: List[str] = field(default_factory=list)
+    rp_groups: Dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
 class EvpnInstance:
     """An EVPN instance: VLANs whose MAC routes share a route distinguisher and route targets (EOS router bgp / vlan N
     or vlan-aware-bundle NAME; IOS l2vpn evpn instance N vlan-based)."""
@@ -998,6 +1009,14 @@ class Device:
     anycast_mac: str = ""  # the MAC every switch of a fabric answers on for Interface.virtual_ipv4 (EOS VARP MAC)
     multicast_routing: bool = False
     pim_rps: List[str] = field(default_factory=list)  # static PIM rendezvous point addresses
+    pim_rp_groups: Dict[str, str] = field(default_factory=dict)  # RP -> the groups it serves: a prefix
+    # (239.1.0.0/16) or "acl NAME"; an RP not listed serves every group
+    pim_anycast: Dict[str, List[str]] = field(default_factory=dict)  # anycast RP address -> the RPs that share it
+    msdp_peers: Dict[str, str] = field(default_factory=dict)  # MSDP peer -> the interface (canonical) it is reached
+    # from ("" = the outgoing one)
+    multicast_vrfs: Dict[str, "VrfMulticast"] = field(default_factory=dict)  # multicast routing in VRFs
+    igmp_querier_address: str = ""  # the source address of the IGMP queries ("" = the SVI's)
+    igmp_querier_version: Optional[int] = None
     mlag: Optional[Mlag] = None
     mirror_sessions: List[MirrorSession] = field(default_factory=list)
     sflow: Optional[Sflow] = None
