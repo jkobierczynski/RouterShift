@@ -233,6 +233,7 @@ class Writer:
         routemap_text.items(self.device, self.report)
         for pl in self.device.prefix_lists.values():
             self.out += routemap_text.ios_prefix_lines(pl, "ios")
+        self.out += routemap_text.ios_list_lines(self.device, "nxos", self.report)
         for rm in self.device.route_maps.values():
             self.out += routemap_text.ios_route_map_lines(rm, "nxos", self.report, IND)
 
@@ -324,6 +325,8 @@ class Writer:
                     words.append(route.next_hop)
             if route.name:
                 words += ["name", route.name.replace(" ", "_")]
+            if route.tag is not None:
+                words += ["tag", str(route.tag)]
             if route.distance is not None:
                 words.append(str(route.distance))
             if route.track:

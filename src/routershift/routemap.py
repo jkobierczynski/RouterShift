@@ -175,7 +175,7 @@ def unwritable(e: RouteMapEntry, platform: str) -> Tuple[List[str], List[str]]:
     clauses the reader could not read count too."""
     matches = [c for c in e.unconverted if c.startswith("match")]
     sets = [c for c in e.unconverted if not c.startswith("match")]
-    full = platform in ("ios", "eos", "aoscx")
+    full = platform in ("ios", "eos", "aoscx", "nxos")
     if not full:
         matches += [f"match as-path {x}" for x in e.match_as_paths]
         matches += [f"match community {x}" for x in e.match_communities]
@@ -252,7 +252,7 @@ def ios_route_map_lines(rm: RouteMap, platform: str, report: Report, ind: str,
         if platform == "aoscx":
             body += [f"match aspath-list {x}" for x in e.match_as_paths]
             body += [f"match community-list {x}" for x in e.match_communities]
-        elif platform in ("ios", "eos"):
+        elif platform in ("ios", "eos", "nxos"):
             body += [f"match as-path {(as_paths or {}).get(x, x) if platform == 'ios' else x}"
                      for x in e.match_as_paths]
             body += [f"match community {x}" for x in e.match_communities]
@@ -265,7 +265,8 @@ def ios_route_map_lines(rm: RouteMap, platform: str, report: Report, ind: str,
                            "so add them (bgp rpki server) or the entry matches nothing")
         for key in SET_KEYS:
             value = e.sets.get(key)
-            if value is None or key in ("extcommunity-rt", "metric-type") and platform not in ("ios", "eos", "aoscx"):
+            if value is None or key in ("extcommunity-rt", "metric-type") and platform not in ("ios", "eos", "aoscx",
+                                                                                              "nxos"):
                 continue
             if key == "next-hop":
                 body.append(f"set ip next-hop {value}")
@@ -501,6 +502,8 @@ def ios_community_list(device: Device, w: List[str]) -> bool:
     expanded = False
     if args[:1] in (["standard"], ["expanded"], ["regexp"]):
         expanded, args = args[0] != "standard", args[1:]
+    if args[1:2] == ["seq"] and len(args) >= 3 and args[2].isdigit():  # NX-OS: NAME seq N permit ...
+        args = args[:1] + args[3:]
     if len(args) < 3 or args[1] not in ("permit", "deny"):
         return False
     name = args[0]
@@ -514,9 +517,14 @@ def ios_community_list(device: Device, w: List[str]) -> bool:
 def ios_as_path_list(device: Device, w: List[str]) -> bool:
     """ip as-path access-list NAME permit|deny REGEX [any|igp|egp|incomplete] (EOS adds the origin)."""
     args = w[3:]
+    if args[1:2] == ["seq"] and len(args) >= 3 and args[2].isdigit():  # NX-OS: NAME seq N permit "REGEX"
+        args = args[:1] + args[3:]
     if len(args) < 3 or args[1] not in ("permit", "deny"):
         return False
     expression = args[2:]
+    joined = " ".join(expression)
+    if len(joined) >= 2 and joined[0] == joined[-1] == '"':  # NX-OS quotes the expression
+        expression = [joined[1:-1]]
     if len(expression) > 1 and expression[-1] in ("any", "igp", "egp", "incomplete"):
         if expression[-1] != "any":
             return False  # an origin the other platforms cannot match on
@@ -556,10 +564,27 @@ def aoscx_list_lines(device: Device, report: Report) -> List[str]:
     return out
 
 
+def nxos_list_lines(device: Device, report: Report) -> List[str]:
+    """NX-OS numbers each entry and quotes AS-path expressions."""
+    out: List[str] = []
+    for cl in device.community_lists.values():
+        report.item("policy", label(cl.name, "community-list"))
+        kind = "expanded" if cl.expanded else "standard"
+        out += [f"ip community-list {kind} {cl.name} seq {10 * n} {action} {value}"
+                for n, (action, value) in enumerate(cl.entries, 1)]
+    for apl in device.as_path_lists.values():
+        report.item("policy", label(apl.name, "as-path list"))
+        out += [f'ip as-path access-list {apl.name} seq {10 * n} {action} "{regex}"'
+                for n, (action, regex) in enumerate(apl.entries, 1)]
+    return out + (["!"] if out else [])
+
+
 def ios_list_lines(device: Device, platform: str, report: Report) -> List[str]:
     """Community and AS-path lists for IOS and EOS. IOS XE numbers its AS-path lists, so names get numbers."""
     if platform == "aoscx":
         return aoscx_list_lines(device, report)
+    if platform == "nxos":
+        return nxos_list_lines(device, report)
     out: List[str] = []
     for cl in device.community_lists.values():
         report.item("policy", label(cl.name, "community-list"))

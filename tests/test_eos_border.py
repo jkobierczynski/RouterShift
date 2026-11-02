@@ -312,6 +312,9 @@ def test_other_targets_report_what_they_leave_out(target: str) -> None:
         assert "mac 00:1c:73:00:dc:01;" in out  # the anycast gateway: one address and MAC on every leaf
     elif target == "aoscx":
         assert "    active-gateway ip 10.1.100.1\n" in out and "    ip address 10.1.100.1/24\n" in out
+    elif target == "nxos":
+        assert "ip community-list standard CL-BLACKHOLE seq 10 permit 65535:666\n" in out
+        assert "anycast gateway 10.1.100.1/24" in text
     else:
         assert "anycast gateway 10.1.100.1/24" in text
         assert "community-list CL-BLACKHOLE: skipped" in text

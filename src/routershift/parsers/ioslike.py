@@ -3448,7 +3448,7 @@ class _Reader:
         missing: List[str] = []
         while args:
             word = args.pop(0)
-            if word == "tag" and args and args[0].isdigit() and self.device.platform in ("ios", "eos"):
+            if word == "tag" and args and args[0].isdigit() and self.device.platform in ("ios", "eos", "nxos"):
                 route.tag = int(args.pop(0))
             elif word == "tag" and args:
                 missing.append(f"tag {args.pop(0)}")
