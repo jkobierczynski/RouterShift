@@ -11,7 +11,7 @@ approximated and what a person has to look at.
 |---|---|---|---|---|
 | `ios` | Cisco IOS and IOS XE | `show running-config` | CLI configuration | 1 (done) |
 | `eos` | Arista EOS | `show running-config` | CLI configuration | 1 (done) |
-| `junos` | Juniper Junos (EX and QFX with ELS, MX, SRX in switching/routing) | `show configuration`, or `\| display set` | curly braces, for `load merge terminal` | 2 (core done) |
+| `junos` | Juniper Junos (EX and QFX with ELS, MX, SRX in switching/routing) | `show configuration`, or `\| display set` | curly braces, for `load merge terminal` | 4 (done) |
 | `nxos` | Cisco NX-OS (Nexus 9000/3000, 9.x and 10.x) | `show running-config` | CLI configuration | 2 (core done) |
 | `aoscx` | HPE Aruba AOS-CX (10.x) | `show running-config` | CLI configuration | 1 (done) |
 | `aoss` | HPE Aruba AOS-S (ProCurve / ProVision, 16.x) | `show running-config` | CLI configuration | 1 (done) |
@@ -37,7 +37,7 @@ platform converts to and from all the others.
 | Spanning tree: mode, bridge priorities (per instance or per VLAN), MST region, edge ports, BPDU guard and filter, root and loop guard, port cost and priority | `Device.stp_mode`, `Stp`, `Interface.stp_*` | 3 (done) |
 | OSPFv2: processes per VRF, areas and area types, passive interfaces, redistribution, cost, network type | `Ospf`, `Interface.ospf_cost` | 2 (done) |
 | BGP: neighbors, peer groups, IPv4/IPv6 activation, networks, redistribution | `Bgp`, `BgpNeighbor` | 2 (done) |
-| BGP: IOS XE peer templates, BGP in VRFs, passwords, timers, route-reflector clients, prefix limits, allowas-in, remove-private-as, maximum-paths (Junos: passwords, hold time and remove-private; VRFs reported) | `BgpVrf`, `BgpNeighbor.password` ... | 4 (done) |
+| BGP: IOS XE peer templates, BGP in VRFs, passwords, timers, route-reflector clients, prefix limits, allowas-in, remove-private-as, maximum-paths | `BgpVrf`, `BgpNeighbor.password` ... | 4 (done) |
 | Access lists (IPv4 and IPv6) and their interface bindings | `Acl`, `AclEntry`, `Interface.acl_in` ... | 2 (done) |
 | NAT: pools, dynamic source NAT and PAT, one-to-one and port forwarding rules, inside/outside interfaces | `NatPool`, `NatRule`, `Interface.nat` | 2 (done) |
 | Site-to-site IPsec VPN: IKE proposals, transform sets, crypto maps, IPsec profiles on tunnel interfaces, pre-shared keys | `IkePolicy`, `IpsecTransform`, `IpsecPeer`, `PreSharedKey`, `Interface.tunnel_*` | 2 (done) |
@@ -111,11 +111,23 @@ platform converts to and from all the others.
   (`mgmt_junos`).
 * A fixed time zone offset becomes `Etc/GMT-N` (the tz database inverts the sign), without summer time.
 * Junos counts the Ethernet header in the MTU; the value is written as it is and flagged.
-* Not written for Junos yet, and so listed in the report: firewall filters (ACLs), policy statements (prefix lists,
-  route maps, BGP and OSPF export), VRRP, DHCP server and relay, NAT, IPsec, class of service, AAA servers and
-  802.1X, SNMP notifications and v3, port security and storm control, mirroring, sFlow, MPLS, RIP, IS-IS,
-  multicast, MC-LAG, VXLAN, RPM tracking, PoE and the voice VLAN. The reader leaves those statements under
-  "Not understood".
+* Every feature group the IOS and EOS writers write is written for Junos too, and read back. Where Junos has another
+  shape, the writer uses the nearest construct and the report says so:
+  * ACLs are firewall filters (and ethernet-switching filters on switch ports); route maps, prefix lists and
+    community and AS-path lists are policy statements; redistribution is an export policy.
+  * EVPN instances share one `switch-options` route distinguisher; MLAG is MC-LAG with ICCP; route leaking is
+    `instance-import` and VRF policies.
+  * QoS is class of service (forwarding classes `TC<n>`, the classifier `RS-DSCP`, scheduler maps per profile)
+    and QoS policies are filters with policers; CoPP is `system ddos-protection` with a loopback filter.
+  * Monitoring is `protocols sflow`, inline J-Flow (`RS-SAMPLING`) and analyzers; IP SLA probes are RPM tests.
+  * Roles are login classes, SNMPv3 is `usm` and `vacm`, the APIs are `netconf`, `rest` and `extension-service`.
+  * PTP ports are `master interface` units; event handlers are event policies (a save is a commit, a port's state
+    its link-down trap).
+  * BFD timers ride on each OSPF and BGP session; PBR is filter-based forwarding (`<route map>-FBF` and a
+    forwarding instance per entry); OSPF keys are MD5 with a placeholder.
+  * RIP is one group with an export policy for its networks; IS-IS puts the NET on the loopback; GRE tunnels are
+    `gr-0/0/0` units and IPsec tunnel interfaces `st0` units.
+* Junos switches do not do NAT or IPsec: those are reported, not converted (an SRX does them under `security`).
 
 ### NX-OS specifics
 

@@ -52,12 +52,15 @@ The DNS client (lookup switch, search domains, source interface, static hosts) a
 (on/off, priority, power limit) convert as far as each platform has the setting.
 VXLAN (VTEP source, VLAN and VRF VNIs, static flood lists) and BGP EVPN (neighbors, advertised VLANs)
 convert between IOS, EOS and AOS-CX, and are flagged on AOS-S and Comware.
-Juniper Junos reads and writes the core of a switch or router configuration, in either the curly-brace
-form or `display set` lines: system settings (hostname, DNS, NTP with keys, syslog, time zone, banner, SSH,
-local users), SNMP communities, VLANs, ports and aggregates with LACP, access and trunk ports, irb, loopback and
-management interfaces, subinterfaces, IPv4/IPv6 addresses, VRFs (routing instances with RD and route targets),
-static routes, OSPF, BGP (groups, EVPN family), LLDP and spanning tree (RSTP, MSTP, VSTP). Every other feature
-read from another platform is listed in the report as "not written for Junos yet".
+Juniper Junos reads and writes a switch or router configuration to the same depth as IOS and EOS, in either the
+curly-brace form or `display set` lines: besides the core (system, users, SNMP, VLANs, ports and aggregates,
+irb/loopback/management units, VRFs, static routes, OSPF, BGP, LLDP, spanning tree) it covers firewall filters and
+policy statements, VRRP and anycast gateways, DHCP relay and server, layer 2 security, AAA and 802.1X, EVPN/VXLAN,
+MC-LAG, route leaking, multicast, class of service, control-plane protection and MACsec, sFlow, J-Flow and
+analyzers, SNMPv3 and login classes, PTP and event policies, BFD, ECMP hashing, OSPF options, filter-based
+forwarding for PBR, RIP, IS-IS, MPLS/LDP and GRE tunnels. What Junos has no form for (an EOS route distinguisher
+per EVPN instance, a BFD slow timer, NAT and IPsec on a switch, ...) is written as the nearest construct or left
+out, and the report says which.
 Cisco NX-OS reads through the IOS reader (with its own blocks: features, vrf context, neighbor blocks, hsrp and
 vrrp blocks, use-vrf) and writes the system settings, users, SNMP communities, VLANs, ports, port-channels, SVIs,
 the management port in VRF management, VRFs and their static routes, ACLs, prefix lists and route maps, HSRP and

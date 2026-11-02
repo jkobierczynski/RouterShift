@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+* Junos is written and read to the same depth as IOS and EOS: policy statements and firewall filters, port
+  settings, gateways, DHCP, layer 2 security, AAA and 802.1X, EVPN/VXLAN, MC-LAG, route leaking, multicast, class
+  of service, control-plane protection, MACsec, monitoring, management (login classes, SNMPv3, APIs), PTP, event
+  policies, BFD, ECMP hashing, OSPF authentication and options, PBR as filter-based forwarding, RIP, IS-IS,
+  MPLS/LDP and tunnels. Each converts EOS (the bl1-dc1 border leaf) to Junos and back with no line left unread;
+  what Junos lacks is flagged instead of labelled exact.
+* The text report shows the device security section (CoPP, MACsec).
+
 * The report lists what RouterShift recognises but does not convert once per feature, with the reason and the line
   numbers ("Recognised, not converted"), and groups the remaining "Not understood" lines by block. A real IOS XE
   core router went from 558 separate "not understood" items to none.
