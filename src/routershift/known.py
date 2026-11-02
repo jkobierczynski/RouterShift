@@ -32,9 +32,18 @@ _RAW: List[Tuple[str, str, str]] = [
      "application recognition (NBAR) is Cisco only; classify by ACL or DSCP on the target"),
     # Features not converted yet
     (r"(router ospfv3 |ipv6 ospf |ospfv3 )", "OSPFv3 (IPv6)", "OSPFv3 is not converted yet; set it up by hand"),
+    (r"ip as-path regex-mode ", "BGP AS-path regular expressions",
+     "the AS-path lists are converted with their expressions as written; EOS 'regex-mode asn' matches whole AS numbers, "
+     "so check each expression on the target"),
+    (r"router general", "Routes leaked between VRFs (EOS router general)",
+     "leaking routes from one VRF into another without route targets is not converted; on IOS XE import the source "
+     "VRF's route target into the other VRF, with an import map for the route map"),
+    (r"(rpki |router bgp \S+ / rpki |rpki origin-validation)", "RPKI origin validation",
+     "the RPKI cache servers and origin validation are not converted; route maps that match the validation state are"),
     (r"(ip as-path access-list |ip community-list |ip extcommunity-list |ip large-community-list |match as-path |"
      r"match community |match extcommunity |set community |set comm-list |set extcommunity )",
-     "BGP AS-path and community lists", "AS-path and community lists are not converted yet"),
+     "BGP AS-path and community lists", "these AS-path and community list forms are not converted yet (standard "
+     "and expanded community lists, AS-path lists and route-target sets are)"),
     (r"(key chain |ip ospf authentication key-chain )", "Key chains",
      "key chains for routing-protocol authentication are not converted yet; set the keys on the target"),
     (r"(bfd-template |bfd template |bfd interval )", "BFD timers",

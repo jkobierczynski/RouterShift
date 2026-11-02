@@ -137,7 +137,9 @@ def test_bgp_round_trips(target: str) -> None:
         for peer in expected:
             peer.maximum_prefix = None
     else:
-        assert "not written for" not in report.to_text().split("Recognised")[0], target
+        # every neighbor option is written (the process-wide graceful restart is left to a person on some targets)
+        assert not [f for i in report.items.values() if i.kind == "bgp" for f in i.findings
+                    if f.code == "bgp-option"], target
     assert bgp_text.flat(back.bgp) == expected, target
     assert [n for v in back.bgp.vrfs.values() for n in v.neighbors] == first.bgp.vrfs["CORP"].neighbors
     assert back.bgp.vrfs["CORP"].redistribute == ["connected"]
@@ -162,8 +164,10 @@ def test_report_groups_what_it_recognises() -> None:
     assert "Not understood" not in text
     known = {name for kind, name in report.items if kind == "known"}
     assert {"Embedded Event Manager (EEM) applets", "Device housekeeping", "IP SLA options",
-            "Interface hardening (redirects, proxy ARP, uRPF)", "Routing protocol tuning",
-            "Gateway redundancy options", "Static route options"} <= known
+            "Gateway redundancy options"} <= known
+    # converted now: no ip redirects, no ip proxy-arp, bgp graceful-restart, the static route's tag
+    assert not {"Interface hardening (redirects, proxy ARP, uRPF)", "Routing protocol tuning",
+                "Static route options"} & known
     eem = report.items[("known", "Embedded Event Manager (EEM) applets")]
     assert eem.skipped and "(3 lines: " in eem.findings[0].message
 
