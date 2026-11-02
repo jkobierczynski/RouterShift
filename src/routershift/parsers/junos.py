@@ -25,6 +25,7 @@ from .. import junospolicy
 from .. import junosqos
 from .. import junossec
 from .. import junosmon
+from .. import junosmgmt
 from .. import monitor as monitor_text
 from .. import qos as qos_text
 from .. import security as security_text
@@ -118,6 +119,8 @@ class Reader:
         self.macsec_ports: Dict[str, str] = {}  # port -> connectivity association
         self.mon = junosmon.MonitorReader(self.device)
         self.lldp_timers: Dict[str, int] = {}
+        self.mgmt = junosmgmt.MgmtReader(self.device)
+        self.login_filter: Optional[Tuple[str, Optional[Interface]]] = None
         self.lldp_address = ""
         self.rp_ranges: Dict[Tuple[str, str], List[str]] = {}  # (VRF, RP) -> group ranges
         self.local_rp = ""
@@ -534,7 +537,10 @@ class Reader:
             return self.syslog(w[1:])
         elif w[0] == "services" and len(w) >= 2:
             m = self.device.management
-            if w[1:] == ["ssh"]:
+            api = next((k for k, words in junosmgmt.API_KEYS.items() if w[1:] == list(words)), None)
+            if api is not None:
+                m.apis[api] = ""  # the instance is the management one when there is one, set when all is read
+            elif w[1:] == ["ssh"]:
                 m.ssh = True
             elif w[1:] == ["telnet"]:
                 m.telnet = True
@@ -598,9 +604,9 @@ class Reader:
         return True
 
     def login(self, w: List[str]) -> bool:
-        if w[0] == "message" and len(w) == 2:
-            self.device.system.banner_motd = w[1].replace("\\n", "\n")
-            return True
+        handled = self.mgmt.login(w)
+        if handled is not None:
+            return handled
         if w[0] != "user" or len(w) < 3:
             return False
         user = next((u for u in self.device.users if u.name == w[1]), None)
@@ -669,6 +675,16 @@ class Reader:
             if w[2] == "routing-instance" and len(w) == 4:
                 sy.service_vrf = w[3]
                 return True
+            if w[2] in ("port", "transport") and len(w) == 4:
+                protocol, port = sy.syslog_transport.get(w[1], ("udp", 514))
+                if w[2] == "port":
+                    port = int(w[3])
+                elif w[3] in ("tcp", "tls", "udp"):
+                    protocol = w[3]
+                else:
+                    return False
+                sy.syslog_transport[w[1]] = (protocol, port)
+                return True
             if w[2] == "any" and len(w) == 4 and w[3] in LEVELS:
                 sy.logging_level = LEVELS.index(w[3])
                 return True
@@ -676,6 +692,18 @@ class Reader:
         if w[0] == "source-address" and len(w) == 2:
             sy.logging_source = vxlan_text.interface_of(self.device, w[1])
             return bool(sy.logging_source)
+        if w[:2] == ["file", "messages"] and len(w) == 4 and w[2] == "any" and w[3] in LEVELS:
+            sy.logging_buffer_level = LEVELS.index(w[3])
+            return True
+        if w[0] == "console" and len(w) == 3 and w[1] == "any" and w[2] in LEVELS:
+            sy.logging_console_level = LEVELS.index(w[2])
+            return True
+        if w[:2] == ["user", "*"] and len(w) == 4 and w[2] == "any" and w[3] in LEVELS:
+            sy.logging_monitor_level = LEVELS.index(w[3])
+            return True
+        if w == ["time-format", "millisecond"]:
+            sy.logging_timestamp = "msec"
+            return True
         return False
 
     # forwarding options, switch options, PoE, access ----------------------------------------------------------------
@@ -825,7 +853,7 @@ class Reader:
                 return False
             sn.communities.append(SnmpCommunity(w[1], access))
         else:
-            return False
+            return self.mgmt.snmp(w)
         return True
 
     def chassis(self, s: Statement) -> bool:
@@ -1392,6 +1420,9 @@ class Reader:
         for (name, direction), filters in self.filter_lists.items():
             iface = dev.interfaces[name]
             for f in filters:
+                if f.endswith(junosmgmt.LOGIN_SUFFIX) and f[:-len(junosmgmt.LOGIN_SUFFIX)] in dev.acls:
+                    self.login_filter = (f, iface)
+                    continue
                 if f in dev.qos_policies:
                     setattr(iface, f"qos_policy_{'in' if direction == 'input' else 'out'}", f)
                 elif not getattr(iface, f"acl_{'in' if direction == 'input' else 'out'}"):
@@ -1430,7 +1461,25 @@ class Reader:
                 iface.acl_in = ""
         if dev.control_plane is not None:
             cp = dev.control_plane
+            for vrf, acl in list(cp.acls.items()):
+                if acl.endswith(junosmgmt.LOGIN_SUFFIX) and acl[:-len(junosmgmt.LOGIN_SUFFIX)] in dev.acls:
+                    del cp.acls[vrf]
+                    self.login_filter = (acl, None)
             cp.acls = dict(sorted(cp.acls.items(), key=lambda kv: kv[0] != ""))
+            if not cp.acls and not cp.classes:
+                dev.control_plane = None
+        if self.login_filter is not None:
+            # the filter RouterShift writes for the remote-login ACL: the ACL itself again
+            name = self.login_filter[0]
+            dev.management.vty_acl = name[:-len(junosmgmt.LOGIN_SUFFIX)]
+            dev.acls.pop(name, None)
+        self.mgmt.finish(lambda a: vxlan_text.interface_of(dev, a), unread)
+        m = dev.management
+        if self.management_instance:
+            if m.ssh or m.vty_acl:
+                m.vrf = MGMT_INSTANCE
+            for api in m.apis:
+                m.apis[api] = MGMT_INSTANCE
         for port, profile in self.macsec_ports.items():
             secured = self.canonical(port)
             if secured is None:

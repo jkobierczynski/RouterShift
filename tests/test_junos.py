@@ -40,13 +40,13 @@ def test_braces_and_set_lines_read_the_same() -> None:
 
 def test_reads_the_sample() -> None:
     d = parse(JUNOS, "junos")
-    assert [u.text.split()[:3] for u in d.unparsed] == [["set", "system", "root-authentication"],
-                                                         ["set", "system", "services"]]
+    assert [u.text.split()[:3] for u in d.unparsed] == [["set", "system", "root-authentication"]]
+    assert d.management.apis == {"netconf": ""}
     assert d.system.hostname == "core-01" and d.system.timezone == "Europe/Brussels"
     assert d.system.ntp_servers == ["10.0.0.123", "10.0.0.124"] and d.system.ntp_prefer == "10.0.0.123"
     assert d.system.ntp_keys[1].trusted and d.system.ntp_source == "Loopback0"
     assert d.system.syslog_servers == ["10.0.5.14"] and d.system.logging_level == 4
-    assert d.system.banner_motd == "Authorised access only."
+    assert d.system.banner_login == "Authorised access only."  # login message: shown before the login prompt
     assert [(u.name, u.privilege, u.hash_type) for u in d.users] == [("netops", 15, "sha512-crypt"),
                                                                     ("viewer", 1, "md5-crypt")]
     assert {v.vlan_id: v.name for v in d.vlans.values()} == {99: "MGMT", 10: "USERS", 20: "VOICE", 1: "default"}

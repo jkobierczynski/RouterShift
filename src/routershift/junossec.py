@@ -42,9 +42,9 @@ Add = Callable[..., None]
 
 # writing ------------------------------------------------------------------------------------------------------------
 
-def control_plane(device: Device, add: Add, report: Report, mgmt_vrfs: List[str], loopback_unit: Callable[[str],
-                                                                                                     Optional[str]],
-                  filter_name: Callable[[str], str]) -> None:
+def control_plane(device: Device, add: Add, apply: Callable[[str, str], None], report: Report, mgmt_vrfs: List[str],
+                  loopback_unit: Callable[[str], Optional[str]], filter_name: Callable[[str], str]) -> None:
+    """The control-plane ACLs (applied through ``apply(unit, filter)``) and the platform's CoPP classes."""
     cp = device.control_plane
     if cp is None:
         return
@@ -59,9 +59,9 @@ def control_plane(device: Device, add: Add, report: Report, mgmt_vrfs: List[str]
                        "the source")
             continue
         if not vrf:
-            add("interfaces", "lo0", "unit 0", "family inet", "filter", f"input {filter_name(acl)}")
+            apply("lo0.0", filter_name(acl))
         elif vrf in mgmt_vrfs:
-            add("interfaces", "me0", "unit 0", "family inet", "filter", f"input {filter_name(acl)}")
+            apply("me0.0", filter_name(acl))
             report.add(KIND, label, Severity.APPROX, "copp-mgmt",
                        f"ACL {acl}{where} is the input filter of the management port me0, which takes the management "
                        "VRF's traffic to the switch")
@@ -72,7 +72,7 @@ def control_plane(device: Device, add: Add, report: Report, mgmt_vrfs: List[str]
                            f"ACL {acl}{where}: Junos guards a VRF with the input filter of a loopback unit in it, and "
                            "the VRF has none; not applied")
                 continue
-            add("interfaces", "lo0", f"unit {unit}", "family inet", "filter", f"input {filter_name(acl)}")
+            apply(f"lo0.{unit}", filter_name(acl))
     builtin = [c for c in cp.classes if not c.acl]
     own = [c for c in cp.classes if c.acl]
     left = []

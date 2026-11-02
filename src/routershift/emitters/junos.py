@@ -29,6 +29,7 @@ from .. import junospolicy
 from .. import junosqos
 from .. import junossec
 from .. import junosmon
+from .. import junosmgmt
 from .. import ospf as ospf_text
 from .. import partial
 from .. import snmp as snmp_text
@@ -93,6 +94,11 @@ class Writer:
     def label(self, iface: Interface) -> str:
         return f"{iface.source_name or iface.name} -> {self.port(iface.name)}"
 
+    @property
+    def mgmt(self) -> junosmgmt.MgmtWriter:
+        return junosmgmt.MgmtWriter(self.device, self.add, self.report, self.address_of, self.instance,
+                                    sorted(self.mgmt_vrfs), lambda acl: getattr(self, "filter_names", {}).get(acl, acl))
+
     def instance(self, vrf: str) -> str:
         return MGMT_INSTANCE if vrf in self.mgmt_vrfs else vrf
 
@@ -143,10 +149,7 @@ class Writer:
         hosts_text.dns_unsupported(self.device, self.report, PLATFORM, search=True, hosts=True)
         if sy.timezone:
             self.timezone(sy.timezone)
-        if sy.banner_motd:
-            self.report.item("system", "banner")
-            text = sy.banner_motd.replace('"', "'").replace("\n", "\\n")
-            self.add("system", "login", f'message "{text}"')
+        self.mgmt.banners()
         if self.mgmt_vrfs:
             self.add("system", "management-instance")
             self.report.add("system", f"vrf {', '.join(sorted(self.mgmt_vrfs))}", Severity.APPROX, "mgmt-instance",
@@ -155,9 +158,15 @@ class Writer:
         self.syslog()
         self.services()
         if sy.service_vrf:
-            self.report.add("system", f"services in vrf {sy.service_vrf}", Severity.REVIEW, "service-vrf",
-                            "NTP, DNS and syslog are written in the main routing table; add routing-instance "
-                            f"{self.instance(sy.service_vrf)} to them by hand if they must leave from the VRF")
+            instance = self.instance(sy.service_vrf)
+            for server in sy.dns_servers:
+                self.add("system", "name-server", server, f"routing-instance {instance}")
+            for server in sy.syslog_servers:
+                self.add("system", "syslog", f"host {server}", f"routing-instance {instance}")
+            self.report.item("system", f"services in vrf {sy.service_vrf}")
+            self.report.add("system", f"services in vrf {sy.service_vrf}", Severity.APPROX, "service-vrf",
+                            f"DNS, NTP and syslog servers are reached through routing-instance {instance}; check the "
+                            "release takes it on name-server")
         for name, source in sy.transfer_source.items():
             self.report.skip("system", f"{name} source interface", "junos-not-yet",
                              f"not written for Junos yet ({source}); configure it by hand")
@@ -207,6 +216,8 @@ class Writer:
                 words += ["key", str(sy.ntp_server_keys[server])]
             if server == sy.ntp_prefer:
                 words.append("prefer")
+            if sy.service_vrf:
+                words += ["routing-instance", self.instance(sy.service_vrf)]
             self.add("system", "ntp", " ".join(words))
         if sy.ntp_source:
             self.source(sy.ntp_source, ("system", "ntp"), "ntp source")
@@ -219,6 +230,8 @@ class Writer:
             self.add("system", "syslog", f"host {server}", f"any {level}")
         if sy.logging_source and sy.syslog_servers:
             self.source(sy.logging_source, ("system", "syslog"), "syslog source")
+        self.mgmt.syslog_transport()
+        self.mgmt.logging()
 
     def services(self) -> None:
         m = self.device.management
@@ -228,36 +241,12 @@ class Writer:
             if on:
                 self.report.item("management", name)
                 self.add("system", "services", *words)
-        if m.vty_acl:
-            self.report.skip("management", f"remote login ACL {m.vty_acl}", "junos-not-yet",
-                             "a loopback firewall filter is not written for Junos yet; protect the routing engine "
-                             "by hand")
-        if m.exec_timeout is not None:
-            self.report.skip("management", "session timeout", "junos-not-yet",
-                             f"idle-timeout ({m.exec_timeout} minutes) goes in a login class; not written for Junos "
-                             "yet")
+        self.mgmt.apis()
         if m.cdp:
             self.report.skip("management", "CDP", "cdp", "Junos has no CDP; LLDP is written where it is on")
 
     def users(self) -> None:
-        for user in self.device.users:
-            label = aaa_text.user_label(user)
-            password = aaa_text.password(user, HASHES, self.report)
-            if password is None:
-                continue
-            self.report.item("management", label)
-            path = ("system", "login", f"user {quote(user.name)}")
-            self.add(*path, f"class {aaa_text.role(user.privilege, CLASSES)}")
-            kind, value = password
-            if kind in HASHES:
-                self.add(*path, "authentication", f"encrypted-password {quote(value)}")
-            elif kind == "plain":
-                self.report.add("management", label, Severity.REVIEW, "plain-password",
-                                "Junos takes no clear-text password in a configuration; set it with 'set system "
-                                f"login user {user.name} authentication plain-text-password'")
-        if self.device.aaa.enable_secret is not None:
-            self.report.skip("management", "enable secret", "enable", "Junos has no enable password; the login "
-                             "class of each user sets what it may do")
+        self.mgmt.users()
 
     # VLANs and interfaces ----------------------------------------------------------------------------------------
 
@@ -651,15 +640,7 @@ class Writer:
             self.report.item("management", label)
             access = "read-write" if c.access == "rw" else "read-only"
             self.add("snmp", f"community {quote(c.name)}", f"authorization {access}")
-            if c.acl:
-                self.report.add("management", label, Severity.REVIEW, "junos-not-yet",
-                                f"the manager list {c.acl} is not written for Junos yet (snmp community clients)")
-        rest = [what for what, stated in (("notification hosts", bool(sn.hosts or sn.traps)),
-                                          ("SNMPv3 users and groups", bool(sn.users or sn.groups)),
-                                          ("the source interface", bool(sn.source))) if stated]
-        if rest:
-            self.report.skip("management", "SNMP", "junos-not-yet",
-                             f"not written for Junos yet: {', '.join(rest)}; configure by hand")
+        self.mgmt.snmp()
 
     # routing -----------------------------------------------------------------------------------------------------
 
@@ -1278,8 +1259,24 @@ class Writer:
             lo = next((i for i in dev.interfaces.values() if i.kind == InterfaceKind.LOOPBACK and i.vrf == vrf), None)
             return self.unit_name(lo.name).split(".", 1)[1] if lo is not None else None
 
-        junossec.control_plane(dev, self.add, self.report, sorted(self.mgmt_vrfs), loopback_unit,
+        re_filters: Dict[str, List[str]] = {}  # lo0.N / me0.0 -> input filters guarding the routing engine
+
+        def apply(unit: str, name: str) -> None:
+            re_filters.setdefault(unit, []).append(name)
+
+        junossec.control_plane(dev, self.add, apply, self.report, sorted(self.mgmt_vrfs), loopback_unit,
                                lambda acl: self.filter_names.get(acl, acl))
+        login = self.mgmt.login_filter()
+        if login is not None:
+            apply(f"{login[1]}.0", login[0])
+        for unit, names in re_filters.items():
+            ifd, number = unit.split(".")
+            path = ("interfaces", ifd, f"unit {number}", "family inet", "filter")
+            if len(names) == 1:
+                self.add(*path, f"input {names[0]}")
+            else:
+                for name in names:
+                    self.add(*path, f"input-list {name}")
         junossec.macsec(dev, self.add, self.report, self.port)
         junossec.coa(dev, self.add, self.report)
 

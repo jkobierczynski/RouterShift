@@ -120,5 +120,5 @@ def test_ios_management_to_eos() -> None:
 
 
 def test_management_on_other_targets() -> None:
-    _, report = convert(EOS, "eos", "junos")
+    _, report = convert(EOS, "eos", "comware")
     assert "the CLI roles NOC-READONLY" in report.to_text()
