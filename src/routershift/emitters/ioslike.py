@@ -29,6 +29,7 @@ from .. import monitor as monitor_text
 from .. import tracking as tracking_text
 from .. import vxlan as vxlan_text
 from .. import queuing as queuing_text
+from .. import security as security_text
 from .. import evpn as evpn_text
 from .. import hosts as hosts_text
 from .. import igp as igp_text
@@ -114,6 +115,7 @@ class Writer:
         self.policies()
         self.routing()
         self.acls()
+        self.security()
         self.nat()
         self.dhcp()
         self.services()
@@ -330,6 +332,7 @@ class Writer:
             lines.append(f"mtu {mtu}")
         lines += self._speed(iface, add)
         lines += self._dot1x(iface, add)
+        lines += self._security_interface(iface, add)
         lines += self._qos_interface(iface, add)
         if iface.mpls:
             lines.append("mpls ip" if self.ios else "mpls ldp interface")
@@ -2130,6 +2133,13 @@ class Writer:
             self.out.append("ip dhcp snooping")
             if vlans:
                 self.out.append(f"ip dhcp snooping vlan {l2sec_text.vlan_text(vlans)}")
+            if d.dhcp_option82:
+                self.out.append("ip dhcp snooping information option")
+            elif d.dhcp_option82 is False and self.ios:
+                self.out.append("no ip dhcp snooping information option")
+            elif d.dhcp_option82 is False:
+                rep.add("vlan", "DHCP snooping", Severity.REVIEW, "dhcp-option82",
+                        "the source switches option 82 off; EOS snooping does nothing but insert it")
             if not self.ios:
                 rep.add("vlan", "DHCP snooping", Severity.REVIEW, "dhcp-snooping",
                         "EOS DHCP snooping adds relay option 82 only; it does not drop server replies on untrusted "
@@ -2140,6 +2150,37 @@ class Writer:
             self.out.append(f"ip arp inspection vlan {l2sec_text.vlan_text(vlans)}")
         if d.dhcp_snooping or vlans:
             self.out.append("!")
+
+    def security(self) -> None:
+        """MAC ACLs, MACsec profiles and control-plane protection."""
+        d = self.device
+        for acl in d.mac_acls.values():
+            self.out += security_text.mac_acl_lines(acl, self.ios, self.report)
+        self.out += security_text.ios_macsec_lines(d, self.report) if self.ios else \
+            security_text.eos_macsec_lines(d, self.report, self.ind)
+        self.out += security_text.ios_lines(d, self.report, self.vrf) if self.ios else \
+            security_text.eos_lines(d, self.report, self.ind, self.vrf)
+
+    def _security_interface(self, iface: Interface, add: _Add) -> List[str]:
+        lines: List[str] = []
+        for name, way in ((iface.mac_acl_in, "in"), (iface.mac_acl_out, "out")):
+            if name and name not in self.device.mac_acls:
+                add(Severity.REVIEW, "mac-acl", f"MAC ACL {name} is applied but not defined; left out")
+            elif name:
+                lines.append(f"mac access-group {name} {way}")
+        p = self.device.macsec_profiles.get(iface.macsec_profile)
+        if iface.macsec_profile and p is None:
+            add(Severity.REVIEW, "macsec", f"MACsec profile {iface.macsec_profile} is applied but not defined")
+        elif p is not None and self.ios:
+            lines += ["macsec network-link", f"mka policy {p.name}"]
+            if p.ckn:
+                lines.append(f"mka pre-shared-key key-chain {security_text.keychain_name(p.name)}")
+        elif p is not None:
+            lines.append(f"mac security profile {p.name}")
+        if iface.dot1x_fail_vlan is not None:
+            lines.append(f"authentication event fail action authorize vlan {iface.dot1x_fail_vlan}" if self.ios else
+                         f"dot1x authentication failure action traffic allow vlan {iface.dot1x_fail_vlan}")
+        return lines
 
     def _l2sec_interface(self, iface: Interface, add: _Add, label: str) -> List[str]:
         lines = []
@@ -2503,6 +2544,15 @@ class Writer:
         if self.device.aaa.dot1x:
             self.out.append("dot1x system-auth-control")
             self.report.item("management", "802.1X")
+        if self.device.aaa.coa:
+            self.report.item("management", "RADIUS change of authorization")
+            if self.ios:
+                self.out += ["aaa server radius dynamic-author", " auth-type any", "!"]
+                self.report.add("management", "RADIUS change of authorization", Severity.REVIEW, "coa-clients",
+                                "add the RADIUS servers that may send changes as 'client ADDRESS server-key KEY' "
+                                "under aaa server radius dynamic-author")
+            else:
+                self.out.append("dot1x dynamic-authorization")
         for protocol, source in s.transfer_source.items():
             self.out.append(f"ip {protocol}{'' if self.ios else ' client'} source-interface {self.port(source)}")
             self.report.item("system", f"{protocol} source")

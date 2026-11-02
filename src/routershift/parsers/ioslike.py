@@ -33,6 +33,7 @@ from .. import igp as igp_text
 from .. import routemap as routemap_text
 from .. import qos as qos_text
 from .. import queuing as queuing_text
+from .. import security as security_text
 from .. import confparse, names
 from .. import dhcp as dhcp_text
 from .. import vpn as vpn_text
@@ -40,7 +41,7 @@ from .. import aaa as aaa_text
 from ..confparse import Node
 from ..errors import ParseError
 from ..model import (IpSla, Netflow, Sflow, AaaGroup, AaaMethod, AaaServer, Acl, Device, LocalUser, DhcpPool, FhrpGroup, IkePolicy, IpsecPeer, IpsecTransform, NtpKey, PreSharedKey,
-                     EvpnInstance, Vxlan, QosProfile, QosQueue, SnmpCommunity, SnmpGroup, SnmpHost, SnmpUser, NatPool, NatRule, Interface, InterfaceKind, LacpMode, Origin, Ospf, OspfNetwork, Wlan, Mlag, Rip, Isis,
+                     EvpnInstance, Vxlan, CoppClass, MacAcl, MacsecProfile, QosProfile, QosQueue, SnmpCommunity, SnmpGroup, SnmpHost, SnmpUser, NatPool, NatRule, Interface, InterfaceKind, LacpMode, Origin, Ospf, OspfNetwork, Wlan, Mlag, Rip, Isis,
                      QosAction, QosClass, QosPolicy, StaticRoute, BgpNeighbor, BgpVrf, StpMode, SwitchportMode, Unparsed, Vlan)
 
 # Lines that only describe the file or the software, not the device's behaviour.
@@ -168,6 +169,12 @@ class _Reader:
         self._bgp_router_id = ""  # EOS: a VRF that names the same router ID needs none of its own
         self._syslog_hosts: List[Tuple[Node, str, str]] = []  # every logging host line, its address and VRF
         self._pbr_policies: List[Node] = []
+        self._policy_nodes: Dict[str, Node] = {}
+        self._copp_classes: Dict[str, str] = {}  # EOS class-map type copp -> its ACL  # IOS: every policy-map, for the control-plane policy
+        self._macsec_chains: Dict[str, List[Tuple[str, str]]] = {}  # IOS key chain NAME macsec -> (CKN, CAK)
+        self._macsec_ports: Dict[str, str] = {}  # IOS: port -> its mka pre-shared-key key chain
+        self._key_chains: Dict[str, Dict[int, str]] = {}  # IOS: other key chains -> key id -> algorithm
+        self._ospf_chains: Dict[str, str] = {}  # IOS: port -> the key chain of its OSPF authentication
         self._qos_queuing: List[Tuple[QosProfile, List[Tuple[str, QosQueue]]]] = []  # IOS queuing policies
         self._qos_parents: Dict[str, Tuple[str, int]] = {}  # IOS parent shaper -> (child policy, kbit/s)  # EOS policy-map type pbr, read once the classes are known
 
@@ -232,6 +239,11 @@ class _Reader:
             "policy-map": self.policy_map,
             "mls": lambda node: node.words == ["mls", "qos"],
             "qos": self.qos_global,
+            "system": self.system_cp,
+            "control-plane": self.ios_control_plane,
+            "mac": self.mac,
+            "key": self.key_chain,
+            "mka": self.mka,
             "mpls": self.mpls,
             "wlan": self.wlan,
             "wireless": self.wireless,
@@ -565,6 +577,9 @@ class _Reader:
         if w[1:] == ["dhcp", "snooping"]:
             self.device.dhcp_snooping = True
             return True
+        if w[1:] == ["dhcp", "snooping", "information", "option"]:
+            self.device.dhcp_option82 = True
+            return True
         if w[1] == "vrf" and len(w) == 3:  # IOS: ip vrf NAME
             self._add_vrf(w[2])
             self._vrf_children(w[2], node)
@@ -791,6 +806,15 @@ class _Reader:
         origin = Origin(node.line, node.text)
         if w[1:] in (["new-model"], ["session-id", "common"]) or w[1] == "root":
             return w[1] != "root"
+        if w[1:] == ["server", "radius", "dynamic-author"]:
+            a.coa = True
+            for child in node.children:
+                if child.words == ["auth-type", "any"]:
+                    continue  # what RouterShift writes; EOS accepts CoA from any configured RADIUS server
+                self._reason = ("RADIUS change-of-authorization clients",
+                                "the clients and their keys are not converted; change of authorization is switched on")
+                self.unparsed(child, node.text)
+            return True
         if w[1:3] == ["group", "server"] and len(w) == 5 and w[3] in ("radius", "tacacs+"):
             group = AaaGroup("radius" if w[3] == "radius" else "tacacs", w[4], origin=origin)
             a.groups[group.name] = group
@@ -845,6 +869,14 @@ class _Reader:
         w = node.words[1:]
         if w[:2] == ["type", "pbr"]:
             return self._pbr_class(node, w[2:])
+        if w[:2] == ["type", "copp"] and len(w) in (3, 4):
+            for child in node.children:
+                c = child.words
+                if c[:3] == ["match", "ip", "access-group"] and len(c) == 4:
+                    self._copp_classes[w[-1]] = c[3]
+                else:
+                    self.unparsed(child, node.text)
+            return True
         if w[:2] == ["type", "qos"]:
             w = w[2:]
         match_all = w[0] != "match-any"  # IOS defaults to match-all
@@ -875,10 +907,29 @@ class _Reader:
         if w[:2] == ["type", "pbr"] and len(w) == 3:
             self._pbr_policies.append(node)  # its classes may come later in the file
             return True
+        if w[:2] == ["type", "copp"] and len(w) == 3:
+            cp = security_text.control_plane(self.device)
+            cp.policy = w[2]
+            for child in node.children:
+                c = child.words
+                if c[0] != "class" or len(c) != 2:
+                    self.unparsed(child, node.text)
+                    continue
+                cls = CoppClass(c[1], acl=self._copp_classes.get(c[1], ""))
+                for line in child.children:
+                    try:
+                        ok = security_text.eos_copp_class_line(cls, line.words)
+                    except (ValueError, IndexError):
+                        ok = False
+                    if not ok:
+                        self.unparsed(line, f"{node.text} / {child.text}")
+                cp.classes.append(cls)
+            return True
         if w[:2] == ["type", "quality-of-service"]:
             w = w[2:]
         if len(w) != 1:
             return False
+        self._policy_nodes[w[0]] = node
         if queuing_text.is_queuing([g.words for c in node.children for g in c.children]):
             return self._ios_queuing_policy(node, w[0])
         policy = QosPolicy(w[0], origin=Origin(node.line, node.text))
@@ -1055,7 +1106,180 @@ class _Reader:
         if node.words[1:] == ["system-auth-control"]:
             self.device.aaa.dot1x = True
             return True
+        if node.words[1:] == ["dynamic-authorization"]:
+            self.device.aaa.coa = True
+            return True
+        if node.words[1:] == ["protocol", "lldp", "bypass"]:
+            self._reason = ("802.1X session options", "LLDP passing unauthenticated ports is not converted; IOS "
+                                                      "lets LLDP through by default")
         return False
+
+    def system_cp(self, node: Node) -> bool:
+        """EOS: system control-plane / ip access-group ACL [vrf V] in."""
+        if node.words[1:] != ["control-plane"]:
+            return False
+        cp = security_text.control_plane(self.device)
+        cp.origin = Origin(node.line, node.text)
+        for child in node.children:
+            c = child.words
+            if c[:2] == ["ip", "access-group"] and len(c) in (4, 6) and c[-1] == "in" and \
+                    (len(c) == 4 or c[3] == "vrf"):
+                cp.acls[c[4] if len(c) == 6 else ""] = c[2]
+            else:
+                self.unparsed(child, node.text)
+        return True
+
+    def ios_control_plane(self, node: Node) -> bool:
+        """IOS: control-plane / service-policy input P (the policy is read as CoPP classes at the end)."""
+        if node.words != ["control-plane"]:
+            return False
+        cp = security_text.control_plane(self.device)
+        cp.origin = Origin(node.line, node.text)
+        for child in node.children:
+            c = child.words
+            if c[:2] == ["service-policy", "input"] and len(c) == 3:
+                cp.policy = c[2]
+            else:
+                self.unparsed(child, node.text)
+        return True
+
+    def _finish_copp(self) -> None:
+        """IOS: the control-plane policy's classes become CoPP classes; the policy is no QoS policy."""
+        d = self.device
+        cp = d.control_plane
+        if cp is None or not cp.policy or cp.policy not in self._policy_nodes:
+            return
+        node = self._policy_nodes[cp.policy]
+        d.qos_policies.pop(cp.policy, None)
+        d.unparsed = [u for u in d.unparsed if not u.section.startswith(node.text)]
+        for child in node.children:
+            c = child.words
+            if c[0] != "class" or len(c) != 2:
+                self.unparsed(child, node.text)
+                continue
+            qc = d.qos_classes.get(c[1])
+            cls = CoppClass(c[1], acl=qc.acl if qc else "")
+            if qc is not None and not qc.dscp:
+                d.qos_classes.pop(c[1], None)
+            for line in child.children:
+                try:
+                    ok = line.words[0] == "police" and security_text.ios_police(cls, line.words)
+                except (ValueError, IndexError):
+                    ok = False
+                if not ok:
+                    self.unparsed(line, f"{node.text} / {child.text}")
+            cp.classes.append(cls)
+
+    def mac(self, node: Node) -> bool:
+        """mac access-list [extended] NAME (EOS, IOS); EOS mac security with fips restrictions and profiles."""
+        w = node.words
+        if w[1:2] == ["access-list"] and len(w) in (3, 4) and (len(w) == 3 or w[2] == "extended"):
+            acl = MacAcl(w[-1], origin=Origin(node.line, node.text))
+            self.device.mac_acls[acl.name] = acl
+            for child in node.children:
+                try:
+                    ok = security_text.mac_acl_line(acl, child.words, len(w) == 4)
+                except (ValueError, IndexError):
+                    ok = False
+                if not ok:
+                    self.unparsed(child, node.text)
+            return True
+        if w[1:] == ["security"]:
+            for child in node.children:
+                c = child.words
+                if c == ["fips", "restrictions"]:
+                    self.device.macsec_fips = True
+                elif c[0] == "profile" and len(c) == 2:
+                    p = self.device.macsec_profiles.setdefault(c[1], MacsecProfile(c[1]))
+                    p.origin = Origin(child.line, child.text)
+                    for grand in child.children:
+                        try:
+                            ok = security_text.eos_profile_line(p, grand.words)
+                        except (ValueError, IndexError):
+                            ok = False
+                        if not ok:
+                            self.unparsed(grand, f"{node.text} / {child.text}")
+                elif c[0] == "license":
+                    self._reason = ("Device housekeeping", "software, licence, hardware and service settings of the "
+                                                           "device itself; set them the target's own way")
+                    self.unparsed(child, node.text)
+                else:
+                    self.unparsed(child, node.text)
+            return True
+        return False
+
+    def key_chain(self, node: Node) -> bool:
+        """IOS: key chain NAME macsec / key CKN / cryptographic-algorithm, key-string; a plain key chain is read for
+        the OSPF authentication that uses it."""
+        w = node.words
+        if w[1:2] == ["chain"] and len(w) == 3:
+            return self._plain_key_chain(node)
+        if w[1:2] != ["chain"] or len(w) != 4 or w[3] != "macsec":
+            return False
+        keys: List[Tuple[str, str]] = []
+        for child in node.children:
+            c = child.words
+            if c[0] == "key" and len(c) == 2:
+                cak = ""
+                for grand in child.children:
+                    g = grand.words
+                    if g[0] == "key-string" and len(g) in (2, 3):
+                        cak = g[1] if len(g) == 2 else (g[2] if g[1] == "0" else "")
+                    elif g[0] == "cryptographic-algorithm" or g[0] == "lifetime":
+                        pass
+                    else:
+                        self.unparsed(grand, f"{node.text} / {child.text}")
+                keys.append((c[1], cak))
+            else:
+                self.unparsed(child, node.text)
+        self._macsec_chains[w[2]] = keys
+        return True
+
+    def _plain_key_chain(self, node: Node) -> bool:
+        """IOS: key chain NAME / key N / key-string, cryptographic-algorithm (the keys are secrets and not kept)."""
+        keys: Dict[int, str] = {}
+        for child in node.children:
+            c = child.words
+            if c[0] != "key" or len(c) != 2 or not c[1].isdigit():
+                self.unparsed(child, node.text)
+                continue
+            algorithm = "md5"
+            for grand in child.children:
+                g = grand.words
+                if g[0] == "cryptographic-algorithm" and len(g) == 2 and g[1].startswith("hmac-sha-"):
+                    algorithm = g[1].replace("hmac-sha-", "sha")
+                elif g[0] == "cryptographic-algorithm" and g[1:] == ["md5"]:
+                    algorithm = "md5"
+                elif g[0] != "key-string":
+                    self.unparsed(grand, f"{node.text} / {child.text}")
+            keys[int(c[1])] = algorithm
+        self._key_chains[node.words[2]] = keys
+        return True
+
+    def mka(self, node: Node) -> bool:
+        """IOS: mka policy NAME."""
+        w = node.words
+        if w[1:2] != ["policy"] or len(w) != 3:
+            return False
+        p = self.device.macsec_profiles.setdefault(w[2], MacsecProfile(w[2]))
+        p.origin = Origin(node.line, node.text)
+        for child in node.children:
+            try:
+                ok = security_text.ios_mka_line(p, child.words)
+            except (ValueError, IndexError):
+                ok = False
+            if not ok:
+                self.unparsed(child, node.text)
+        return True
+
+    def _finish_macsec(self) -> None:
+        """IOS: a port's MKA policy takes the key of its pre-shared key chain."""
+        for name, chain in self._macsec_ports.items():
+            iface = self.device.interfaces.get(name)
+            p = self.device.macsec_profiles.get(iface.macsec_profile) if iface else None
+            keys = self._macsec_chains.get(chain)
+            if p is not None and keys:
+                p.ckn, p.cak = keys[0]
 
     def dot1x_line(self, iface: Interface, w: List[str]) -> bool:
         """IOS: authentication|access-session ..., dot1x pae authenticator, mab; EOS: dot1x ..."""
@@ -1079,6 +1303,13 @@ class _Reader:
             iface.dot1x_reauth_period = int(w[3])
         elif w[:3] == ["dot1x", "timeout", "reauth-period"] and n == 4:
             iface.dot1x_reauth_period = int(w[3])
+        elif w[:6] == ["dot1x", "authentication", "failure", "action", "traffic", "allow"] and n == 8 and \
+                w[6] == "vlan":
+            iface.dot1x_fail_vlan = int(w[7])
+        elif w[:5] == ["authentication", "event", "fail", "action", "authorize"] and n == 7 and w[5] == "vlan":
+            iface.dot1x_fail_vlan = int(w[6])
+        elif w[:2] == ["dot1x", "auth-fail"] and n == 4 and w[2] == "vlan":
+            iface.dot1x_fail_vlan = int(w[3])
         else:
             return False
         return True
@@ -2597,6 +2828,9 @@ class _Reader:
         m = self.device.management
         if w[1:4] == ["ip", "igmp", "snooping"]:
             return self.igmp_snooping(w[4:], False)
+        if w[1:] == ["ip", "dhcp", "snooping", "information", "option"]:
+            self.device.dhcp_option82 = False
+            return True
         if w[1:] in (["ip", "domain", "lookup"], ["ip", "domain-lookup"]):
             self.device.system.dns_lookup = False
             return True
@@ -3206,6 +3440,8 @@ class _Reader:
             iface.proxy_arp = w[0] != "no"
         elif w[:3] == ["ip", "ospf", "authentication"] and n in (3, 4) and w[3:] in ([], ["message-digest"]):
             iface.ospf_auth = "message-digest" if n == 4 else "simple"
+        elif w[:4] == ["ip", "ospf", "authentication", "key-chain"] and n == 5:
+            self._ospf_chains[iface.name] = w[4]
         elif w[:3] == ["ip", "ospf", "message-digest-key"] and n in (6, 7) and w[3].isdigit() and \
                 w[4] in ("md5", "sha1", "sha256", "sha384", "sha512"):
             iface.ospf_keys[int(w[3])] = w[4]  # the key itself is a secret the writer asks for again
@@ -3303,6 +3539,17 @@ class _Reader:
             iface.qos_trust = "none"
         elif w[0] == "service-profile" and n == 2:
             iface.qos_profile = w[1]
+        elif w[:3] == ["mac", "security", "profile"] and n == 4:
+            iface.macsec_profile = w[3]
+        elif w == ["macsec", "network-link"] or w == ["macsec"]:
+            pass  # IOS: the MKA policy below says which profile
+        elif w[:2] == ["mka", "policy"] and n == 3:
+            iface.macsec_profile = w[2]
+        elif w[:3] == ["mka", "pre-shared-key", "key-chain"] and n == 4:
+            self._macsec_ports[iface.name] = w[3]
+        elif w[:2] == ["mac", "access-group"] and n == 4 and w[3] in ("in", "out"):
+            setattr(iface, "mac_acl_in" if w[-1] == "in" else "mac_acl_out", w[2])
+
         elif w in (["no", "lldp", "transmit"], ["no", "lldp", "receive"]):
             setattr(iface, "lldp_tx" if w[2] == "transmit" else "lldp_rx", False)
         elif w[0] == "mlag" and n == 2 and w[1].isdigit():
@@ -3413,7 +3660,14 @@ class _Reader:
         for node in self._pbr_policies:
             self._pbr_policy(node, node.words[3])
         self._finish_syslog()
+        self._finish_copp()
         self._finish_qos()
+        self._finish_macsec()
+        for port, chain in self._ospf_chains.items():
+            iface = self.device.interfaces.get(port)
+            if iface is not None and chain in self._key_chains:
+                iface.ospf_auth = "message-digest"
+                iface.ospf_keys = dict(self._key_chains[chain])
         self._finish_vpn()
         multicast_text.finish(self.device)
         self._finish_monitor()

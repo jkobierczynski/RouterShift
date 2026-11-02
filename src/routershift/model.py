@@ -281,6 +281,10 @@ class Interface:
     dot1x_host_mode: str = ""  # "single-host", "multi-host" (one login opens the port), "multi-auth", "multi-domain"
     dot1x_reauth: bool = False
     dot1x_reauth_period: Optional[int] = None  # seconds; None = the platform default
+    dot1x_fail_vlan: Optional[int] = None  # a client that fails authentication is put in this VLAN
+    mac_acl_in: str = ""  # MacAcl names
+    mac_acl_out: str = ""
+    macsec_profile: str = ""  # MacsecProfile name
     origin: Origin = field(default_factory=Origin)
 
 
@@ -786,6 +790,7 @@ class Aaa:
     source: Dict[str, str] = field(default_factory=dict)  # protocol -> canonical source interface
     enable_secret: Optional[LocalUser] = None  # IOS/EOS enable secret, as a user named "enable"
     dot1x: bool = False  # 802.1X port authentication switched on for the device
+    coa: bool = False  # RADIUS change of authorization accepted (EOS dot1x dynamic-authorization, IOS dynamic-author)
 
 
 @dataclass
@@ -844,6 +849,61 @@ class QosProfile:
     queues: Dict[int, QosQueue] = field(default_factory=dict)
     shape_kbps: Optional[int] = None  # the whole port is shaped (IOS parent policy shape average)
     input_policy: str = ""  # EOS: service-policy type qos input inside the profile
+    origin: Origin = field(default_factory=Origin)
+
+
+@dataclass
+class CoppClass:
+    """A class of control-plane traffic and the rate it is limited to."""
+
+    name: str
+    acl: str = ""  # the ACL that picks the traffic ("" for a platform's own class, EOS copp-system-*)
+    pps: Optional[int] = None  # packets per second
+    kbps: Optional[int] = None
+
+
+@dataclass
+class ControlPlane:
+    """Protection of the device's CPU: ACLs on traffic to the device (EOS system control-plane, per VRF) and policing
+    by class (EOS policy-map type copp, IOS control-plane / service-policy input)."""
+
+    acls: Dict[str, str] = field(default_factory=dict)  # VRF ("" = default) -> ACL
+    policy: str = ""  # the name of the policing policy
+    classes: List[CoppClass] = field(default_factory=list)
+    origin: Origin = field(default_factory=Origin)
+
+
+@dataclass
+class MacsecProfile:
+    """MACsec with a pre-shared key (MKA): EOS mac security profile, IOS mka policy with a macsec key chain."""
+
+    name: str
+    cipher: str = ""  # "aes128-gcm", "aes256-gcm", "aes128-gcm-xpn", "aes256-gcm-xpn"; "" = the default
+    ckn: str = ""  # the connectivity association key name (hex)
+    cak: str = ""  # the key; "" when the source holds it encrypted
+    key_server_priority: Optional[int] = None
+    rekey_period: Optional[int] = None  # seconds
+    sci: bool = False  # the SCI is sent in every frame
+    lldp_bypass: bool = False  # LLDP passes unencrypted
+    origin: Origin = field(default_factory=Origin)
+
+
+@dataclass
+class MacAclEntry:
+    action: AclAction
+    sequence: Optional[int] = None
+    source: str = "any"  # "any", or "MAC MASK" in EOS colon form (00:11:22:33:44:55 00:00:00:00:00:00 = host)
+    destination: str = "any"
+    ethertype: Optional[int] = None
+    vlan: Optional[int] = None
+    log: bool = False
+    remark: str = ""
+
+
+@dataclass
+class MacAcl:
+    name: str
+    entries: List[MacAclEntry] = field(default_factory=list)
     origin: Origin = field(default_factory=Origin)
 
 
@@ -1060,6 +1120,11 @@ class Device:
     qos_classes: Dict[str, QosClass] = field(default_factory=dict)
     qos_policies: Dict[str, QosPolicy] = field(default_factory=dict)
     qos_profiles: Dict[str, QosProfile] = field(default_factory=dict)
+    control_plane: Optional[ControlPlane] = None
+    macsec_profiles: Dict[str, MacsecProfile] = field(default_factory=dict)
+    macsec_fips: bool = False  # EOS mac security / fips restrictions
+    mac_acls: Dict[str, MacAcl] = field(default_factory=dict)
+    dhcp_option82: Optional[bool] = None  # DHCP snooping inserts option 82; None = the platform default
     qos_dscp_tc: Dict[int, int] = field(default_factory=dict)  # DSCP -> traffic class (queue) it is put in
     qos_tc_dscp: Dict[int, int] = field(default_factory=dict)  # traffic class -> DSCP it is rewritten to
     snmp: Snmp = field(default_factory=Snmp)
