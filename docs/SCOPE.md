@@ -13,7 +13,7 @@ approximated and what a person has to look at.
 | `eos` | Arista EOS | `show running-config` | CLI configuration | 1 (done) |
 | `junos` | Juniper Junos (EX and QFX with ELS, MX, SRX in switching/routing) | `show configuration`, or `\| display set` | curly braces, for `load merge terminal` | 4 (done) |
 | `nxos` | Cisco NX-OS (Nexus 9000/3000, 9.x and 10.x) | `show running-config` | CLI configuration | 2 (core done) |
-| `aoscx` | HPE Aruba AOS-CX (10.x) | `show running-config` | CLI configuration | 1 (done) |
+| `aoscx` | HPE Aruba AOS-CX (10.x) | `show running-config` | CLI configuration | 4 (done) |
 | `aoss` | HPE Aruba AOS-S (ProCurve / ProVision, 16.x) | `show running-config` | CLI configuration | 1 (done) |
 | `comware` | HPE Comware 7 (FlexFabric, 5130/5140/5510...) | `display current-configuration` | system-view commands | 1 (done) |
 
@@ -590,6 +590,34 @@ platform converts to and from all the others.
 * The management port is always in VRF `mgmt`; a default route in that VRF becomes its `default-gateway`.
 * LACP is set on the LAG, not on its members.
 * AOS-CX counts the slot of the fixed ports from 1 and IOS from 0, so `1/1/7` becomes `GigabitEthernet1/0/7`.
+* Every feature group the IOS and EOS writers write is written for AOS-CX too, and read back. Where AOS-CX has
+  another shape, the writer uses the nearest construct and the report says so:
+  * An anycast gateway is `active-gateway` on the SVI; community and AS-path lists number their entries
+    (`ip community-list standard NAME seq N`, `ip aspath-list`), and route maps match them with `match
+    community-list` and `match aspath-list`.
+  * EVPN instances are VLAN-based (`evpn` / `vlan N` with `rd` and `route-target`): the VLANs of an EOS
+    VLAN-aware bundle are written each with the bundle's route targets. VXLAN floods by head-end replication, so
+    underlay multicast groups are left out.
+  * MLAG is VSX: the MLAG heartbeat is the keepalive and the reload delay `linkup-delay-timer`. StackWise Virtual
+    is VSF (`vsf member N` / `link`). Route leaking imports the source VRF's export route targets.
+  * Multicast has `router pim [vrf V]` with `rp-address A GROUPS`, and an anycast RP shares its address through
+    MSDP peers (`router msdp`).
+  * Queuing is `qos dscp-map` and a schedule profile per queuing profile (`strict queue N`, `dwrr queue N weight
+    W`); a port with queue settings of its own gets `<profile>-P<n>`. Queue shaping, WRED and ECN are left out.
+  * Control-plane ACLs are `apply access-list ip NAME control-plane vrf V`, the platform's CoPP classes classes of
+    `copp-policy RS-COPP`; MACsec is a MACsec policy with an MKA policy of the same name; MAC ACLs are
+    `access-list mac`.
+  * LLDP holds information a multiple of its timer; tracked objects follow port links (`track N interface P`) and
+    take a VRRP group down rather than lowering its priority.
+  * Roles are user groups with `cli command` rules, SSH keys `user NAME authorized-key`, the HTTP API the REST API,
+    and the minimum password length `password complexity`.
+  * PTP is the `1588v2` profile; event handlers have no CLI form (AOS-CX automates with NAE agents) and are
+    reported.
+  * OSPF keys are MD5 with a placeholder; GRE tunnels are `interface tunnel N`; PBR is a classifier policy with a
+    class and a PBR action list per route-map entry, applied `routed-in`.
+* AOS-CX has no RIP, IS-IS, MPLS, NAT or IPsec, no TWAMP reflector and no SNMP views: those are reported, not
+  converted. Several of the commands above are newer AOS-CX features (PTP, MACsec, VSF, PBR) that run on some
+  switches only; the report says so where it matters.
 
 ## Port names
 

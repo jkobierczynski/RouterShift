@@ -8,6 +8,12 @@
   policies, BFD, ECMP hashing, OSPF authentication and options, PBR as filter-based forwarding, RIP, IS-IS,
   MPLS/LDP and tunnels. Each converts EOS (the bl1-dc1 border leaf) to Junos and back with no line left unread;
   what Junos lacks is flagged instead of labelled exact.
+* AOS-CX is written and read to the same depth as IOS and EOS: anycast gateways, relay VRFs, community and AS-path
+  lists, EVPN instances, VSX options and VSF, VRF EVPN targets and leaking, BGP options, rendezvous points per VRF
+  and MSDP, the DSCP map and schedule profiles, CoPP, MACsec, MAC ACLs, LLDP options, tracked objects, banners,
+  user groups, SSH keys, the REST API, syslog transport, PTP, OSPF authentication and timers, GRE tunnels and PBR.
+  Each converts EOS (the bl1-dc1 border leaf) to AOS-CX and back with no line left unread; what AOS-CX lacks is
+  flagged instead of labelled exact.
 * The text report shows the device security section (CoPP, MACsec).
 
 * The report lists what RouterShift recognises but does not convert once per feature, with the reason and the line

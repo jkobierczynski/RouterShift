@@ -61,6 +61,14 @@ analyzers, SNMPv3 and login classes, PTP and event policies, BFD, ECMP hashing, 
 forwarding for PBR, RIP, IS-IS, MPLS/LDP and GRE tunnels. What Junos has no form for (an EOS route distinguisher
 per EVPN instance, a BFD slow timer, NAT and IPsec on a switch, ...) is written as the nearest construct or left
 out, and the report says which.
+HPE Aruba AOS-CX reads and writes to the same depth as well: besides the switch core it covers anycast gateways
+(active gateway), DHCP relay to another VRF, community and AS-path lists, EVPN instances with their route targets,
+VSX options and VSF stacks, VRF route targets for EVPN and route leaking, BGP options (timers, graceful restart,
+distance, best-path, aggregates, prefix limits), rendezvous points per VRF and MSDP, the DSCP map and schedule
+profiles, control-plane ACLs and CoPP classes, MACsec and MKA policies, MAC ACLs, LLDP options, tracked objects,
+banners, user groups and SSH keys, the REST API, syslog over TLS, PTP, OSPF authentication and timers, GRE tunnels
+and policy-based routing as classifier policies. What AOS-CX has no form for (RIP, IS-IS, MPLS, NAT, IPsec, event
+handlers, TWAMP, SNMP views, ...) is left out and reported, and the nearest construct is flagged as approximated.
 Cisco NX-OS reads through the IOS reader (with its own blocks: features, vrf context, neighbor blocks, hsrp and
 vrrp blocks, use-vrf) and writes the system settings, users, SNMP communities, VLANs, ports, port-channels, SVIs,
 the management port in VRF management, VRFs and their static routes, ACLs, prefix lists and route maps, HSRP and
