@@ -18,13 +18,16 @@ from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from .. import aaa as aaa_text
 from .. import bgp as bgp_text
+from .. import dhcp as dhcp_text
+from .. import fhrp as fhrp_text
 from .. import junospolicy
 from .. import ospf as ospf_text
 from .. import vrfs as vrfs_text
 from .. import vxlan as vxlan_text
 from ..junostext import Statement, read
-from ..model import (BgpNeighbor, Device, Interface, InterfaceKind, LacpMode, LocalUser, NtpKey, SnmpCommunity,
-                     StaticRoute, StpMode, SwitchportMode, Unparsed, Vlan)
+from ..model import (AaaMethod, AaaServer, BgpNeighbor, Device, DhcpPool, FhrpGroup, Interface, InterfaceKind,
+                     LacpMode, LocalUser, NtpKey, SnmpCommunity, StaticRoute, StpMode, SwitchportMode, Track, Unparsed,
+                     Vlan)
 
 _MEDIA = {"ge": "1g", "xe": "10g", "et": "100g", "mge": "2.5g", "fe": "100m"}
 _PHYSICAL = re.compile(r"^(ge|xe|et|mge|fe)-(\d+/\d+/\d+(?::\d+)?)$")
@@ -32,6 +35,7 @@ _LAG = re.compile(r"^ae(\d+)$")
 _MANAGEMENT = ("me0", "em0", "fxp0")
 LEVELS = ["emergency", "alert", "critical", "error", "warning", "notice", "info", "any"]
 CLASSES = {"super-user": 15, "operator": 5, "read-only": 1, "unauthorized": 0}
+MGMT_INSTANCE = "mgmt_junos"
 _STP = {"rstp": StpMode.RSTP, "stp": StpMode.STP, "mstp": StpMode.MSTP, "vstp": StpMode.RAPID_PVST}
 
 
@@ -95,6 +99,30 @@ class Reader:
         self.ospf_exports: Dict[str, List[str]] = {}  # routing instance -> export policies of its OSPF
         self.generated: List[Statement] = []  # generate route 0.0.0.0/0 discard (for default-information always)
         self.load_balance: List[str] = []
+        self.unit_macs: Dict[str, str] = {}  # canonical interface -> the MAC of its unit
+        self.anycast_marked: Set[str] = set()  # units whose addresses are virtual-gateway-address anycast gateways
+        self.virtual_mac = ""
+        self.unnumbered: Dict[str, str] = {}  # canonical interface -> unit it borrows from
+        self.storm_profiles: Dict[str, Dict[str, object]] = {}
+        self.storm_ports: Dict[str, str] = {}  # canonical interface -> profile
+        self.voip: Dict[str, str] = {}  # unit -> VLAN word
+        self.mac_limits: Dict[str, Tuple[int, str]] = {}  # unit -> (limit, action)
+        self.snooping: Dict[str, Dict[str, object]] = {}  # VLAN name -> dhcp-security settings
+        self.trust_groups: Dict[Tuple[str, str], List[str]] = {}  # (VLAN, group) -> units
+        self.trust_kind: Dict[Tuple[str, str], str] = {}  # (VLAN, group) -> trusted / untrusted
+        self.relay_servers: Dict[Tuple[str, str], List[str]] = {}  # (instance, server group) -> addresses
+        self.relay_active: Dict[Tuple[str, str], str] = {}  # (instance, group) -> server group
+        self.relay_units: Dict[Tuple[str, str], List[str]] = {}
+        self.relay_source: Dict[Tuple[str, str], str] = {}
+        self.dot1x_ports: Dict[str, Dict[str, str]] = {}  # unit -> settings
+        self.aaa_line = 0
+        self.vrrp_tracks: List[Tuple[FhrpGroup, str, int]] = []
+        self.management_instance = False
+        self.vrrp_v3 = False
+        self.accounting: List[str] = []
+        self.accounting_to = ""
+        self.aaa_sources: Dict[str, str] = {}
+        self.pool_ranges: Dict[Tuple[str, str], Dict[str, Dict[str, str]]] = {}
 
     # -------------------------------------------------------------------------------------------------------------
 
@@ -130,6 +158,8 @@ class Reader:
             "snmp": self.snmp, "chassis": self.chassis,
             "policy-options": lambda s: self.policy.policy_options(s.line, s.words[1:]),
             "firewall": lambda s: self.policy.firewall(s.line, s.words[1:]),
+            "forwarding-options": lambda s: self.forwarding_options(s, s.words[1:], ""),
+            "switch-options": self.switch_options, "poe": self.poe_line, "access": lambda s: self.access(s.words[1:], ""),
         }
         # routing instances first: their interfaces belong to them before OSPF reads them
         later.sort(key=lambda s: s.words[0] != "routing-instances" or "protocols" in s.words[:3])
@@ -164,6 +194,23 @@ class Reader:
         if rest[0] == "l3-interface" and len(rest) == 2:
             self.l3_units[rest[1]] = name
             return True
+        if rest[:2] == ["forwarding-options", "dhcp-security"]:
+            settings = self.snooping.setdefault(name, {})
+            more = rest[2:]
+            if not more:
+                return True
+            if more in (["arp-inspection"], ["ip-source-guard"], ["option-82"]):
+                settings[more[0]] = True
+                return True
+            if more[0] == "group" and len(more) >= 3:
+                key = (name, more[1])
+                if more[2:] in (["overrides", "trusted"], ["overrides", "untrusted"]):
+                    self.trust_kind[key] = more[3]
+                    return True
+                if more[2] == "interface" and len(more) == 4:
+                    self.trust_groups.setdefault(key, []).append(more[3])
+                    return True
+            return False
         return False
 
     def vlan_id(self, word: str) -> List[str]:
@@ -246,6 +293,16 @@ class Reader:
             self.ifds[rest[2]] = lag[0]
         elif rest[:2] == ["aggregated-ether-options", "lacp"] and len(rest) == 3 and rest[2] in ("active", "passive"):
             self.lacp[port.name] = LacpMode(rest[2])
+        elif rest[0] in ("ether-options", "gigether-options") and len(rest) == 3 and rest[1] == "speed" or \
+                rest[0] == "speed" and len(rest) == 2:
+            port.speed = bandwidth(rest[-1])
+            return port.speed is not None
+        elif rest[0] in ("ether-options", "gigether-options") and rest[1:2] == ["link-mode"] and len(rest) == 3 or \
+                rest[0] == "link-mode" and len(rest) == 2:
+            mode = {"full-duplex": "full", "half-duplex": "half", "automatic": "auto"}.get(rest[-1])
+            if mode is None:
+                return False
+            port.duplex = mode
         else:
             return False
         return True
@@ -259,6 +316,14 @@ class Reader:
             iface.encapsulation_vlan = int(rest[1])
         elif rest[0] == "family" and len(rest) >= 2:
             return self.family(s, iface, rest[1], rest[2:])
+        elif rest[0] == "mac" and len(rest) == 2:
+            self.unit_macs[iface.name] = fhrp_text.mac(rest[1])
+        elif rest[0] in ("virtual-gateway-v4-mac", "virtual-gateway-v6-mac") and len(rest) == 2:
+            self.virtual_mac = fhrp_text.mac(rest[1])
+        elif rest == ["virtual-gateway-accept-data"]:
+            pass
+        elif rest[0] == "proxy-arp" and rest[1:] in ([], ["restricted"], ["unrestricted"]):
+            iface.proxy_arp = True
         else:
             return False
         return True
@@ -282,7 +347,25 @@ class Reader:
                     addresses.remove(rest[1])
                     addresses.insert(0, rest[1])
                     return True
+                if rest[2:3] == ["virtual-gateway-address"] and len(rest) == 4:
+                    length = rest[1].split("/")[1]
+                    (iface.virtual_ipv4 if family == "inet" else iface.virtual_ipv6).append(f"{rest[3]}/{length}")
+                    return True
+                if rest[2:3] == ["vrrp-group"] and len(rest) >= 5 and family == "inet":
+                    return self.vrrp(iface, int(rest[3]), rest[4:])
                 return len(rest) == 2
+            if rest[0] == "mtu" and len(rest) == 2 and family == "inet":
+                iface.mtu = int(rest[1])
+                return True
+            if rest[0] == "unnumbered-address" and len(rest) == 2 and family == "inet":
+                self.unnumbered[iface.name] = rest[1]
+                return True
+            if rest[0] == "rpf-check" and rest[1:] in ([], ["mode", "loose"]):
+                iface.urpf = "loose" if rest[1:] else "strict"
+                return True
+            if rest == ["no-redirects"] and family == "inet":
+                iface.ip_redirects = False
+                return True
             return False
         if family == "ethernet-switching":
             if iface.mode == SwitchportMode.ROUTED:
@@ -299,7 +382,38 @@ class Reader:
             if rest[0] == "native-vlan-id" and len(rest) == 2:
                 iface.native_vlan = int(rest[1])
                 return True
+            if rest[0] == "storm-control" and len(rest) == 2:
+                self.storm_ports[iface.name] = rest[1]
+                return True
         return False
+
+    def vrrp(self, iface: Interface, number: int, w: List[str]) -> bool:
+        group = next((g for g in iface.fhrp if g.protocol == "vrrp" and g.group == number), None)
+        if group is None:
+            group = FhrpGroup("vrrp", number)
+            iface.fhrp.append(group)
+        if w[0] == "virtual-address" and len(w) == 2:
+            if not group.address:
+                group.address = w[1]
+            elif w[1] != group.address and w[1] not in group.secondary:
+                group.secondary.append(w[1])
+        elif w[0] == "priority" and len(w) == 2:
+            group.priority = int(w[1])
+        elif w == ["no-preempt"]:
+            group.preempt = False
+        elif w == ["preempt"]:
+            group.preempt = True
+        elif w[0] == "advertise-interval" and len(w) == 2:
+            group.hello_ms = int(w[1]) * 1000
+        elif w[0] == "fast-interval" and len(w) == 2:
+            group.hello_ms = int(w[1])
+        elif w == ["accept-data"]:
+            pass
+        elif w[:2] == ["track", "interface"] and len(w) == 5 and w[3] == "priority-cost":
+            self.vrrp_tracks.append((group, w[2], int(w[4])))
+        else:
+            return False
+        return True
 
     # system ------------------------------------------------------------------------------------------------------
 
@@ -346,7 +460,51 @@ class Reader:
             else:
                 return False
         elif w == ["management-instance"]:
-            pass
+            self.management_instance = True
+        elif w[0] in ("radius-server", "tacplus-server") and len(w) >= 2:
+            return self.aaa_server("radius" if w[0] == "radius-server" else "tacacs", w[1], w[2:], s.line)
+        elif w[0] == "authentication-order" and len(w) == 2:
+            method = next((m for m in self.device.aaa.methods if m.kind == "authentication" and m.service == "login"),
+                          None)
+            if method is None:
+                method = AaaMethod("authentication", "login")
+                method.origin.line = s.line
+                self.device.aaa.methods.append(method)
+            word = {"radius": "group:radius", "tacplus": "group:tacacs", "password": "local"}.get(w[1])
+            if word is None:
+                return False
+            method.methods.append(word)
+        elif w[:2] == ["accounting", "events"] and len(w) == 3 and w[2] in ("login", "interactive-commands"):
+            self.accounting.append(w[2])
+        elif w[:2] == ["accounting", "destination"] and len(w) >= 3 and w[2] in ("radius", "tacplus"):
+            self.accounting_to = w[2]
+        elif w[:3] == ["services", "dhcp-local-server", "group"] and len(w) == 6 and w[4] == "interface":
+            pass  # the interfaces of the pools' networks serve them
+        else:
+            return False
+        return True
+
+    def aaa_server(self, protocol: str, address: str, w: List[str], line: int) -> bool:
+        a = self.device.aaa
+        server = next((x for x in a.servers if x.protocol == protocol and x.address == address), None)
+        if server is None:
+            server = AaaServer(protocol, address)
+            server.origin.line = line
+            a.servers.append(server)
+        if not w:
+            return True
+        if w[0] == "secret" and len(w) == 2:
+            server.key = "" if w[1].startswith("$9$") or w[1] == aaa_text.PLACEHOLDER else w[1]
+        elif w[0] == "port" and len(w) == 2:
+            server.auth_port = int(w[1])
+        elif w[0] == "accounting-port" and len(w) == 2:
+            server.acct_port = int(w[1])
+        elif w[0] == "timeout" and len(w) == 2:
+            server.timeout = int(w[1])
+        elif w[0] == "source-address" and len(w) == 2:
+            self.aaa_sources[protocol] = w[1]
+        elif w[0] == "routing-instance" and len(w) == 2:
+            server.vrf = w[1]
         else:
             return False
         return True
@@ -430,6 +588,111 @@ class Reader:
         if w[0] == "source-address" and len(w) == 2:
             sy.logging_source = vxlan_text.interface_of(self.device, w[1])
             return bool(sy.logging_source)
+        return False
+
+    # forwarding options, switch options, PoE, access ----------------------------------------------------------------
+
+    def forwarding_options(self, s: Statement, w: List[str], vrf: str) -> bool:
+        if w[0] == "storm-control-profiles" and len(w) >= 4 and w[2] == "all":
+            profile = self.storm_profiles.setdefault(w[1], {})
+            rest = w[3:]
+            if rest[0] == "bandwidth-percentage" and len(rest) == 2:
+                profile["level"] = float(rest[1])
+            elif rest[0] in ("no-broadcast", "no-multicast", "no-unknown-unicast", "no-registered-multicast",
+                             "no-unregistered-multicast") and len(rest) == 1:
+                profile[rest[0]] = True
+            else:
+                return False
+            return True
+        if w[0] == "dhcp-relay" and len(w) >= 3:
+            rest = w[1:]
+            if rest[0] == "server-group" and len(rest) == 3:
+                self.relay_servers.setdefault((vrf, rest[1]), []).append(rest[2])
+                return True
+            if rest[0] == "group" and len(rest) == 4:
+                key = (vrf, rest[1])
+                if rest[2] == "active-server-group":
+                    self.relay_active[key] = rest[3]
+                elif rest[2] == "interface":
+                    self.relay_units.setdefault(key, []).append(rest[3])
+                elif rest[2] == "relay-source":
+                    self.relay_source[key] = rest[3]
+                else:
+                    return False
+                return True
+        return False
+
+    def switch_options(self, s: Statement) -> bool:
+        w = s.words[1:]
+        if w[:2] == ["voip", "interface"] and len(w) == 5 and w[3] == "vlan":
+            self.voip[w[2]] = w[4]
+            return True
+        if w[:2] == ["voip", "interface"] and len(w) == 5 and w[3] == "forwarding-class":
+            return True
+        if w[0] == "interface" and len(w) >= 4 and w[2] == "interface-mac-limit":
+            limit, action = self.mac_limits.get(w[1], (1, "shutdown"))
+            if len(w) == 4 and w[3].isdigit():
+                limit = int(w[3])
+            elif w[3:4] == ["packet-action"] and len(w) == 5:
+                action = w[4]
+            else:
+                return False
+            self.mac_limits[w[1]] = (limit, action)
+            return True
+        return False
+
+    def poe_line(self, s: Statement) -> bool:
+        w = s.words[1:]
+        if w[0] != "interface" or len(w) < 2:
+            return False
+        iface = self.stp_port(w[1])
+        if iface is None:
+            return False
+        rest = w[2:]
+        if not rest:
+            iface.poe = True
+        elif rest == ["disable"]:
+            iface.poe = False
+        elif rest[0] == "priority" and len(rest) == 2 and rest[1] in ("low", "high"):
+            iface.poe_priority = rest[1]
+        elif rest[0] == "maximum-power" and len(rest) == 2:
+            iface.poe_max_mw = int(float(rest[1]) * 1000)
+        else:
+            return False
+        return True
+
+    def access(self, w: List[str], vrf: str) -> bool:
+        if w[0] == "profile" and len(w) >= 3:
+            # the access profile 802.1X uses: its servers are the system's RADIUS servers
+            return w[2] in ("authentication-order", "radius") or w[2:3] == ["radius-server"]
+        if w[0] == "radius-server" and len(w) >= 2:
+            return self.aaa_server("radius", w[1], w[2:], 0)
+        if w[:2] == ["address-assignment", "pool"] and len(w) >= 5 and w[3] == "family" and w[4] == "inet":
+            pool = next((p for p in self.device.dhcp_pools if p.name == w[2] and p.vrf == vrf), None)
+            if pool is None:
+                pool = DhcpPool(w[2], vrf=vrf)
+                self.device.dhcp_pools.append(pool)
+            rest = w[5:]
+            if not rest:
+                return True
+            if rest[0] == "network" and len(rest) == 2:
+                pool.network = rest[1]
+            elif rest[0] == "range" and len(rest) == 4 and rest[2] in ("low", "high"):
+                self.pool_ranges.setdefault((vrf, pool.name), {}).setdefault(rest[1], {})[rest[2]] = rest[3]
+            elif rest[0] == "dhcp-attributes" and len(rest) == 3:
+                if rest[1] == "router":
+                    pool.default_routers.append(rest[2])
+                elif rest[1] == "name-server":
+                    pool.dns_servers.append(rest[2])
+                elif rest[1] == "domain-name":
+                    pool.domain_name = rest[2]
+                elif rest[1] == "maximum-lease-time":
+                    pool.lease_seconds = 0 if rest[2] == "infinite" else int(rest[2])
+                else:
+                    return False
+            else:
+                return False
+            return True
         return False
 
     # SNMP and chassis --------------------------------------------------------------------------------------------
@@ -530,6 +793,12 @@ class Reader:
             return self.routing_options(s, rest[1:], vrf)
         if rest[0] == "protocols" and len(rest) >= 2 and rest[1] == "ospf":
             return self.protocols(s, rest[1:], vrf)
+        if rest[0] == "forwarding-options":
+            return self.forwarding_options(s, rest[1:], vrf)
+        if rest[0] == "access":
+            return self.access(rest[1:], vrf)
+        if rest[:3] == ["system", "services", "dhcp-local-server"]:
+            return True
         return False
 
     def protocols(self, s: Statement, w: List[str], vrf: str) -> bool:
@@ -555,11 +824,43 @@ class Reader:
             return False
         if w[0] in _STP:
             return self.stp(w[0], w[1:])
-        if w[:3] == ["layer2-control", "bpdu-block", "interface"] and len(w) == 4:
+        if w[:3] == ["layer2-control", "bpdu-block", "interface"] and len(w) in (4, 5):
             iface = self.stp_port(w[3])
-            if iface is None:
+            if iface is None or w[4:] not in ([], ["drop"]):
                 return False
-            iface.stp_bpduguard = True
+            if w[4:] == ["drop"]:
+                iface.stp_bpdufilter = True
+            else:
+                iface.stp_bpduguard = True
+            return True
+        if w[:2] == ["dot1x", "authenticator"] and len(w) >= 3:
+            return self.dot1x(w[2:])
+        if w == ["vrrp", "version-3"]:
+            self.vrrp_v3 = True
+            return True
+        return False
+
+    def dot1x(self, w: List[str]) -> bool:
+        if w[0] == "authentication-profile-name" and len(w) == 2:
+            self.device.aaa.dot1x = True
+            return True
+        if w[0] == "interface" and len(w) >= 2:
+            settings = self.dot1x_ports.setdefault(w[1], {})
+            rest = w[2:]
+            if not rest:
+                return True
+            if rest[0] == "supplicant" and len(rest) == 2 and rest[1] in ("single", "single-secure", "multiple"):
+                settings["supplicant"] = rest[1]
+            elif rest[0] == "mac-radius" and rest[1:] in ([], ["restrict"]):
+                settings["mac-radius"] = "restrict" if rest[1:] else "on"
+            elif rest[0] == "reauthentication" and len(rest) == 2:
+                settings["reauth"] = rest[1]
+            elif rest == ["no-reauthentication"]:
+                settings["reauth"] = ""
+            elif rest[0] in ("server-reject-vlan", "server-fail-vlan") and len(rest) == 2:
+                settings["fail"] = rest[1]
+            else:
+                return False
             return True
         return False
 
@@ -591,6 +892,8 @@ class Reader:
                 iface.stp_cost = int(rest[1])
             elif rest[0] == "priority" and len(rest) == 2:
                 iface.stp_port_priority = int(rest[1])
+            elif rest == ["bpdu-timeout-action", "block"]:
+                iface.stp_guard = "loop"
             else:
                 return False
             return True
@@ -742,10 +1045,137 @@ class Reader:
                 iface.stp_bpduguard = True
         for p in dev.ospf:
             p.router_id = self.router_ids.get(p.vrf, "")
+        if self.management_instance:
+            # the management port is in its own routing instance, mgmt_junos
+            for iface in dev.interfaces.values():
+                if iface.kind == InterfaceKind.MANAGEMENT:
+                    iface.vrf = MGMT_INSTANCE
+                    if MGMT_INSTANCE not in dev.vrfs:
+                        dev.vrfs.insert(0, MGMT_INSTANCE)
+        self.finish_ports()
+        self.finish_services()
         self.finish_exports()
         if self.local_as:
             self.finish_bgp()
         self.policy.finish(lambda line, text, why: dev.unparsed.append(Unparsed(line, text, why)))
+
+    def canonical(self, unit: str) -> Optional[Interface]:
+        name = self.units.get(unit) or self.units.get(f"{unit}.0") or self.ifds.get(unit)
+        return self.device.interfaces.get(name) if name else None
+
+    def finish_ports(self) -> None:
+        dev = self.device
+        # anycast gateways: the same MAC on several units (or EVPN's default gateway without its community)
+        macs = list(self.unit_macs.values())
+        shared = {m for m in macs if macs.count(m) > 1}
+        for name, mac in self.unit_macs.items():
+            iface = dev.interfaces[name]
+            if mac in shared:
+                dev.anycast_mac = mac
+                iface.virtual_ipv4, iface.ipv4 = iface.ipv4, []
+                iface.virtual_ipv6, iface.ipv6 = iface.ipv6, []
+            else:
+                iface.mac_address = mac
+        if self.virtual_mac:
+            dev.anycast_mac = self.virtual_mac
+        for name, unit in self.unnumbered.items():
+            target = self.canonical(unit)
+            dev.interfaces[name].unnumbered = target.name if target else unit
+        for vgroup, vunit, cost in self.vrrp_tracks:
+            tracked = self.canonical(vunit)
+            if tracked is not None:
+                track = f"{tracked.name}-track"
+                dev.tracks.setdefault(track, Track(track, interface=tracked.name))
+                vgroup.tracks[track] = cost
+        if self.vrrp_v3:
+            for iface in dev.interfaces.values():
+                for g in iface.fhrp:
+                    g.version = 3
+        for name, profile in self.storm_ports.items():
+            settings = self.storm_profiles.get(profile, {})
+            level = settings.get("level")
+            if isinstance(level, float):
+                for kind in ("broadcast", "multicast", "unknown-unicast"):
+                    if not settings.get(f"no-{kind}"):
+                        dev.interfaces[name].storm_control[kind] = level
+        for unit, word in self.voip.items():
+            voice = self.canonical(unit)
+            if voice is not None:
+                voice.voice_vlan = int(self.vlan_id(word)[0])
+        for unit, (limit, action) in self.mac_limits.items():
+            secured = self.canonical(unit)
+            if secured is not None:
+                secured.port_security = True
+                secured.port_security_max = limit
+                secured.port_security_violation = {"drop-and-log": "restrict", "drop": "protect", "log": "restrict",
+                                                 "shutdown": "shutdown"}.get(action, "shutdown")
+        untrusted: Set[str] = set()
+        for key, units in self.trust_groups.items():
+            kind = self.trust_kind.get(key, "")
+            for unit in units:
+                member = self.canonical(unit)
+                if member is None:
+                    continue
+                if kind == "trusted":
+                    member.dhcp_trust = member.arp_trust = True
+                elif kind == "untrusted":
+                    untrusted.add(member.name)
+        for name, settings in self.snooping.items():
+            vid = self.vlan_names.get(name)
+            if vid is None:
+                continue
+            snooped = dev.vlans[vid]
+            snooped.dhcp_snooping = True
+            dev.dhcp_snooping = True
+            snooped.arp_inspection = bool(settings.get("arp-inspection"))
+            if settings.get("option-82"):
+                dev.dhcp_option82 = True
+            for iface in dev.interfaces.values():
+                carried = self.members.get(iface.name, [])
+                if iface.mode == SwitchportMode.TRUNK and iface.name not in untrusted and not iface.lag and (
+                        "all" in carried or name in carried or str(vid) in carried):
+                    iface.dhcp_trust = iface.arp_trust = True  # Junos trusts trunk ports unless told otherwise
+                if settings.get("ip-source-guard") and iface.mode == SwitchportMode.ACCESS and (
+                        name in carried or str(vid) in carried):
+                    iface.source_guard = True
+        modes = {"single-secure": "single-host", "single": "multi-host", "multiple": "multi-auth"}
+        for unit, port_settings in self.dot1x_ports.items():
+            auth = self.canonical(unit)
+            if auth is None:
+                continue
+            auth.dot1x = port_settings.get("mac-radius") != "restrict"
+            auth.mab = "mac-radius" in port_settings
+            if auth.dot1x:
+                auth.dot1x_host_mode = modes.get(port_settings.get("supplicant", "single-secure"), "single-host")
+            reauth = port_settings.get("reauth", "")
+            auth.dot1x_reauth = bool(reauth)
+            auth.dot1x_reauth_period = int(reauth) if reauth.isdigit() else None
+            if "fail" in port_settings:
+                auth.dot1x_fail_vlan = int(self.vlan_id(port_settings["fail"])[0])
+
+    def finish_services(self) -> None:
+        dev = self.device
+        for (vrf, group), units in self.relay_units.items():
+            servers = self.relay_servers.get((vrf, self.relay_active.get((vrf, group), group)), [])
+            source = self.canonical(self.relay_source.get((vrf, group), ""))
+            for unit in units:
+                iface = self.canonical(unit)
+                if iface is not None:
+                    iface.helper_addresses = list(servers)
+                    iface.helper_source = source.name if source else ""
+        for (vrf, name), ranges in self.pool_ranges.items():
+            pool = next(p for p in dev.dhcp_pools if p.name == name and p.vrf == vrf)
+            pool.ranges = [(r["low"], r["high"]) for r in ranges.values() if "low" in r and "high" in r]
+        a = dev.aaa
+        for protocol, address in self.aaa_sources.items():
+            name = vxlan_text.interface_of(dev, address)
+            if name:
+                a.source[protocol] = name
+        if self.accounting and self.accounting_to:
+            protocol = "group:radius" if self.accounting_to == "radius" else "group:tacacs"
+            for event in self.accounting:
+                a.methods.append(AaaMethod("accounting", "exec" if event == "login" else "commands", [protocol],
+                                           record="start-stop"))
 
     def finish_exports(self) -> None:
         """Export policies RouterShift writes for redistribution are read back as redistribution."""

@@ -29,7 +29,8 @@ _NAMES = {"aoscx": "AOS-CX", "aoss": "AOS-S", "comware": "Comware", "junos": "Ju
 
 # The settings below each other writer writes (or reports itself, where the target has no equivalent), by key
 WRITES: Dict[str, Set[str]] = {
-    "junos": {"policy-lists"},
+    "junos": {"policy-lists", "anycast-gateway", "relay-vrf", "hardening", "svi-mac", "autostate", "unnumbered",
+              "dot1x-fail-vlan", "option82"},
 }
 
 Option = Tuple[str, str, object]  # (key, what the report calls it, whether the device has it)

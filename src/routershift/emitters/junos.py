@@ -14,19 +14,22 @@ from __future__ import annotations
 
 import ipaddress
 import re
-from typing import Dict, List, Tuple
+from typing import Dict, List, Set, Tuple
 
 from .. import aaa as aaa_text
 from .. import bgp as bgp_text
 from .. import stp as stp_text
+from .. import dhcp as dhcp_text
+from .. import fhrp as fhrp_text
 from .. import hosts as hosts_text
+from .. import l2sec as l2sec_text
 from .. import junospolicy
 from .. import ospf as ospf_text
 from .. import partial
 from .. import snmp as snmp_text
 from .. import vrfs as vrfs_text
 from ..junostext import Tree, quote
-from ..model import BgpNeighbor, Device, Interface, InterfaceKind, LacpMode, StpMode, SwitchportMode
+from ..model import BgpNeighbor, Device, FhrpGroup, Interface, InterfaceKind, LacpMode, StpMode, SwitchportMode
 from ..names import PortMapper
 from ..report import Report, Severity
 from ..timezones import offset_minutes, utc
@@ -37,7 +40,9 @@ CLASSES = [(15, "super-user"), (5, "operator"), (0, "read-only")]
 HASHES = ("md5-crypt", "sha256-crypt", "sha512-crypt", "junos")
 MGMT_INSTANCE = "mgmt_junos"
 # What partial.device need not report: the device-wide features this writer writes
-WRITTEN = {"acl", "policy"}
+WRITTEN = {"acl", "policy", "dhcp", "l2sec", "aaa"}
+# What partial.port need not report
+PORT_WRITTEN = {"dhcp-relay", "fhrp", "voice", "speed", "l2sec", "storm", "poe", "dot1x", "stp-guards"}
 _NAME_CHARS = re.compile(r"[^A-Za-z0-9_.-]+")
 
 
@@ -60,12 +65,18 @@ class Writer:
         self.report = report
         self.root = Tree()
         for section in ("system", "chassis", "interfaces", "snmp", "forwarding-options", "routing-options",
-                        "protocols", "policy-options", "class-of-service", "firewall", "vlans", "routing-instances"):
+                        "protocols", "policy-options", "class-of-service", "firewall", "access", "switch-options",
+                        "poe", "vlans", "routing-instances"):
             self.root.add(section)
         self.vlan_names: Dict[int, str] = {}
         self.prefix_kinds: Dict[str, str] = {}
         self.communities: Dict[str, List[str]] = {}
         self.filter_names: Dict[str, str] = {}
+        self.relays: List[Interface] = []
+        self.trusted: List[Tuple[Interface, str]] = []
+        self.guarded: List[Interface] = []
+        self.authenticators: List[Tuple[Interface, str]] = []
+        self.anycast_units: Set[Tuple[str, ...]] = set()
         self.mgmt_vrfs = {i.vrf for i in device.interfaces.values() if i.kind == InterfaceKind.MANAGEMENT and i.vrf}
 
     def add(self, *path: str) -> None:
@@ -90,6 +101,11 @@ class Writer:
         self.bgp()
         self.lldp()
         self.spanning_tree()
+        self.snooping()
+        self.dhcp_relay()
+        self.dhcp_server()
+        self.aaa()
+        self.dot1x()
         self.not_yet()
         self.report.unparsed(self.device.unparsed)
         self.root.children = {k: v for k, v in self.root.children.items() if v.children}
@@ -316,6 +332,8 @@ class Writer:
                     self.add(*top, f"mtu {iface.mtu}")
                     self.report.add("interface", self.label(iface), Severity.APPROX, "mtu",
                                     f"Junos counts the Ethernet header in the MTU; {iface.mtu} is written as it is")
+            if physical and iface.kind == InterfaceKind.ETHERNET:
+                self.ether_options(iface, top)
             if iface.lag:
                 self.add(*top, "ether-options", f"802.3ad {self.port(iface.lag)}")
                 self.leftovers(iface)
@@ -331,6 +349,8 @@ class Writer:
                     self.add(*path, f"description {quote(iface.description)}")
                 if iface.shutdown:
                     self.add(*path, "disable")
+                if iface.mtu:
+                    self.add(*path, "family inet", f"mtu {iface.mtu}")
             if iface.kind == InterfaceKind.SUBINTERFACE:
                 self.add("interfaces", ifd, "vlan-tagging")
                 if iface.encapsulation_vlan:
@@ -345,23 +365,181 @@ class Writer:
                     self.add(*switching, "vlan", f"members {word}")
                 if iface.mode == SwitchportMode.TRUNK and iface.native_vlan:
                     self.add(*top, f"native-vlan-id {iface.native_vlan}")
+                self.switching(iface, f"{ifd}.{unit}", switching)
             else:
-                for n, address in enumerate(iface.ipv4):
-                    if n == 0 and len(iface.ipv4) > 1:
-                        self.add(*path, "family inet", f"address {address}", "primary")
-                    else:
-                        self.add(*path, "family inet", f"address {address}")
-                if iface.dhcp_client:
-                    self.add(*path, "family inet", "dhcp")
-                for address in iface.ipv6:
-                    self.add(*path, "family inet6", f"address {address}")
-                self.interface_filters(iface, path)
-                if iface.kind in (InterfaceKind.VLAN, InterfaceKind.LOOPBACK) and not (
-                        iface.ipv4 or iface.ipv6 or iface.dhcp_client):
-                    self.add(*path, "family inet")
+                self.layer3(iface, path)
+            if physical:
+                self.poe(iface)
             self.leftovers(iface)
         if lags:
             self.add("chassis", "aggregated-devices", "ethernet", f"device-count {lags}")
+
+    def ether_options(self, iface: Interface, top: Tuple[str, ...]) -> None:
+        if iface.speed:
+            self.add(*top, "ether-options", f"speed {bandwidth(iface.speed)}")
+        if iface.duplex in ("full", "half"):
+            self.add(*top, "ether-options", f"link-mode {iface.duplex}-duplex")
+
+    def layer3(self, iface: Interface, path: Tuple[str, ...]) -> None:
+        """The addresses of a routed interface, with its gateway redundancy, relay and hardening."""
+        label = self.label(iface)
+        groups = fhrp_text.plan(iface, "junos", self.report, iface.source_name or iface.name)
+        anycast = [g for g in groups if g.protocol == "anycast"]
+        virtual = list(iface.virtual_ipv4) + [g.address for g in anycast]
+        addresses = list(iface.ipv4)
+        shared_mac = self.device.anycast_mac or next((g.mac for g in anycast if g.mac), "")
+        if virtual and not addresses:
+            # an anycast gateway alone: the address and MAC are the same on every switch of the fabric
+            addresses = [a if "/" in a else f"{a}/32" for a in virtual]
+            virtual = []
+            if shared_mac:
+                self.add(*path, f"mac {shared_mac}")
+                self.anycast_units.add(path)
+        for n, address in enumerate(addresses):
+            where = path + ("family inet", f"address {address}")
+            self.add(*where)
+            if n == 0 and len(addresses) > 1:
+                self.add(*where, "primary")
+            net = ipaddress.ip_interface(address).network
+            for vip in virtual:
+                if ipaddress.ip_interface(vip).ip in net:
+                    self.add(*where, f"virtual-gateway-address {ipaddress.ip_interface(vip).ip}")
+            for g in groups:
+                if g.protocol == "vrrp" and (ipaddress.ip_address(g.address) in net or n == 0 and not any(
+                        ipaddress.ip_address(g.address) in ipaddress.ip_interface(a).network for a in addresses)):
+                    self.vrrp(iface, g, where)
+        if virtual and shared_mac:
+            self.add(*path, f"virtual-gateway-v4-mac {shared_mac}")
+        if iface.dhcp_client:
+            self.add(*path, "family inet", "dhcp")
+        ipv6 = list(iface.ipv6)
+        if iface.virtual_ipv6 and not ipv6:
+            ipv6 = list(iface.virtual_ipv6)
+        elif iface.virtual_ipv6:
+            for vip in iface.virtual_ipv6:
+                net6 = next((a for a in ipv6 if ipaddress.ip_interface(vip).ip in ipaddress.ip_interface(a).network),
+                            ipv6[0])
+                self.add(*path, "family inet6", f"address {net6}", f"virtual-gateway-address "
+                         f"{ipaddress.ip_interface(vip).ip}")
+            if shared_mac:
+                self.add(*path, f"virtual-gateway-v6-mac {shared_mac}")
+        for address in ipv6:
+            self.add(*path, "family inet6", f"address {address}")
+        self.interface_filters(iface, path)
+        if iface.kind in (InterfaceKind.VLAN, InterfaceKind.LOOPBACK) and not (
+                addresses or ipv6 or iface.dhcp_client or iface.unnumbered):
+            self.add(*path, "family inet")
+        if iface.unnumbered:
+            self.add(*path, "family inet", f"unnumbered-address {self.unit_name(iface.unnumbered)}")
+        if iface.urpf:
+            self.add(*path, "family inet", "rpf-check" + (" mode loose" if iface.urpf == "loose" else ""))
+            if iface.ipv6:
+                self.add(*path, "family inet6", "rpf-check" + (" mode loose" if iface.urpf == "loose" else ""))
+        if iface.ip_redirects is False:
+            self.add(*path, "family inet", "no-redirects")
+        if iface.proxy_arp:
+            self.add(*path, "proxy-arp unrestricted")
+        if iface.ip_unreachables is not None:
+            self.report.add("interface", label, Severity.APPROX, "unreachables",
+                            f"Junos has no per-interface switch for ICMP unreachables ({'on' if iface.ip_unreachables else 'off'}); "
+                            "it sends them unless a filter discards the packets with reject")
+        if iface.mac_address:
+            self.add(*path, f"mac {iface.mac_address}")
+        if iface.autostate is False:
+            self.report.add("interface", label, Severity.APPROX, "autostate",
+                            "Junos has no 'no autostate': the irb unit goes down when no port of its VLAN is up")
+        if iface.helper_addresses:
+            self.relays.append(iface)
+
+    def vrrp(self, iface: Interface, g: FhrpGroup, where: Tuple[str, ...]) -> None:
+        add = fhrp_text.adder(self.report, iface.source_name or iface.name, g)
+        path = where + (f"vrrp-group {g.group}",)
+        self.add(*path, f"virtual-address {g.address}")
+        for address in g.secondary:
+            self.add(*path, f"virtual-address {address}")
+        if g.priority is not None:
+            self.add(*path, f"priority {g.priority}")
+        if g.preempt is False:
+            self.add(*path, "no-preempt")
+        if g.hello_ms is not None:
+            if g.hello_ms % 1000 == 0:
+                self.add(*path, f"advertise-interval {g.hello_ms // 1000}")
+            else:
+                self.add(*path, f"fast-interval {g.hello_ms}")
+        if g.version == 3:
+            self.add("protocols", "vrrp", "version-3")
+        if g.shutdown:
+            add(Severity.REVIEW, "fhrp-shutdown", "Junos cannot shut a VRRP group down; it is written active")
+        if g.name:
+            add(Severity.APPROX, "fhrp-name", f"Junos VRRP groups have no name; '{g.name}' is left out")
+        if g.mac:
+            add(Severity.APPROX, "fhrp-mac", "the virtual MAC is VRRP's own on Junos")
+        for track, decrement in g.tracks.items():
+            target = self.device.tracks.get(track)
+            if target is not None and target.interface:
+                self.add(*path, "track", f"interface {self.unit_name(target.interface)}", f"priority-cost {decrement}")
+            else:
+                add(Severity.REVIEW, "fhrp-track", f"tracking object {track} is not written: Junos VRRP tracks "
+                    "interfaces and routes; add it by hand")
+        self.add(*path, "accept-data")
+
+    def switching(self, iface: Interface, unit: str, switching: Tuple[str, ...]) -> None:
+        """Layer 2 settings of a switch port: voice VLAN, storm control, port security, trust, 802.1X."""
+        label = self.label(iface)
+        if iface.voice_vlan is not None:
+            self.add("switch-options", "voip", f"interface {unit}", f"vlan {self.vlan_names.get(iface.voice_vlan, iface.voice_vlan)}")
+        if iface.storm_control:
+            self.add(*switching, f"storm-control {self.storm_profile(iface, label)}")
+        if iface.port_security:
+            path = ("switch-options", f"interface {unit}")
+            self.add(*path, f"interface-mac-limit {iface.port_security_max or 1}")
+            action = {"shutdown": "shutdown", "restrict": "drop-and-log", "protect": "drop"}.get(
+                iface.port_security_violation or "shutdown", "shutdown")
+            self.add(*path, "interface-mac-limit", f"packet-action {action}")
+        if iface.dhcp_trust or iface.arp_trust:
+            self.trusted.append((iface, unit))
+            if iface.dhcp_trust != iface.arp_trust:
+                self.report.add("interface", label, Severity.APPROX, "trust",
+                                "Junos trusts a port for DHCP snooping and ARP inspection together")
+        if iface.source_guard:
+            self.guarded.append(iface)
+        if iface.dot1x or iface.mab:
+            self.authenticators.append((iface, unit))
+
+    def storm_profile(self, iface: Interface, label: str) -> str:
+        kinds = l2sec_text.storm(iface, "unknown-unicast", ["broadcast", "multicast", "unknown-unicast"], self.report,
+                                 label, PLATFORM)
+        level = min(kinds.values()) if kinds else 0.0
+        if len(set(kinds.values())) > 1:
+            self.report.add("interface", label, Severity.APPROX, "storm-level",
+                            f"Junos sets one level for the kinds a profile limits; {l2sec_text.level_text(level)}% "
+                            "(the lowest) is written for all")
+        name = "SC-" + l2sec_text.level_text(level).replace(".", "_") + "".join(
+            "-" + k[0].upper() for k in ("broadcast", "multicast", "unknown-unicast") if k in kinds)
+        base = ("forwarding-options", f"storm-control-profiles {name}", "all")
+        self.add(*base, f"bandwidth-percentage {l2sec_text.level_text(level)}")
+        for kind in ("broadcast", "multicast", "unknown-unicast"):
+            if kind not in kinds:
+                self.add(*base, f"no-{kind}")
+        return name
+
+    def poe(self, iface: Interface) -> None:
+        if iface.poe is None and not iface.poe_priority and iface.poe_max_mw is None:
+            return
+        path = ("poe", f"interface {self.port(iface.name)}")
+        if iface.poe is False:
+            self.add(*path, "disable")
+            return
+        self.add(*path)
+        if iface.poe_priority:
+            priority = "high" if iface.poe_priority in ("high", "critical") else "low"
+            self.add(*path, f"priority {priority}")
+            if iface.poe_priority not in ("high", "low"):
+                self.report.add("interface", self.label(iface), Severity.APPROX, "poe-priority",
+                                f"Junos PoE priorities are low and high; {iface.poe_priority} is written as {priority}")
+        if iface.poe_max_mw is not None:
+            watts = iface.poe_max_mw / 1000
+            self.add(*path, f"maximum-power {watts:g}")
 
     def interface_filters(self, iface: Interface, path: Tuple[str, ...]) -> None:
         for family, acl, direction in (("inet", iface.acl_in, "input"), ("inet", iface.acl_out, "output"),
@@ -371,7 +549,7 @@ class Writer:
 
     def leftovers(self, iface: Interface) -> None:
         """What a port carries that this writer does not write yet."""
-        written = set()
+        written = set(PORT_WRITTEN)
         if iface.mode == SwitchportMode.ROUTED or iface.kind not in (InterfaceKind.ETHERNET, InterfaceKind.LAG):
             written.add("acl")
         partial.port(iface, self.report, self.label(iface), PLATFORM, written)
@@ -671,7 +849,7 @@ class Writer:
         protocol = {StpMode.STP: "rstp", StpMode.RSTP: "rstp", StpMode.MSTP: "mstp", StpMode.RAPID_PVST: "vstp",
                     StpMode.PVST: "vstp"}.get(mode) if mode else None
         ports = [i for i in self.stp_ports() if i.stp_portfast or i.stp_cost or i.stp_port_priority is not None
-                 or i.stp_guard == "root" or i.stp_bpduguard]
+                 or i.stp_guard or i.stp_bpduguard or i.stp_bpdufilter]
         if protocol is None and not ports:
             return
         protocol = protocol or "rstp"
@@ -710,8 +888,220 @@ class Writer:
                 self.add(*path, f"priority {iface.stp_port_priority}")
             if iface.stp_guard == "root":
                 self.add(*path, "no-root-port")
+            if iface.stp_guard == "loop":
+                self.add(*path, "bpdu-timeout-action block")
+            if iface.stp_bpdufilter:
+                self.add("protocols", "layer2-control", "bpdu-block", f"interface {self.port(iface.name)}", "drop")
             if iface.stp_bpduguard:
                 self.add("protocols", "layer2-control", "bpdu-block", f"interface {self.port(iface.name)}")
+
+    # layer 2 security, DHCP, AAA and 802.1X ----------------------------------------------------------------------
+
+    def port_vlans(self, iface: Interface) -> List[int]:
+        if iface.mode == SwitchportMode.ACCESS:
+            return [iface.access_vlan or 1]
+        if not iface.allowed_vlans:
+            return sorted(self.device.vlans)
+        vids: List[int] = []
+        for part in iface.allowed_vlans.split(","):
+            low, _, high = part.strip().partition("-")
+            if low.isdigit():
+                vids += [v for v in range(int(low), int(high or low) + 1) if v in self.vlan_names]
+        return vids
+
+    def snooping(self) -> None:
+        dev = self.device
+        snooped = l2sec_text.snooping_vlans_written(dev, self.report)
+        inspected = l2sec_text.inspection_vlans(dev)
+        guarded = {v for i in self.guarded for v in self.port_vlans(i)}
+        vlans = sorted(set(snooped) | set(inspected) | guarded)
+        for vid in vlans:
+            base = ("vlans", self.vlan_names.get(vid, f"VLAN{vid}"), "forwarding-options", "dhcp-security")
+            self.add(*base)
+            if vid in inspected:
+                self.add(*base, "arp-inspection")
+            if vid in guarded:
+                self.add(*base, "ip-source-guard")
+            if dev.dhcp_option82:
+                self.add(*base, "option-82")
+            for iface, unit in self.trusted:
+                if vid in self.port_vlans(iface):
+                    self.add(*base, "group TRUSTED", "overrides trusted")
+                    self.add(*base, "group TRUSTED", f"interface {unit}")
+            for iface in self.device.interfaces.values():
+                if iface.mode == SwitchportMode.TRUNK and not iface.lag and not (iface.dhcp_trust or iface.arp_trust) \
+                        and vid in self.port_vlans(iface):
+                    unit = self.unit_name(iface.name)
+                    self.add(*base, "group UNTRUSTED", "overrides untrusted")  # Junos trusts trunk ports by default
+                    self.add(*base, "group UNTRUSTED", f"interface {unit}")
+        for vid in vlans:
+            if vid not in snooped:
+                self.report.add("vlan", str(vid), Severity.APPROX, "snooping-implied",
+                                "Junos inspects ARP and guards sources against DHCP snooping, so the VLAN snoops DHCP "
+                                "too")
+        for iface in self.guarded:
+            others = sorted({self.port(i.name) for i in self.device.interfaces.values() if i.mode ==
+                             SwitchportMode.ACCESS and not i.source_guard and set(self.port_vlans(i)) &
+                             set(self.port_vlans(iface))})
+            self.report.add("interface", self.label(iface), Severity.APPROX, "source-guard",
+                            "Junos guards source addresses per VLAN" + (
+                                f": {', '.join(others)} in the same VLAN are guarded too" if others else ""))
+        if dev.dhcp_option82 is not None and not vlans:
+            self.report.add("system", "DHCP snooping", Severity.REVIEW, "option82",
+                            "Junos inserts option 82 per snooped VLAN, and no VLAN snoops; left out")
+        elif dev.dhcp_option82 is not None:
+            self.report.item("system", "DHCP snooping")
+
+    def dhcp_relay(self) -> None:
+        groups: Dict[Tuple[str, Tuple[str, ...]], List[Interface]] = {}
+        for iface in self.relays:
+            groups.setdefault((iface.vrf, tuple(iface.helper_addresses)), []).append(iface)
+        numbers: Dict[str, int] = {}
+        for (vrf, servers), members in groups.items():
+            numbers[vrf] = numbers.get(vrf, 0) + 1
+            name = f"RELAY-{numbers[vrf]}"
+            base: Tuple[str, ...] = ("forwarding-options", "dhcp-relay")
+            if vrf:
+                base = ("routing-instances", self.instance(vrf)) + base
+            for server in servers:
+                self.add(*base, f"server-group {name}", server)
+            self.add(*base, f"group {name}", f"active-server-group {name}")
+            for iface in members:
+                self.add(*base, f"group {name}", f"interface {self.unit_name(iface.name)}")
+                if iface.helper_source:
+                    self.add(*base, f"group {name}", f"relay-source {self.unit_name(iface.helper_source)}")
+                if iface.helper_vrf and iface.helper_vrf != iface.vrf:
+                    self.report.add("interface", self.label(iface), Severity.REVIEW, "relay-vrf",
+                                    f"the DHCP servers are in VRF {iface.helper_vrf}: the relay is written in the "
+                                    f"interface's own routing instance, so leak the routes to the servers into it")
+
+    def dhcp_server(self) -> None:
+        for pool in self.device.dhcp_pools:
+            label = dhcp_text.label(pool)
+            self.report.item("dhcp", label)
+            base: Tuple[str, ...] = ("access", "address-assignment", f"pool {pool.name}", "family inet")
+            if pool.vrf:
+                base = ("routing-instances", self.instance(pool.vrf)) + base
+            if not pool.network:
+                self.report.skip("dhcp", label, "dhcp-network", "a Junos pool needs a network; the pool has none")
+                continue
+            self.add(*base, f"network {pool.network}")
+            for n, (low, high) in enumerate(pool.ranges, 1):
+                self.add(*base, f"range R{n}", f"low {low}")
+                self.add(*base, f"range R{n}", f"high {high}")
+            attrs = base + ("dhcp-attributes",)
+            for router in pool.default_routers:
+                self.add(*attrs, "router", router)
+            for server in pool.dns_servers:
+                self.add(*attrs, "name-server", server)
+            if pool.domain_name:
+                self.add(*attrs, f"domain-name {pool.domain_name}")
+            if pool.lease_seconds is not None:
+                self.add(*attrs, f"maximum-lease-time {pool.lease_seconds or 'infinite'}")
+            net = ipaddress.ip_network(pool.network)
+            served = [i for i in self.device.interfaces.values() if i.vrf == pool.vrf and any(
+                ipaddress.ip_interface(a).network == net for a in i.ipv4)]
+            where: Tuple[str, ...] = ("system", "services", "dhcp-local-server")
+            if pool.vrf:
+                where = ("routing-instances", self.instance(pool.vrf)) + where
+            for iface in served:
+                self.add(*where, "group DHCP-SERVER", f"interface {self.unit_name(iface.name)}")
+            if not served:
+                self.report.add("dhcp", label, Severity.REVIEW, "dhcp-interface",
+                                "no interface is in the pool's network; add the interface that serves it to "
+                                "system services dhcp-local-server by hand")
+
+    def aaa(self) -> None:
+        a = self.device.aaa
+        order: List[str] = []
+        for server in a.servers:
+            label = aaa_text.server_label(server)
+            self.report.item("management", label)
+            word = "radius-server" if server.protocol == "radius" else "tacplus-server"
+            path = ("system", f"{word} {server.address}")
+            self.add(*path, f"secret {quote(aaa_text.key(server, self.report))}")
+            if server.auth_port is not None:
+                self.add(*path, f"port {server.auth_port}")
+            if server.acct_port is not None and server.protocol == "radius":
+                self.add(*path, f"accounting-port {server.acct_port}")
+            if server.timeout is not None:
+                self.add(*path, f"timeout {server.timeout}")
+            source = a.source.get(server.protocol)
+            if source:
+                address = self.address_of(source)
+                if address:
+                    self.add(*path, f"source-address {address}")
+                else:
+                    self.report.add("management", label, Severity.REVIEW, "source-address",
+                                    f"Junos names the source by its address; {source} has none, left out")
+            if server.vrf:
+                self.add(*path, f"routing-instance {self.instance(server.vrf)}")
+        for method in a.methods:
+            label = aaa_text.method_label(method)
+            self.report.item("management", label)
+            if method.kind == "authentication" and method.service == "login" and method.name == "default":
+                for m in method.methods:
+                    protocol = aaa_text.protocol_of(self.device, m)
+                    word = {"radius": "radius", "tacacs": "tacplus", "": "password" if m == "local" else ""}[protocol]
+                    if word and word not in order:
+                        order.append(word)
+                    if m.startswith("group:") and m[6:] not in ("radius", "tacacs"):
+                        group = a.groups.get(m[6:])
+                        everyone = {s.address for s in a.servers if s.protocol == protocol}
+                        if group is not None and set(group.servers) != everyone:
+                            self.report.add("management", label, Severity.APPROX, "aaa-group",
+                                            f"Junos asks every {protocol} server; group {group.name} named only "
+                                            f"{', '.join(group.servers)}")
+                    if m in ("none", "enable", "if-authenticated"):
+                        self.report.add("management", label, Severity.APPROX, "aaa-method",
+                                        f"Junos has no '{m}' login method; left out")
+            elif method.kind == "authentication" and method.service == "dot1x":
+                pass  # the access profile of 802.1X
+            elif method.kind == "accounting" and method.service in ("exec", "commands"):
+                protocol = next((aaa_text.protocol_of(self.device, m) for m in method.methods
+                                 if aaa_text.protocol_of(self.device, m)), "")
+                if protocol:
+                    events = "login" if method.service == "exec" else "interactive-commands"
+                    self.add("system", "accounting", f"events {events}")
+                    self.add("system", "accounting", f"destination {'radius' if protocol == 'radius' else 'tacplus'}")
+            else:
+                self.report.add("management", label, Severity.APPROX, "aaa-method",
+                                f"Junos has no {method.kind} {method.service} method list"
+                                + (": the login class the server names decides what the user may run"
+                                   if method.kind == "authorization" else "; left out"))
+        for word in order:
+            self.add("system", f"authentication-order {word}")
+
+    def dot1x(self) -> None:
+        if not self.authenticators:
+            return
+        base = ("protocols", "dot1x", "authenticator")
+        self.add(*base, "authentication-profile-name dot1x")
+        servers = [s for s in self.device.aaa.servers if s.protocol == "radius"]
+        self.add("access", "profile dot1x", "authentication-order radius")
+        for server in servers:
+            self.add("access", "profile dot1x", "radius", "authentication-server", server.address)
+            self.add("access", f"radius-server {server.address}", f"secret {quote(aaa_text.key(server, self.report))}")
+        modes = {"single-host": "single-secure", "multi-host": "single", "multi-auth": "multiple",
+                 "multi-domain": "multiple"}
+        for iface, unit in self.authenticators:
+            path = base + (f"interface {unit}",)
+            label = self.label(iface)
+            if iface.dot1x:
+                mode = modes.get(iface.dot1x_host_mode or "single-host", "single-secure")
+                self.add(*path, f"supplicant {mode}")
+                if iface.dot1x_host_mode == "multi-domain":
+                    self.report.add("interface", label, Severity.APPROX, "dot1x-mode",
+                                    "multi-domain is written as supplicant multiple: the phone authenticates like any "
+                                    "other client")
+            if iface.mab:
+                self.add(*path, "mac-radius" + ("" if iface.dot1x else " restrict"))
+            if iface.dot1x_reauth:
+                self.add(*path, f"reauthentication {iface.dot1x_reauth_period or 3600}")
+            else:
+                self.add(*path, "no-reauthentication")
+            if iface.dot1x_fail_vlan is not None:
+                self.add(*path, f"server-reject-vlan {self.vlan_names.get(iface.dot1x_fail_vlan, iface.dot1x_fail_vlan)}")
 
     # the rest ----------------------------------------------------------------------------------------------------
 

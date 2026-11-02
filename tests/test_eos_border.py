@@ -307,10 +307,11 @@ def test_reads_back(target: str) -> None:
 def test_other_targets_report_what_they_leave_out(target: str) -> None:
     out, rep = convert(EOS, "eos", target)
     text = rep.to_text()
-    assert "anycast gateway 10.1.100.1/24" in text
     if target == "junos":
-        assert "community CL-BLACKHOLE {" in out
+        assert "community CL-BLACKHOLE {" in out and "virtual-gateway-v4-mac" not in out
+        assert "mac 00:1c:73:00:dc:01;" in out  # the anycast gateway: one address and MAC on every leaf
     else:
+        assert "anycast gateway 10.1.100.1/24" in text
         assert "community-list CL-BLACKHOLE: skipped" in text
     for (kind, name), item in rep.items.items():
         if kind == "interface" and name.startswith("Vlan100 ->"):
