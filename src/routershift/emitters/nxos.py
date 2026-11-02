@@ -29,6 +29,7 @@ from .. import nxosqos
 from .. import nxossec
 from .. import nxosmon
 from .. import nxosmgmt
+from .. import nxosauto
 from .. import tracking as tracking_text
 from .. import ospf as ospf_text
 from .. import partial
@@ -277,11 +278,13 @@ class Writer:
 
     def monitoring(self) -> None:
         d, rep = self.device, self.report
-        lines = nxosmon.lldp_lines(d, rep)
+        lines = nxosauto.ptp_lines(d, rep, self.features)
+        lines += nxosmon.lldp_lines(d, rep)
         lines += nxosmon.sflow_lines(d, rep, self.port, self.vrf, self.features)
         lines += nxosmon.netflow_lines(d, rep, self.port, self.vrf, IND, self.features)
         lines += nxosmon.mirror_lines(d, rep, self.port, IND)
         nxosmon.unwritable(d, rep)
+        lines += nxosauto.eem_lines(d, rep, self.port, IND)
         if lines:
             self.out += lines + ["!"]
 
@@ -458,6 +461,7 @@ class Writer:
         if layer3 and not iface.lag:
             lines += self.layer3(iface, name)
         lines += nxosmon.interface_lines(self.device, iface, self.adder(label), self.mirror_ports)
+        lines += nxosauto.ptp_interface(iface, self.adder(label))
         if not iface.lag:
             lines += nxossec.interface_lines(self.device, iface, self.adder(label))
             lines += nxosqos.interface_policy_lines(self.device, iface, self.adder(label))

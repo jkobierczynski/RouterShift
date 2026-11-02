@@ -34,6 +34,7 @@ from .. import nxosqos
 from .. import nxossec
 from .. import nxosmon
 from .. import nxosmgmt
+from .. import nxosauto
 from .. import evpn as evpn_text
 from .. import igp as igp_text
 from .. import routemap as routemap_text
@@ -572,6 +573,8 @@ class _Reader:
         """ptp mode, domain, priority1/2 (both); EOS clock-identity, source ip, message-type dscp."""
         if node.children or len(node.words) < 3:
             return False
+        if self.nxos:
+            return nxosauto.read_global(self.device, node.words)
         mechanism = automation_text.global_line(self.device, node.words, self.device.platform == "eos")
         if mechanism is None:
             return False
@@ -613,7 +616,13 @@ class _Reader:
         for child in node.children:
             c = automation_text.split(child.text.strip())
             if c[0] == "description":
-                h.description = child.text.strip().split(None, 1)[1] if len(c) > 1 else ""
+                h.description = (" ".join(c[1:]) if self.nxos else child.text.strip().split(None, 1)[1]) \
+                    if len(c) > 1 else ""
+            elif self.nxos and c[0] == "event" and not h.trigger and nxosauto.read_event(
+                    h, c, lambda name: names.canonical(name)[0]):
+                pass
+            elif self.nxos and c[0] == "action" and nxosauto.read_action(h, c):
+                pass
             elif c[0] == "event" and not h.trigger and automation_text.ios_event(
                     h, c, lambda name: names.canonical(name)[0]):
                 pass
@@ -4124,6 +4133,8 @@ class _Reader:
             iface.flow = way if iface.flow in ("", way) else "both"
         elif w[:2] == ["bfd", "template"] and n == 3:
             self._bfd_ports[iface.name] = w[2]
+        elif self.nxos and w[0] == "ptp":
+            return nxosauto.read_interface(iface, w)
         elif w[0] == "ptp" or w[:2] == ["no", "ptp"]:
             return automation_text.port_line(iface, w)
         elif w == ["no", "sflow", "enable"] and self.device.platform == "eos":
