@@ -26,6 +26,7 @@ from .. import vxlan as vxlan_text
 from .. import acl as acl_text
 from .. import bfd as bfd_text
 from .. import aoscxfabric as fabric
+from .. import multicast as multicast_text
 from .. import routemap as routemap_text
 from .. import bgp as bgp_text
 from .. import dhcp as dhcp_text
@@ -748,15 +749,40 @@ class _Reader:
         w = node.words
         if w == ["router", "vrrp", "enable"]:
             return True  # implied by the groups
-        if w == ["router", "pim"]:
+        if w[:2] == ["router", "pim"] and len(w) in (2, 4) and w[2:3] in ([], ["vrf"]):
+            vrf = w[3] if len(w) == 4 else ""
+            rps, rp_groups = (self.device.pim_rps, self.device.pim_rp_groups) if not vrf else \
+                (multicast_text.vrf(self.device, vrf).rps, multicast_text.vrf(self.device, vrf).rp_groups)
             for child in node.children:
                 c = child.words
                 if c == ["enable"]:
-                    self.device.multicast_routing = True
-                elif c[0] == "rp-address" and len(c) == 2:
-                    self.device.pim_rps.append(str(ipaddress.IPv4Address(c[1])))
+                    if vrf:
+                        multicast_text.vrf(self.device, vrf).routing = True
+                    else:
+                        self.device.multicast_routing = True
+                elif c[0] == "rp-address" and len(c) in (2, 3):
+                    rp = str(ipaddress.IPv4Address(c[1]))
+                    rps.append(rp)
+                    if len(c) == 3:
+                        rp_groups[rp] = str(ipaddress.IPv4Network(c[2]))
                 else:
                     self.unparsed(child, node.text)
+            return True
+        if w == ["router", "msdp"]:
+            for child in node.children:
+                c = child.words
+                if c == ["enable"]:
+                    continue
+                if c[:3] != ["ip", "msdp", "peer"] or len(c) != 4:
+                    self.unparsed(child, node.text)
+                    continue
+                source = ""
+                for g in child.children:
+                    if g.words[0] == "connect-source" and len(g.words) >= 2:
+                        source = canonical(" ".join(g.words[1:]))[0]
+                    elif g.words != ["enable"]:
+                        self.unparsed(g, f"{node.text} / {child.text}")
+                self.device.msdp_peers[str(ipaddress.IPv4Address(c[3]))] = source
             return True
         if w[1:2] == ["ospf"] and len(w) in (3, 5) and (len(w) == 3 or w[3] == "vrf"):
             vrf = w[4] if len(w) == 5 else ""

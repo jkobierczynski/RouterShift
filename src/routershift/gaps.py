@@ -41,7 +41,8 @@ WRITES: Dict[str, Set[str]] = {
     "aoscx": {"anycast-gateway", "relay-vrf", "hardening", "svi-mac", "autostate", "unnumbered", "dot1x-fail-vlan",
               "option82", "coa", "policy-lists", "route-tag", "evpn-instances", "vxlan-mcast", "evpn-domain",
               "mlag-options", "stackwise", "trunk-groups", "leaks", "evpn-vrf", "evpn-es", "bgp-options",
-              "bgp-vrf-ipv6", "bgp-vrf-groups", "bgp-misc", "router-id"},
+              "bgp-vrf-ipv6", "bgp-vrf-groups", "bgp-misc", "router-id", "pim-rp", "msdp", "multicast-vrf",
+              "igmp-querier"},
 }
 
 Option = Tuple[str, str, object]  # (key, what the report calls it, whether the device has it)

@@ -593,7 +593,6 @@ class Writer:
         igmp = multicast_text.snooped(self.device)
         if multicast_text.stated(self.device):
             self.report.item("vlan", multicast_text.LABEL)
-            multicast_text.querier_unsupported(self.device, self.report, "AOS-CX")
         if self.device.dhcp_snooping or snooped:
             self.out.append("dhcpv4-snooping")
             self.report.item("vlan", "DHCP snooping")
@@ -617,10 +616,57 @@ class Writer:
                 self.out.append(f"{_IND}ip igmp snooping enable")
             self.report.item("vlan", str(vlan.vlan_id))
         fabric.trunk_groups(self.device, self.report, self.port)
+        self.multicast()
+
+    def _rp_lines(self, rps: List[str], rp_groups: Dict[str, str]) -> List[str]:
+        lines = []
+        for rp in rps:
+            groups = rp_groups.get(rp, "")
+            if groups.startswith("acl "):
+                self.report.add("system", "multicast routing", Severity.REVIEW, "pim-rp-acl",
+                                f"RP {rp} serves the groups of ACL {groups[4:]}; AOS-CX takes a group prefix, so the "
+                                "RP is written for every group: add the prefix")
+                groups = ""
+            lines.append(f"{_IND}rp-address {rp}" + (f" {groups}" if groups else ""))
+        return lines
+
+    def multicast(self) -> None:
+        """router pim per VRF with its rendezvous points, router msdp; an anycast RP is shared through MSDP."""
         d = self.device
-        if d.multicast_routing or d.pim_rps:
-            self.report.item("system", "multicast routing")
-            self.out += ["router pim", f"{_IND}enable"] + [f"{_IND}rp-address {rp}" for rp in d.pim_rps]
+        rep = self.report
+        vrf_pim = {name: m for name, m in d.multicast_vrfs.items() if m.routing or m.rps}
+        if d.multicast_routing or d.pim_rps or vrf_pim or d.msdp_peers or d.pim_anycast:
+            rep.item("system", "multicast routing")
+        if d.multicast_routing or d.pim_rps or d.pim_anycast:
+            self.out += ["router pim", f"{_IND}enable"] + self._rp_lines(d.pim_rps, d.pim_rp_groups)
+        for name, m in vrf_pim.items():
+            self.out += [f"router pim vrf {self.vrf(name)}", f"{_IND}enable"] + self._rp_lines(m.rps, m.rp_groups)
+            if not m.routing:
+                rep.add("system", "multicast routing", Severity.APPROX, "pim-vrf",
+                        f"VRF {name} has rendezvous points but no multicast routing: AOS-CX enables PIM with them")
+        msdp = dict(d.msdp_peers)
+        for anycast, peers in d.pim_anycast.items():
+            for peer in peers:
+                msdp.setdefault(peer, "")
+            rep.add("system", "multicast routing", Severity.REVIEW, "anycast-rp",
+                    f"anycast RP {anycast} (shared with {', '.join(peers)}): AOS-CX shares an anycast RP through MSDP, "
+                    "so the other RPs are written as MSDP peers; give them a connect-source (the loopback with this "
+                    "switch's own address), and only the RPs need it")
+        if msdp:
+            self.out += ["router msdp", f"{_IND}enable"]
+            for peer, src in msdp.items():
+                self.out.append(f"{_IND}ip msdp peer {peer}")
+                if src:
+                    self.out.append(f"{_IND * 2}connect-source {self.port(src)}")
+                self.out.append(f"{_IND * 2}enable")
+        queriers = multicast_text.queriers(d)
+        if queriers:
+            address = d.igmp_querier_address or next(
+                (d.vlans[v].igmp_querier_address for v in queriers if d.vlans[v].igmp_querier_address), "")
+            rep.add("vlan", multicast_text.LABEL, Severity.REVIEW, "igmp-querier",
+                    "AOS-CX runs the IGMP querier on the VLAN interface (ip igmp querier): the querier of VLANs "
+                    + ", ".join(str(v) for v in queriers) + (f" (address {address})" if address else "")
+                    + " is not written")
 
     def vxlan(self) -> None:
         """interface vxlan 1 with its VNIs, and the evpn block for the VLANs EVPN advertises."""
