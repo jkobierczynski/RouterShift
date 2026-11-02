@@ -147,6 +147,10 @@ class Management:
     console_login: str = ""  # the login method list the console uses (EOS: aaa authentication login console)
     lldp: Optional[bool] = None
     cdp: Optional[bool] = None
+    lldp_timer: Optional[int] = None  # seconds between LLDP advertisements
+    lldp_holdtime: Optional[int] = None  # how long neighbours keep them
+    lldp_mgmt_interface: str = ""  # EOS lldp management-address IF: the address advertised (canonical)
+    lldp_mgmt_vrf: str = ""  # EOS lldp management-address vrf V
 
 
 @dataclass
@@ -948,6 +952,7 @@ class MirrorSession:
     name: str  # the session number (a name on EOS)
     sources: Dict[str, str] = field(default_factory=dict)  # canonical interface -> "both", "rx" or "tx"
     destination: str = ""  # canonical interface
+    acl: str = ""  # only the traffic this IPv4 ACL permits is mirrored
     origin: Origin = field(default_factory=Origin)
 
 
@@ -965,8 +970,10 @@ class Sflow:
     collectors: List[FlowCollector] = field(default_factory=list)
     agent: str = ""  # the agent address in the datagrams
     source_interface: str = ""  # or the interface (canonical) whose address it is
+    source_vrf: str = ""  # EOS: the VRF of the source interface (sflow vrf V source-interface X)
     sample_rate: Optional[int] = None  # one packet in N
     polling_interval: Optional[int] = None  # counter polling, seconds
+    extensions: List[str] = field(default_factory=list)  # EOS sflow extension bgp | router | switch
     origin: Origin = field(default_factory=Origin)
 
 
@@ -979,6 +986,7 @@ class Netflow:
     version: Optional[int] = None  # export format: 5, 9 or 10 (IPFIX)
     source_interface: str = ""  # canonical
     record: str = ""  # IOS: the flow record of the monitor
+    sample_rate: Optional[int] = None  # IOS: the monitor samples one packet in N (sampler mode random 1 out-of N)
     origin: Origin = field(default_factory=Origin)
 
 
@@ -1114,6 +1122,8 @@ class Device:
     mirror_sessions: List[MirrorSession] = field(default_factory=list)
     sflow: Optional[Sflow] = None
     netflow: Optional[Netflow] = None
+    twamp_port: Optional[int] = None  # a TWAMP reflector answers on this UDP port (862 by default)
+    twamp_mode: str = ""  # "light" (EOS monitor twamp / twamp-light) or "full" (IOS ip sla server/responder twamp)
     vxlan: Optional[Vxlan] = None
     ip_slas: Dict[str, IpSla] = field(default_factory=dict)
     tracks: Dict[str, Track] = field(default_factory=dict)

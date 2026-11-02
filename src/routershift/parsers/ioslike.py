@@ -149,6 +149,8 @@ class _Reader:
         self._wlan_tags: Dict[str, str] = {}  # WLAN -> policy profile, from the policy tags
         self._flow_exporters: Dict[str, Netflow] = {}  # IOS flow exporter -> its collector, version and source
         self._flow_monitors: Dict[str, Tuple[List[str], str]] = {}  # IOS flow monitor -> exporters, record
+        self._samplers: Dict[str, int] = {}  # IOS sampler -> one packet in N
+        self._port_samplers: List[str] = []  # IOS: the samplers the ports' flow monitors use
         self._sflow_run = False  # EOS: sflow run
         self._sflow_off: List[str] = []  # EOS: ports with no sflow enable
         self._nve_vrfs: Dict[int, str] = {}  # IOS nve: layer 3 VNI -> VRF
@@ -256,6 +258,7 @@ class _Reader:
             "stackwise-virtual": self.stackwise,
             "route-map": self.route_map,
             "monitor": self.monitor_session,
+            "sampler": self.sampler,
             "sflow": self.sflow,
             "flow": self.flow,
             "track": self.track,
@@ -557,6 +560,8 @@ class _Reader:
             return self.ip_sla(node, w[2])
         if w[1:2] == ["flow-export"]:
             return self.flow_export(w[2:])
+        if w[1:] in (["sla", "server", "twamp"], ["sla", "responder", "twamp"]):
+            return self._ios_twamp(node)
         if w[1:2] == ["multicast-routing"] and w[2:] in ([], ["distributed"]):
             self.device.multicast_routing = True
             return True
@@ -1663,8 +1668,14 @@ class _Reader:
         session and leaves out the word interface."""
         w = node.words
         eos = self.device.platform == "eos"
+        if w == ["monitor", "twamp"] and eos:
+            return self._eos_twamp(node)
         if w[1:2] != ["session"] or len(w) < 5 or node.children:
             return False
+        if (eos and w[3:5] == ["ip", "access-group"] and len(w) == 6) or \
+                (not eos and w[3:6] == ["filter", "ip", "access-group"] and len(w) == 7):
+            monitor_text.session(self.device, w[2], node.line, node.text).acl = w[-1]
+            return True
         if (w[4] == "interface") == eos:  # IOS says source interface, EOS source
             return False
         rest = w[4:] if eos else w[5:]
@@ -1690,6 +1701,52 @@ class _Reader:
             return True
         return False
 
+    def _eos_twamp(self, node: Node) -> bool:
+        """EOS monitor twamp / twamp-light / reflector defaults / listen port N."""
+        d = self.device
+        for child in node.children:
+            if child.words != ["twamp-light"]:
+                self.unparsed(child, node.text)
+                continue
+            d.twamp_mode = "light"
+            for grand in child.children:
+                if grand.words != ["reflector", "defaults"]:
+                    self.unparsed(grand, f"{node.text} / {child.text}")
+                    continue
+                d.twamp_port = d.twamp_port or 862
+                for g in grand.children:
+                    if g.words[:2] == ["listen", "port"] and len(g.words) == 3 and g.words[2].isdigit():
+                        d.twamp_port = int(g.words[2])
+                    else:
+                        self.unparsed(g, f"{node.text} / {child.text} / {grand.text}")
+        return True
+
+    def _ios_twamp(self, node: Node) -> bool:
+        """IOS ip sla server twamp / port N, and ip sla responder twamp."""
+        d = self.device
+        d.twamp_mode = "full"
+        d.twamp_port = d.twamp_port or 862
+        for child in node.children:
+            c = child.words
+            if node.words[2] == "server" and c[0] == "port" and len(c) == 2 and c[1].isdigit():
+                d.twamp_port = int(c[1])
+            else:
+                self.unparsed(child, node.text)
+        return True
+
+    def sampler(self, node: Node) -> bool:
+        """IOS sampler NAME / mode random 1 out-of N."""
+        w = node.words
+        if len(w) != 2 or self.device.platform != "ios":
+            return False
+        for child in node.children:
+            c = child.words
+            if c[:4] == ["mode", "random", "1", "out-of"] and len(c) == 5 and c[4].isdigit():
+                self._samplers[w[1]] = int(c[4])
+            elif c[0] != "description":
+                self.unparsed(child, node.text)
+        return True
+
     def _sflow(self, node: Node) -> Sflow:
         if self.device.sflow is None:
             self.device.sflow = Sflow(origin=Origin(node.line, node.text))
@@ -1707,16 +1764,19 @@ class _Reader:
         if w[0] == "destination" and n in (2, 3):
             port = int(w[2]) if n == 3 else None
             self._sflow(node).collectors.append(monitor_text.collector(str(ipaddress.ip_address(w[1])), port, vrf))
+        elif w[0] == "source-interface" and n >= 2:
+            self._sflow(node).source_interface = names.canonical(" ".join(w[1:]))[0]
+            self._sflow(node).source_vrf = vrf
         elif vrf:
             return False
+        elif w[0] == "extension" and n == 2 and w[1] in ("bgp", "router", "switch"):
+            self._sflow(node).extensions.append(w[1])
         elif w[0] == "sample" and n == 2:
             self._sflow(node).sample_rate = int(w[1])
         elif w[0] == "polling-interval" and n == 2:
             self._sflow(node).polling_interval = int(w[1])
         elif w[0] == "source" and n == 2:
             self._sflow(node).agent = str(ipaddress.ip_address(w[1]))
-        elif w[0] == "source-interface" and n >= 2:
-            self._sflow(node).source_interface = names.canonical(" ".join(w[1:]))[0]
         elif w == ["run"]:
             self._sflow(node)
             self._sflow_run = True
@@ -1882,6 +1942,12 @@ class _Reader:
             nf.source_interface = nf.source_interface or exp.source_interface
         records = [r for _, r in self._flow_monitors.values() if r]
         nf.record = records[0] if records else ""
+        rates = [self._samplers[name] for name in self._port_samplers if name in self._samplers]
+        if rates:
+            nf.sample_rate = rates[0]
+            if len(set(rates)) > 1:
+                d.unparsed.append(Unparsed(0, "sampler", "", "Flow samplers",
+                                           f"the ports sample at different rates; 1 in {rates[0]} is kept"))
 
     # DHCP server ------------------------------------------------------------------------------------------------------
 
@@ -2789,10 +2855,24 @@ class _Reader:
 
     def discovery(self, node: Node) -> bool:
         """lldp run, cdp run (the no forms come through no_global)."""
-        if node.words[1:] == ["run"] or node.words == ["cdp", "enable"]:
-            setattr(self.device.management, node.words[0], True)
+        w = node.words
+        m = self.device.management
+        if w[1:] == ["run"] or w == ["cdp", "enable"]:
+            setattr(m, w[0], True)
             return True
-        return False
+        if w[0] != "lldp" or node.children:
+            return False
+        if w[1] == "timer" and len(w) == 3 and w[2].isdigit():
+            m.lldp_timer = int(w[2])
+        elif w[1] in ("hold-time", "holdtime") and len(w) == 3 and w[2].isdigit():
+            m.lldp_holdtime = int(w[2])
+        elif w[1:3] == ["management-address", "vrf"] and len(w) == 4:
+            m.lldp_mgmt_vrf = w[3]
+        elif w[1] == "management-address" and len(w) >= 3 and self.device.platform == "eos":
+            m.lldp_mgmt_interface = names.canonical(" ".join(w[2:]))[0]
+        else:
+            return False
+        return True
 
     def igmp_snooping(self, w: List[str], on: bool) -> bool:
         """ip igmp snooping [querier | vlan N [querier]], or its no form."""
@@ -3508,8 +3588,11 @@ class _Reader:
             iface.pim = "sparse"
         elif w[:3] == ["ip", "igmp", "version"] and n == 4 and w[3] in ("1", "2", "3"):
             iface.igmp_version = int(w[3])
-        elif w[:3] == ["ip", "flow", "monitor"] and n == 5 and w[4] in ("input", "output"):
-            iface.flow = w[4] if iface.flow in ("", w[4]) else "both"
+        elif w[:3] == ["ip", "flow", "monitor"] and n in (5, 7) and w[-1] in ("input", "output") and \
+                (n == 5 or w[4] == "sampler"):
+            iface.flow = w[-1] if iface.flow in ("", w[-1]) else "both"
+            if n == 7:
+                self._port_samplers.append(w[5])
         elif w[:2] == ["ip", "flow"] and n == 3 and w[2] in ("ingress", "egress"):
             way = "input" if w[2] == "ingress" else "output"
             iface.flow = way if iface.flow in ("", way) else "both"

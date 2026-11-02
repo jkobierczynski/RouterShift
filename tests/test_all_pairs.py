@@ -376,14 +376,27 @@ def test_converts_and_reads_back(source: str, target: str) -> None:
     mirrors = lambda dev: sorted((sorted(s.sources.values()), bool(s.destination))  # noqa: E731
                                  for s in dev.mirror_sessions)
     assert mirrors(back) == mirrors(first)
-    if first.sflow is None or target == "ios":
+    # IOS writes sFlow as sampled NetFlow and EOS NetFlow as sFlow, when the source has only the other
+    sflow_for_netflow = target == "ios" and first.sflow is not None and first.netflow is None
+    netflow_for_sflow = target == "eos" and first.netflow is not None and first.sflow is None
+    if netflow_for_sflow:
+        assert back.sflow is not None and back.netflow is None
+        assert [c.address for c in back.sflow.collectors] == [c.address for c in first.netflow.collectors]
+        assert len(monitor_text.sflow_ports(back)) == len([i for i in monitor_text.flow_ports(first)
+                                                           if i in monitor_text.physical(first)])
+    elif first.sflow is None or target == "ios":
         assert back.sflow is None
     else:
         assert back.sflow is not None
         sflow = lambda sf: ([c.address for c in sf.collectors], sf.sample_rate, sf.polling_interval)  # noqa: E731
         assert sflow(back.sflow) == sflow(first.sflow)
         assert len(monitor_text.sflow_ports(back)) == len(monitor_text.sflow_ports(first))
-    if first.netflow is None or target not in ("ios", "comware"):
+    if sflow_for_netflow:
+        assert back.netflow is not None and first.sflow is not None
+        assert [c.address for c in back.netflow.collectors] == [c.address for c in first.sflow.collectors]
+        assert back.netflow.sample_rate == first.sflow.sample_rate
+        assert len(monitor_text.flow_ports(back)) == len(monitor_text.sflow_ports(first))
+    elif netflow_for_sflow or first.netflow is None or target not in ("ios", "comware"):
         assert back.netflow is None
     else:
         assert back.netflow is not None

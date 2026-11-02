@@ -163,6 +163,22 @@ def later_features(device: Device, report: Report, port: Callable[[str], str]) -
         found.append(("system", "DHCP snooping", "the DHCP option 82 setting:", Severity.APPROX))
     if device.aaa.coa:
         found.append(("system", "RADIUS CoA", "RADIUS change of authorization:", Severity.REVIEW))
+    m_ = device.management
+    options = [w for w, v in (("the LLDP timers", m_.lldp_timer is not None or m_.lldp_holdtime is not None),
+                              ("the LLDP management address", m_.lldp_mgmt_interface or m_.lldp_mgmt_vrf)) if v]
+    if options:
+        found.append(("management", "LLDP", ", ".join(options) + ":", Severity.APPROX))
+    if device.twamp_port is not None:
+        found.append(("monitor", "TWAMP reflector", "the TWAMP reflector:", Severity.REVIEW))
+    for session in device.mirror_sessions:
+        if session.acl:
+            found.append(("monitor", f"mirror session {session.name}", f"the mirror's ACL filter {session.acl}:",
+                          Severity.REVIEW))
+    sf = device.sflow
+    if sf is not None and (sf.extensions or sf.source_vrf):
+        found.append(("monitor", "sflow", "the sFlow extensions and the source interface's VRF:", Severity.APPROX))
+    if device.netflow is not None and device.netflow.sample_rate:
+        found.append(("monitor", "netflow", f"sampling 1 in {device.netflow.sample_rate}:", Severity.REVIEW))
     # (new device-level settings go above this line)
     for iface in device.interfaces.values():
         label = _interface_item(report, iface, port)

@@ -90,6 +90,9 @@ class Writer:
         # IOS: the VLAN that carries each layer 3 VNI; EOS: the VLANs and SVIs an IOS source used for them, left out
         self.l3vni_vlans: Dict[str, int] = evpn_text.ios_l3vni_vlans(self.device, self.report) if self.ios else {}
         self.skip_vlans = set(self.device.vxlan.vrf_vlans.values()) if self.device.vxlan and not self.ios else set()
+        # sFlow on IOS and NetFlow on EOS are written as the other (the nearest each platform runs)
+        self.netflow_stand_in = monitor_text.netflow_from_sflow(self.device, self.report) if self.ios else None
+        self.sflow_stand_in = monitor_text.sflow_from_netflow(self.device, self.report) if not self.ios else None
         self.track_plan = tracking_text.plan(self.device, self.report, self.target, "IOS" if self.ios else "EOS")
         self.system()
         self.spanning_tree()
@@ -111,6 +114,7 @@ class Writer:
         self._l3vni_interfaces()
         self.out[mark:mark] = self.key_chains
         self.mirrors()
+        self.twamp()
         self.vxlan()
         self.policies()
         self.routing()
@@ -1346,11 +1350,16 @@ class Writer:
         d = self.device
         rep = self.report
         lines: List[str] = []
-        if d.sflow is not None and self.ios:
+        sflow = self.sflow_stand_in or (d.sflow if not self.ios else None)
+        netflow = self.netflow_stand_in or (d.netflow if self.ios else None)
+        if d.sflow is not None and self.ios and self.netflow_stand_in is None:
             monitor_text.sflow_unsupported(d, rep, "IOS")
-        elif d.sflow is not None:
-            sf = d.sflow
-            rep.item(monitor_text.KIND, monitor_text.SFLOW)
+        if d.netflow is not None and not self.ios and self.sflow_stand_in is None:
+            monitor_text.netflow_unsupported(d, rep, "EOS")
+        if sflow is not None:
+            sf = sflow
+            if sf is d.sflow:
+                rep.item(monitor_text.KIND, monitor_text.SFLOW)
             if sf.sample_rate is not None:
                 lines.append(f"sflow sample {sf.sample_rate}")
             if sf.polling_interval is not None:
@@ -1362,14 +1371,15 @@ class Writer:
             if sf.agent:
                 lines.append(f"sflow source {sf.agent}")
             elif sf.source_interface:
-                lines.append(f"sflow source-interface {self.port(sf.source_interface)}")
-            if monitor_text.sflow_ports(d):
+                vrf = f"vrf {self.vrf(sf.source_vrf)} " if sf.source_vrf else ""
+                lines.append(f"sflow {vrf}source-interface {self.port(sf.source_interface)}")
+            lines += [f"sflow extension {e}" for e in sf.extensions]
+            if self._sflow_ports():
                 lines.append("sflow run")
-        if d.netflow is not None and not self.ios:
-            monitor_text.netflow_unsupported(d, rep, "EOS")
-        elif d.netflow is not None:
-            nf = d.netflow
-            monitor_text.netflow_item(nf, rep)
+        if netflow is not None:
+            nf = netflow
+            if nf is d.netflow:
+                monitor_text.netflow_item(nf, rep)
             exporters = []
             for n, c in enumerate(nf.collectors, 1):
                 name = f"RS-EXPORT-{n}"
@@ -1390,17 +1400,29 @@ class Writer:
                         f"flow record {nf.record} written as {record}")
             lines += ["flow monitor RS-MONITOR"] + [f"{self.ind}exporter {e}" for e in exporters] + \
                 [f"{self.ind}record {record}", "!"]
+            if nf.sample_rate:
+                lines += [f"sampler {monitor_text.SAMPLER}", f"{self.ind}mode random 1 out-of {nf.sample_rate}", "!"]
         if lines:
             self.out += lines + (["!"] if lines[-1] != "!" else [])
+
+    def _sflow_ports(self) -> List[Interface]:
+        """EOS: the ports sFlow samples (those NetFlow recorded when it stands in for it)."""
+        if self.sflow_stand_in is not None:
+            return [i for i in monitor_text.physical(self.device) if i.flow]
+        return monitor_text.sflow_ports(self.device) if self.device.sflow is not None else []
 
     def _flow_interface(self, iface: Interface) -> List[str]:
         d = self.device
         lines = []
-        if self.ios and d.netflow is not None and iface.flow:
-            lines += [f"ip flow monitor RS-MONITOR {way}" for way in ("input", "output") if iface.flow in (way, "both")]
-        if not self.ios and d.sflow is not None and monitor_text.sflow_ports(d) and not iface.sflow and \
-                iface in monitor_text.physical(d):
-            lines.append("no sflow enable")
+        nf = self.netflow_stand_in or d.netflow
+        way = "input" if self.netflow_stand_in is not None and iface.sflow else iface.flow
+        if self.ios and nf is not None and way:
+            sampler = f" sampler {monitor_text.SAMPLER}" if nf.sample_rate else ""
+            lines += [f"ip flow monitor RS-MONITOR{sampler} {w}" for w in ("input", "output") if way in (w, "both")]
+        if not self.ios:
+            ports = self._sflow_ports()
+            if ports and iface not in ports and iface in monitor_text.physical(d):
+                lines.append("no sflow enable")
         return lines
 
     def mirrors(self) -> None:
@@ -1422,6 +1444,12 @@ class Writer:
             for port, way in sources.items():
                 lines.append(f"{head} source{word} {self.port(port)}" + ("" if way == "both" else f" {way}"))
             lines.append(f"{head} destination{word} {self.port(s.destination)}")
+            if s.acl:
+                lines.append(f"{head} {'filter ' if self.ios else ''}ip access-group {s.acl}")
+                if d.platform != self.target:
+                    rep.add(monitor_text.KIND, monitor_text.label(s), Severity.REVIEW, "mirror-acl",
+                            f"the mirror is filtered by ACL {s.acl}; check that the target platform filters "
+                            "mirrored traffic with an ACL")
         if lines:
             self.out += lines + ["!"]
 
@@ -2635,10 +2663,57 @@ class Writer:
                             "http-commands); left out")
         if m.lldp is not None:
             self.out.append("lldp run" if m.lldp else "no lldp run")
+        self._lldp_options()
         if m.cdp is not None and self.ios:
             self.out.append("cdp run" if m.cdp else "no cdp run")
         elif m.cdp:
             rep.add("management", "CDP", Severity.APPROX, "cdp-lldp", "EOS has no CDP; LLDP announces the switch")
+
+    def _lldp_options(self) -> None:
+        """LLDP timers (same meaning both sides) and the advertised management address (EOS only)."""
+        m = self.device.management
+        rep = self.report
+        if m.lldp_timer is not None:
+            self.out.append(f"lldp timer {m.lldp_timer}")
+        if m.lldp_holdtime is not None:
+            self.out.append(f"lldp {'holdtime' if self.ios else 'hold-time'} {m.lldp_holdtime}")
+        if not (m.lldp_mgmt_interface or m.lldp_mgmt_vrf):
+            return
+        if self.ios:
+            rep.item("management", "LLDP")
+            rep.add("management", "LLDP", Severity.REVIEW, "lldp-mgmt-address",
+                    f"IOS has no global LLDP management address (the source advertises "
+                    f"{m.lldp_mgmt_interface or 'the address in VRF ' + m.lldp_mgmt_vrf}); it advertises an address "
+                    "of the port, 'lldp tlv-select management-address' per port; left out")
+            return
+        if m.lldp_mgmt_interface:
+            self.out.append(f"lldp management-address {self.port(m.lldp_mgmt_interface)}")
+        if m.lldp_mgmt_vrf:
+            self.out.append(f"lldp management-address vrf {self.vrf(m.lldp_mgmt_vrf)}")
+
+    def twamp(self) -> None:
+        """A TWAMP reflector: EOS answers TWAMP light, IOS runs a full TWAMP server and responder."""
+        d = self.device
+        if d.twamp_port is None:
+            return
+        rep = self.report
+        rep.item(monitor_text.KIND, "TWAMP reflector")
+        port = d.twamp_port
+        if self.ios:
+            self.out += ["ip sla server twamp"] + ([f" port {port}"] if port != 862 else []) + \
+                ["ip sla responder twamp", "!"]
+            if d.twamp_mode == "light":
+                rep.add(monitor_text.KIND, "TWAMP reflector", Severity.REVIEW, "twamp-light",
+                        "the source reflects TWAMP light; IOS is written as a full TWAMP server and responder, "
+                        "so senders that skip the control session need the IOS TWAMP light responder where the "
+                        "release has it")
+        else:
+            ind = self.ind
+            self.out += ["monitor twamp", f"{ind}twamp-light", f"{ind * 2}reflector defaults",
+                         f"{ind * 3}listen port {port}", "!"]
+            if d.twamp_mode == "full":
+                rep.add(monitor_text.KIND, "TWAMP reflector", Severity.APPROX, "twamp-light",
+                        "EOS reflects TWAMP light only: senders must skip the TWAMP control session")
 
     def _timezone(self, tz: str) -> None:
         words = tz.split()
