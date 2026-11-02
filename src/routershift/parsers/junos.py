@@ -24,7 +24,7 @@ from .. import fhrp as fhrp_text
 from .. import junospolicy
 from .. import junosqos
 from .. import junossec
-from .. import junosmon
+from .. import junosauto, junosmon
 from .. import junosmgmt
 from .. import monitor as monitor_text
 from .. import qos as qos_text
@@ -118,6 +118,7 @@ class Reader:
         self.filter_lists: Dict[Tuple[str, str], List[str]] = {}  # (interface, input|output) -> filters
         self.macsec_ports: Dict[str, str] = {}  # port -> connectivity association
         self.mon = junosmon.MonitorReader(self.device)
+        self.auto = junosauto.AutoReader(self.device)
         self.lldp_timers: Dict[str, int] = {}
         self.mgmt = junosmgmt.MgmtReader(self.device)
         self.login_filter: Optional[Tuple[str, Optional[Interface]]] = None
@@ -198,6 +199,7 @@ class Reader:
             "firewall": self.firewall,
             "class-of-service": lambda s: self.cos.statement(s.words[1:]),
             "services": self.services,
+            "event-options": lambda s: self.auto.event_options(s.words[1:]),
             "security": lambda s: s.words[1:2] == ["macsec"] and len(s.words) > 3 and
             junossec.read_macsec(self.device, s.words[2:], self.macsec_ports),
             "forwarding-options": lambda s: self.forwarding_options(s, s.words[1:], ""),
@@ -1082,6 +1084,8 @@ class Reader:
             return self.bgp(w[1:], vrf)
         if w[0] in ("pim", "igmp", "msdp", "igmp-snooping"):
             return self.multicast(w, vrf)
+        if w[0] == "ptp" and len(w) >= 2 and not vrf:
+            return self.auto.ptp(w[1:])
         if w[0] == "sflow" and len(w) >= 2 and not vrf:
             return self.mon.sflow(w[1:])
         if w[0] == "lldp":
@@ -1431,6 +1435,7 @@ class Reader:
                     unread(0, f"set interfaces {name} family inet filter {direction}-list {f}",
                            "RouterShift keeps one ACL and one QoS policy per direction")
         self.mon.finish(self.canonical, lambda a: vxlan_text.interface_of(dev, a), unread)
+        self.auto.finish(self.canonical, unread)
         monitor_text.finish(dev)
         m = dev.management
         if "advertisement-interval" in self.lldp_timers:

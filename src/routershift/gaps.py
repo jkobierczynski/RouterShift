@@ -36,7 +36,7 @@ WRITES: Dict[str, Set[str]] = {
               "queuing", "qos-burst", "copp", "macsec", "mac-acl", "coa",
               "lldp-options", "twamp", "mirror-acl", "sflow-options", "netflow-sampling", "banners", "local-logging",
               "roles", "ssh-keys", "snmp-views", "apis", "password-length", "syslog-transport", "trap-types",
-              "console-login"},
+              "console-login", "ptp", "event-handlers"},
 }
 
 Option = Tuple[str, str, object]  # (key, what the report calls it, whether the device has it)

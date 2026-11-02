@@ -28,7 +28,7 @@ from .. import multicast as multicast_text
 from .. import junospolicy
 from .. import junosqos
 from .. import junossec
-from .. import junosmon
+from .. import junosauto, junosmon
 from .. import junosmgmt
 from .. import ospf as ospf_text
 from .. import partial
@@ -122,6 +122,8 @@ class Writer:
         self.cos()
         self.security()
         junosmon.MonitorWriter(self.device, self.add, self.report, self.port, self.unit_name, self.instance).write()
+        junosauto.write_ptp(self.device, self.add, self.report, self.unit_name)
+        junosauto.write_events(self.device, self.add, self.report, self.port)
         self.dhcp_relay()
         self.dhcp_server()
         self.aaa()
