@@ -33,6 +33,7 @@ from .. import nxosmcast
 from .. import nxosqos
 from .. import nxossec
 from .. import nxosmon
+from .. import nxosmgmt
 from .. import evpn as evpn_text
 from .. import igp as igp_text
 from .. import routemap as routemap_text
@@ -180,6 +181,7 @@ class _Reader:
         self._bgp_vrfs: Dict[str, Tuple[bgp_text.Builder, BgpVrf]] = {}
         self._fabric = nxosfabric.Reader(self.device)  # NX-OS VXLAN, EVPN and vPC
         self._nxmon = nxosmon.Reader(self.device)  # NX-OS sFlow and NetFlow
+        self._summer: Dict[str, object] = {}  # NX-OS clock summer-time
         self._host_flap: Optional[Tuple[int, int, int]] = None  # NX-OS l2rib dup-host-mac-detection
         self._bgp_router_id = ""  # EOS: a VRF that names the same router ID needs none of its own
         self._syslog_hosts: List[Tuple[Node, str, str]] = []  # every logging host line, its address and VRF
@@ -274,6 +276,9 @@ class _Reader:
             "key": self.key_chain,
             "mka": self.mka,
             "macsec": self.macsec,
+            "nxapi": self.nxos_api,
+            "grpc": self.nxos_api,
+            "userpassphrase": self.userpassphrase,
             "mpls": self.mpls,
             "wlan": self.wlan,
             "wireless": self.wireless,
@@ -329,6 +334,8 @@ class _Reader:
             m.lldp = True
         elif w[1] == "pim":
             self.device.multicast_routing = True  # NX-OS: no ip multicast-routing; the feature routes multicast
+        elif self.nxos:
+            nxosmgmt.read_feature(self.device, w[1])
         return True
 
     @staticmethod
@@ -621,6 +628,11 @@ class _Reader:
     def eos_role(self, node: Node) -> bool:
         """EOS role NAME / [SEQ] permit|deny [mode M] command REGEX."""
         w = node.words
+        if self.nxos and w[1:2] == ["name"] and len(w) == 3:
+            for k in nxosmgmt.read_role(self.device, w[2], [c.words for c in node.children]):
+                self.unparsed(node.children[k], node.text)
+            self.device.roles[w[2]].origin = Origin(node.line, node.text)
+            return True
         if len(w) != 2 or self.device.platform != "eos":
             return False
         role = self.device.roles[w[1]] = Role(w[1], origin=Origin(node.line, node.text))
@@ -727,6 +739,8 @@ class _Reader:
     def logging(self, node: Node) -> bool:
         w = node.words
         s = self.device.system
+        if self.nxos and nxosmgmt.read_logging(self.device, w):
+            return True
         if self._local_logging(w):
             return True
         if len(w) == 3 and w[1] == "trap" and mgmt_text.level(w[2]) is not None:
@@ -741,9 +755,10 @@ class _Reader:
             args, vrf = self._use_vrf(w[3:])
             if vrf:
                 s.service_vrf = vrf
-            if args and args[0].isdigit() and len(args) == 1:
-                s.logging_level = int(args[0])
-            elif args:
+            if args and args[0].isdigit():
+                s.logging_level, args = int(args[0]), args[1:]
+            rest = nxosmgmt.read_server_options(self.device, str(ipaddress.ip_address(w[2])), args)
+            if rest is None or rest:
                 return False
             s.syslog_servers.append(str(ipaddress.ip_address(w[2])))
             return True
@@ -805,6 +820,8 @@ class _Reader:
         if len(node.words) >= 3 and node.words[1] == "timezone":
             self.device.system.timezone = " ".join(node.words[2:])
             return True
+        if self.nxos and len(node.words) >= 2:
+            return nxosmgmt.read_summer_time(node.words[1:], self._summer)
         return False
 
     def policy_node(self, node: Node, bad: Optional[List[int]]) -> bool:
@@ -1054,7 +1071,8 @@ class _Reader:
     def username(self, node: Node) -> bool:
         """username U [privilege N] [role R] [secret|password [type] X | nopassword]"""
         w = node.words
-        if w[2:3] == ["ssh-key"] and len(w) >= 5:  # EOS: username U ssh-key TYPE KEY [COMMENT]
+        if w[2:3] == ["ssh-key"] and len(w) >= 5 or self.nxos and w[2:3] == ["sshkey"] and len(w) >= 4:
+            # EOS: username U ssh-key TYPE KEY [COMMENT]; NX-OS: username U sshkey TYPE KEY [COMMENT]
             known = next((u for u in self.device.users if u.name == w[1]), None)
             if known is None:
                 known = LocalUser(w[1], origin=Origin(node.line, node.text))
@@ -1601,6 +1619,18 @@ class _Reader:
             if not ok:
                 self.unparsed(child, node.text)
         return True
+
+    def nxos_api(self, node: Node) -> bool:
+        """NX-OS nxapi use-vrf V | grpc use-vrf V."""
+        return self.nxos and not node.children and nxosmgmt.read_api_vrf(self.device, node.words)
+
+    def userpassphrase(self, node: Node) -> bool:
+        """NX-OS userpassphrase min-length N."""
+        w = node.words
+        if self.nxos and w[1:2] == ["min-length"] and len(w) == 3 and w[2].isdigit():
+            self.device.management.password_min_length = int(w[2])
+            return True
+        return False
 
     def macsec(self, node: Node) -> bool:
         """NX-OS: macsec policy NAME."""
@@ -4268,6 +4298,7 @@ class _Reader:
         multicast_text.finish(self.device)
         if self.nxos:
             self._nxmon.finish()
+            nxosmgmt.finish_timezone(self.device, self._summer)
         self._finish_monitor()
         if self.nxos:
             self._fabric.finish()

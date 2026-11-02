@@ -28,6 +28,7 @@ from .. import nxosmcast
 from .. import nxosqos
 from .. import nxossec
 from .. import nxosmon
+from .. import nxosmgmt
 from .. import tracking as tracking_text
 from .. import ospf as ospf_text
 from .. import partial
@@ -136,10 +137,7 @@ class Writer:
         if sy.hostname:
             self.out.append(f"hostname {sy.hostname}")
             self.report.item("system", "hostname")
-        if sy.banner_motd:
-            delim = "#" if "#" not in sy.banner_motd else "%"
-            self.out += [f"banner motd {delim}", sy.banner_motd, delim]
-            self.report.item("system", "banner motd")
+        self.out += nxosmgmt.banner_lines(self.device, self.report)
         if sy.domain_name:
             self.out.append(f"ip domain-name {sy.domain_name}")
         for domain in sy.dns_search:
@@ -178,9 +176,13 @@ class Writer:
         for server in sy.syslog_servers:
             self.report.item("system", f"syslog {server}")
             level = f" {sy.logging_level}" if sy.logging_level is not None else ""
-            self.out.append(f"logging server {server}{level}{self.use_vrf()}")
+            transport = nxosmgmt.syslog_transport(self.device, server, self.report)
+            if transport and not level:
+                level = " 5"
+            self.out.append(f"logging server {server}{level}{transport}{self.use_vrf()}")
         if sy.logging_source and sy.syslog_servers:
             self.out.append(f"logging source-interface {self.port(sy.logging_source)}")
+        self.out += nxosmgmt.logging_lines(self.device, self.report)
         for name in sy.transfer_source:
             self.report.item("system", f"{name} source interface")
         self.out += nxosaccess.transfer_lines(self.device, self.port)
@@ -190,9 +192,8 @@ class Writer:
             self.report.item("management", "telnet")
         if m.ssh:
             self.report.item("management", "ssh")
-        if m.http or m.https:
-            self.report.skip("management", "web server", partial.CODE,
-                             "NX-OS has no HTTP management server; use NX-API (feature nxapi) by hand if needed")
+        self.out += nxosmgmt.api_lines(self.device, self.report, self.vrf, self.features)
+        self.out += nxosmgmt.password_lines(self.device, self.report)
         if m.lldp or any(not (i.lldp_tx and i.lldp_rx) for i in self.device.interfaces.values()):
             self.features.add("lldp")
             self.report.item("management", "LLDP")
@@ -205,6 +206,10 @@ class Writer:
         """NX-OS takes a name and an offset, as IOS does."""
         self.report.item("system", "time zone")
         minutes = offset_minutes(tz)
+        zone = nxosmgmt.timezone_lines(tz, self.report) if minutes is None else []
+        if zone:
+            self.out += zone
+            return
         if minutes is None:
             self.report.add("system", "time zone", Severity.REVIEW, "timezone",
                             f"NX-OS takes a fixed offset (clock timezone NAME H M); '{tz}' is not written, set it by "
@@ -216,6 +221,7 @@ class Writer:
         self.out.append(f"clock timezone {name} {sign}{abs(minutes) // 60} {abs(minutes) % 60}")
 
     def users(self) -> None:
+        self.out += nxosmgmt.role_lines(self.device, self.report, IND)
         for user in self.device.users:
             label = aaa_text.user_label(user)
             password = aaa_text.password(user, HASHES, self.report)
@@ -223,7 +229,7 @@ class Writer:
                 continue
             self.report.item("management", label)
             kind, value = password
-            role = aaa_text.role(user.privilege, ROLES)
+            role = nxosmgmt.user_role(self.device, user) or aaa_text.role(user.privilege, ROLES)
             if kind == "plain":
                 self.out.append(f"username {user.name} password {value} role {role}")
             elif kind in HASHES:
@@ -232,6 +238,7 @@ class Writer:
                 self.out.append(f"username {user.name} role {role}")
                 self.report.add("management", label, Severity.REVIEW, "no-password",
                                 "the user has no password in the source; set one")
+            self.out += nxosmgmt.ssh_key_lines(user, self.report, label)
         if self.device.aaa.enable_secret is not None:
             self.report.skip("management", "enable secret", "enable",
                              "NX-OS has no enable password; the role of each user sets what it may do")
