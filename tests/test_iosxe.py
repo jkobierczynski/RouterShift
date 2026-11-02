@@ -149,11 +149,12 @@ def test_junos_writes_the_session_options_and_reports_the_rest() -> None:
     out, report = convert(IOS, "ios", "junos")
     assert "authentication-key s3cret;" in out and "hold-time 30;" in out and "remove-private;" in out
     text = report.to_text()
-    assert "bgp vrf CORP: skipped" in text
-    assert "route-reflector-client not written for Junos" in text
+    assert "bgp vrf CORP: exact" in text and "allowas-in not written for Junos" in text
+    assert "cluster " in out  # route-reflector-client
     back = parse(out, "junos")
     assert back.unparsed == []
-    peers = {n.address: n for n in bgp_text.flat(back.bgp)}  # type: ignore[arg-type]
+    assert back.bgp is not None and [n.route_map_in for n in back.bgp.vrfs["CORP"].neighbors] == ["RM-IN"]
+    peers = {n.address: n for n in bgp_text.flat(back.bgp)}
     assert (peers["10.255.0.2"].password, peers["10.255.0.2"].keepalive, peers["10.255.0.2"].hold) == (
         "s3cret", 10, 30)
 

@@ -14,12 +14,13 @@ from __future__ import annotations
 
 import ipaddress
 import re
-from typing import Dict, List, Set, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 from .. import aaa as aaa_text
 from .. import bgp as bgp_text
 from .. import stp as stp_text
 from .. import dhcp as dhcp_text
+from .. import evpn as evpn_text
 from .. import fhrp as fhrp_text
 from .. import hosts as hosts_text
 from .. import l2sec as l2sec_text
@@ -29,7 +30,8 @@ from .. import partial
 from .. import snmp as snmp_text
 from .. import vrfs as vrfs_text
 from ..junostext import Tree, quote
-from ..model import BgpNeighbor, Device, FhrpGroup, Interface, InterfaceKind, LacpMode, StpMode, SwitchportMode
+from ..model import (BgpAggregate, BgpNeighbor, Device, FhrpGroup, Interface, InterfaceKind, LacpMode, StpMode,
+                     SwitchportMode, VrfInfo)
 from ..names import PortMapper
 from ..report import Report, Severity
 from ..timezones import offset_minutes, utc
@@ -40,9 +42,9 @@ CLASSES = [(15, "super-user"), (5, "operator"), (0, "read-only")]
 HASHES = ("md5-crypt", "sha256-crypt", "sha512-crypt", "junos")
 MGMT_INSTANCE = "mgmt_junos"
 # What partial.device need not report: the device-wide features this writer writes
-WRITTEN = {"acl", "policy", "dhcp", "l2sec", "aaa"}
+WRITTEN = {"acl", "policy", "dhcp", "l2sec", "aaa", "mlag", "vxlan"}
 # What partial.port need not report
-PORT_WRITTEN = {"dhcp-relay", "fhrp", "voice", "speed", "l2sec", "storm", "poe", "dot1x", "stp-guards"}
+PORT_WRITTEN = {"dhcp-relay", "fhrp", "voice", "speed", "l2sec", "storm", "poe", "dot1x", "stp-guards", "mlag"}
 _NAME_CHARS = re.compile(r"[^A-Za-z0-9_.-]+")
 
 
@@ -66,12 +68,13 @@ class Writer:
         self.root = Tree()
         for section in ("system", "chassis", "interfaces", "snmp", "forwarding-options", "routing-options",
                         "protocols", "policy-options", "class-of-service", "firewall", "access", "switch-options",
-                        "poe", "vlans", "routing-instances"):
+                        "multi-chassis", "poe", "vlans", "routing-instances"):
             self.root.add(section)
         self.vlan_names: Dict[int, str] = {}
         self.prefix_kinds: Dict[str, str] = {}
         self.communities: Dict[str, List[str]] = {}
         self.filter_names: Dict[str, str] = {}
+        self.rid: Optional[str] = None
         self.relays: List[Interface] = []
         self.trusted: List[Tuple[Interface, str]] = []
         self.guarded: List[Interface] = []
@@ -99,6 +102,8 @@ class Writer:
         self.routes()
         self.ospf()
         self.bgp()
+        self.evpn()
+        self.mclag()
         self.lldp()
         self.spanning_tree()
         self.snooping()
@@ -273,6 +278,19 @@ class Writer:
         if iface.mode == SwitchportMode.ACCESS:
             vid = iface.access_vlan or 1
             return [self.vlan_names.get(vid, str(vid))]
+        grouped = {v: x.trunk_groups for v, x in self.device.vlans.items() if x.trunk_groups}
+        if grouped:
+            # EOS trunk groups: a VLAN of a group rides only the trunks of that group, and such a trunk carries only
+            # the VLANs of its groups. Junos has none, so the trunk lists the VLANs it carries.
+            if iface.trunk_groups:
+                vids = [v for v, groups in grouped.items() if set(groups) & set(iface.trunk_groups)]
+            else:
+                vids = [v for v in sorted(self.device.vlans) if v not in grouped]
+            if iface.allowed_vlans:
+                vids = [v for v in vids if self.carries(iface.allowed_vlans, v)]
+            if iface.native_vlan and iface.native_vlan not in vids:
+                vids.append(iface.native_vlan)
+            return [self.vlan_names.get(v, str(v)) for v in sorted(vids)]
         if not iface.allowed_vlans:
             return ["all"]
         words: List[str] = []
@@ -343,6 +361,7 @@ class Writer:
                                                 if i.lag == iface.name and i.lacp_mode), None)
                 if mode in (LacpMode.ACTIVE, LacpMode.PASSIVE):
                     self.add(*top, "aggregated-ether-options", "lacp", mode.value)
+                self.segment(iface, top)
             path = top + (f"unit {unit}",)
             if not physical and iface.kind != InterfaceKind.MANAGEMENT:
                 if iface.description:
@@ -373,6 +392,20 @@ class Writer:
             self.leftovers(iface)
         if lags:
             self.add("chassis", "aggregated-devices", "ethernet", f"device-count {lags}")
+
+    def segment(self, iface: Interface, top: Tuple[str, ...]) -> None:
+        """EVPN multihoming: the ethernet segment of a LAG and the LACP system ID both switches share."""
+        if iface.evpn_esi:
+            self.add(*top, "esi", evpn_text.junos_esi(iface.evpn_esi))
+            self.add(*top, "esi", "single-active" if iface.evpn_single_active else "all-active")
+            if iface.evpn_df_preference is not None:
+                self.add(*top, "esi", "df-election-type", "preference", f"value {iface.evpn_df_preference}")
+            if iface.evpn_es_rt:
+                self.report.add("interface", self.label(iface), Severity.APPROX, "es-import",
+                                f"Junos derives the ES-import route target from the ESI; {iface.evpn_es_rt} is not "
+                                "written")
+        if iface.lacp_system_id:
+            self.add(*top, "aggregated-ether-options", "lacp", f"system-id {evpn_text.junos_mac(iface.lacp_system_id)}")
 
     def ether_options(self, iface: Interface, top: Tuple[str, ...]) -> None:
         if iface.speed:
@@ -492,7 +525,7 @@ class Writer:
             self.add(*switching, f"storm-control {self.storm_profile(iface, label)}")
         if iface.port_security:
             path = ("switch-options", f"interface {unit}")
-            self.add(*path, f"interface-mac-limit {iface.port_security_max or 1}")
+            self.add(*path, "interface-mac-limit", str(iface.port_security_max or 1))
             action = {"shutdown": "shutdown", "restrict": "drop-and-log", "protect": "drop"}.get(
                 iface.port_security_violation or "shutdown", "shutdown")
             self.add(*path, "interface-mac-limit", f"packet-action {action}")
@@ -591,6 +624,7 @@ class Writer:
     # routing -----------------------------------------------------------------------------------------------------
 
     def routing_instances(self) -> None:
+        vx = self.device.vxlan
         for vrf in self.device.vrfs:
             if vrf in self.mgmt_vrfs:
                 continue
@@ -600,23 +634,13 @@ class Writer:
             path = ("routing-instances", vrf)
             members = [i for i in self.device.interfaces.values()
                        if i.vrf == vrf and i.kind not in (InterfaceKind.TUNNEL, InterfaceKind.OTHER)]
+            l3vni = vx.vrf_vnis.get(vrf) if vx is not None else None
             if info is not None and info.rd and (info.rt_import or info.rt_export):
                 self.add(*path, "instance-type vrf")
                 for iface in members:
                     self.add(*path, f"interface {self.unit_name(iface.name)}")
                 self.add(*path, f"route-distinguisher {info.rd}")
-                pairs = vrfs_text.targets(info)
-                if len(pairs) == 1 and pairs[0][0] == "both":
-                    self.add(*path, f"vrf-target target:{pairs[0][1]}")
-                else:
-                    imports, exports = info.rt_import[:1], info.rt_export[:1]
-                    for direction, values in (("import", imports), ("export", exports)):
-                        for value in values:
-                            self.add(*path, "vrf-target", f"{direction} target:{value}")
-                    if len(info.rt_import) > 1 or len(info.rt_export) > 1:
-                        self.report.add("system", label, Severity.REVIEW, "route-targets",
-                                        "Junos takes one import and one export target here; the others need "
-                                        "vrf-import and vrf-export policies, not written")
+                self.targets(vrf, info, label)
             else:
                 self.add(*path, "instance-type virtual-router")
                 for iface in members:
@@ -625,6 +649,58 @@ class Writer:
                     self.report.add("system", label, Severity.REVIEW, "vrf-partial",
                                     "a Junos VRF instance needs both a route distinguisher and route targets; written "
                                     "as a virtual router without them")
+            if l3vni is not None:
+                evpn = path + ("protocols", "evpn", "ip-prefix-routes")
+                self.add(*evpn, "advertise direct-nexthop")
+                self.add(*evpn, "encapsulation vxlan")
+                self.add(*evpn, f"vni {l3vni}")
+            if info is not None and info.leaks:
+                name = f"{vrf}-LEAK"
+                base = ("policy-options", f"policy-statement {name}")
+                for source, rmap in info.leaks.items():
+                    term = base + (f"term {source}",)
+                    self.add(*term, "from", f"instance {self.instance(source)}")
+                    if rmap:
+                        self.add(*term, "from", f"policy {rmap}")
+                    self.add(*term, "then accept")
+                self.add(*base, f"term {junospolicy.IMPLICIT}", "then reject")
+                self.add(*path, "routing-options", f"instance-import {name}")
+                self.report.add("system", label, Severity.APPROX, "leak",
+                                "the routes leaked from VRF " + ", ".join(info.leaks) + " are imported with the "
+                                f"instance-import policy {name}")
+
+    def targets(self, vrf: str, info: VrfInfo, label: str) -> None:
+        """The route targets of a VRF: vrf-target where one import and one export do, else vrf-import and
+        vrf-export policies; an export route map is called from the export policy."""
+        path = ("routing-instances", vrf)
+        pairs = vrfs_text.targets(info)
+        simple = len(info.rt_import) <= 1 and len(info.rt_export) <= 1 and not info.export_map
+        if simple and len(pairs) == 1 and pairs[0][0] == "both":
+            self.add(*path, f"vrf-target target:{pairs[0][1]}")
+            return
+        if simple:
+            for direction, values in (("import", info.rt_import), ("export", info.rt_export)):
+                for value in values:
+                    self.add(*path, "vrf-target", f"{direction} target:{value}")
+            return
+        for direction, values in (("import", info.rt_import), ("export", info.rt_export)):
+            name = f"{vrf}-{direction.upper()}"
+            community = f"{vrf}-RT-{direction.upper()}"
+            for value in values:
+                self.add("policy-options", f"community {community}", f"members target:{value}")
+            base = ("policy-options", f"policy-statement {name}")
+            term = base + ("term targets",)
+            if direction == "import":
+                self.add(*term, "from", f"community {community}")
+                self.add(*term, "then accept")
+            else:
+                if info.export_map:
+                    self.add(*term, "from", f"policy {info.export_map}")
+                if values:
+                    self.add(*term, "then", f"community add {community}")
+                self.add(*term, "then accept")
+            self.add(*base, f"term {junospolicy.IMPLICIT}", "then reject")
+            self.add(*path, f"vrf-{direction} {name}")
 
     def routes(self) -> None:
         for route in self.device.static_routes:
@@ -654,13 +730,19 @@ class Writer:
                                 f"tracking (object {route.track}) is not written for Junos yet; the route is always on")
 
     def router_id(self) -> str:
-        ids = [p.router_id for p in self.device.ospf if not p.vrf and p.router_id]
+        if self.rid is not None:
+            return self.rid
+        ids = [self.device.system.router_id] if self.device.system.router_id else []
+        ids += [p.router_id for p in self.device.ospf if not p.vrf and p.router_id]
         if self.device.bgp is not None and self.device.bgp.router_id:
             ids.append(self.device.bgp.router_id)
+        if self.device.system.router_id:
+            self.report.item("system", "router ID")
         if len(set(ids)) > 1:
             self.report.add("system", "router ID", Severity.APPROX, "router-id",
                             f"Junos has one router ID for OSPF and BGP; {ids[0]} is written, not {', '.join(ids[1:])}")
-        return ids[0] if ids else ""
+        self.rid = ids[0] if ids else ""
+        return self.rid
 
     def ospf(self) -> None:
         rid = self.router_id()
@@ -721,51 +803,128 @@ class Writer:
             return
         label = f"bgp {bgp.local_as}"
         self.report.item("bgp", label)
-        self.add("routing-options", f"autonomous-system {bgp.local_as}")
-        if bgp.networks or bgp.redistribute or bgp.redistribute6:
-            sources = list(dict.fromkeys(bgp.redistribute + bgp.redistribute6))
-            junospolicy.export_policy(self.add, "BGP-EXPORT", sources, bgp.redistribute_maps, bgp.networks,
-                                      ospf_match=bgp.ospf_match)
-            self.add("protocols", "bgp", "export BGP-EXPORT")
-            if any(n.route_map_out or n.prefix_list_out for n in list(bgp.peer_groups.values()) + bgp.neighbors):
-                self.report.add("bgp", label, Severity.APPROX, "bgp-export",
-                                "the redistribution and network statements are the export policy BGP-EXPORT; a "
-                                "group or neighbor with its own export policy does not use it on Junos, and exports "
-                                "every route its policy accepts, whatever protocol it comes from")
-        for name, group in bgp.peer_groups.items():
-            members = [n for n in bgp.neighbors if n.peer_group == name]
-            if not members:
-                continue
-            self.peer(("protocols", "bgp", f"group {name}"), group, label, group_as=group.remote_as)
-            kind = "internal" if group.remote_as == bgp.local_as else "external"
-            if not group.remote_as:
-                remotes = {bgp_text.remote_as(bgp, n) for n in members}
-                kind = "internal" if remotes == {bgp.local_as} else "external"
-            self.add("protocols", "bgp", f"group {name}", f"type {kind}")
+        self.add("routing-options", f"autonomous-system {bgp.local_as}" + (" asdot-notation" if bgp.asdot else ""))
+        if bgp.keepalive is not None or bgp.hold is not None:
+            hold = bgp.hold if bgp.hold is not None else 3 * (bgp.keepalive or 60)
+            self.add("protocols", "bgp", f"hold-time {hold}")
+            if bgp.keepalive is not None and bgp.keepalive * 3 != hold:
+                self.report.add("bgp", label, Severity.APPROX, "bgp-timers",
+                                f"Junos sets the hold time only and sends keepalives at a third of it; keepalive "
+                                f"{bgp.keepalive} becomes {hold // 3}")
+        if bgp.graceful_restart:
+            self.add("routing-options", "graceful-restart")
+            if bgp.graceful_restart_time:
+                self.add("routing-options", "graceful-restart", f"restart-duration {bgp.graceful_restart_time}")
+        if bgp.distance and bgp.distance[2] != 200:
+            self.report.add("bgp", label, Severity.APPROX, "bgp-distance",
+                            f"Junos has no distance for local BGP routes; {bgp.distance[2]} is left out")
+        if bgp.med_missing_as_worst or any(v.med_missing_as_worst for v in bgp.vrfs.values()):
+            self.report.add("bgp", label, Severity.APPROX, "med-missing",
+                            "Junos has no 'missing-as-worst': a route without MED counts as MED 0")
         if bgp.maximum_paths or bgp.maximum_paths_ibgp:
             self.add("protocols", "bgp", "multipath" + (" multiple-as" if bgp.multipath_relax else ""))
             self.load_balance()
             self.report.add("bgp", label, Severity.APPROX, "multipath",
                             f"maximum-paths {bgp.maximum_paths or bgp.maximum_paths_ibgp} is written as multipath: "
                             "Junos installs as many equal paths as the platform allows")
-        bgp_text.unwritten_vrfs(bgp, self.report, "Junos")
-        for neighbor in bgp.neighbors:
-            nlabel = f"neighbor {neighbor.address}"
+        evpn_text.junos_domains(bgp, self.report)
+        self.families_note(label, bgp.redistribute, bgp.redistribute6)
+        self.bgp_instance("", bgp.peer_groups, bgp.neighbors, bgp.networks, bgp.redistribute + bgp.redistribute6,
+                          bgp.redistribute_maps, bgp.aggregates, bgp.ospf_match, label)
+        for name, v in bgp.vrfs.items():
+            vlabel = f"bgp vrf {name}"
+            self.report.item("bgp", vlabel)
+            used = {n.peer_group for n in v.neighbors}
+            groups = {k: g for k, g in bgp.peer_groups.items() if k in used}
+            groups.update(v.peer_groups)
+            if v.maximum_paths:
+                self.add("routing-instances", self.instance(name), "protocols", "bgp", "multipath")
+            self.families_note(vlabel, v.redistribute, v.redistribute6)
+            self.bgp_instance(name, groups, v.neighbors, v.networks, v.redistribute + v.redistribute6,
+                              v.redistribute_maps, v.aggregates, v.ospf_match, vlabel)
+
+    def families_note(self, label: str, v4: List[str], v6: List[str]) -> None:
+        if v6 and set(v4) != set(v6):
+            self.report.add("bgp", label, Severity.APPROX, "redistribute6",
+                            f"one export policy serves IPv4 and IPv6 on Junos: the IPv4 sources ({', '.join(v4) or '-'})"
+                            f" and the IPv6 ones ({', '.join(v6)}) are exported in both families")
+
+    def bgp_instance(self, vrf: str, groups: Dict[str, BgpNeighbor], neighbors: List[BgpNeighbor],
+                     networks: List[str], redistribute: List[str], maps: Dict[str, str],
+                     aggregates: List[BgpAggregate], ospf_match: List[str], label: str) -> None:
+        """BGP in the main routing table or in a VRF's routing instance."""
+        bgp = self.device.bgp
+        assert bgp is not None
+        base: Tuple[str, ...] = ("protocols", "bgp")
+        options: Tuple[str, ...] = ("routing-options",)
+        if vrf:
+            base = ("routing-instances", self.instance(vrf)) + base
+            options = ("routing-instances", self.instance(vrf)) + options
+        for a in aggregates:
+            net = ipaddress.ip_network(a.prefix)
+            rib = options + (("rib inet6.0" if not vrf else f"rib {self.instance(vrf)}.inet6.0",) if net.version == 6
+                             else ())
+            self.add(*rib, "aggregate", f"route {net}", "full" if a.as_set else "brief")
+        sources = list(dict.fromkeys(redistribute))
+        if networks or sources or aggregates:
+            name = f"{vrf}-BGP-EXPORT" if vrf else "BGP-EXPORT"
+            junospolicy.export_policy(self.add, name, sources, maps, networks, ospf_match=ospf_match,
+                                      aggregates=aggregates)
+            self.add(*base, f"export {name}")
+            if any(n.route_map_out or n.prefix_list_out or n.next_hop_self for n in list(groups.values()) + neighbors):
+                self.report.add("bgp", label, Severity.APPROX, "bgp-export",
+                                f"the redistribution and network statements are the export policy {name}; a group "
+                                "or neighbor with its own export policy does not use it on Junos, and exports every "
+                                "route its policy accepts, whatever protocol it comes from")
+        dev = self.device
+        if dev.community_lists or any("community" in e.sets for rm in dev.route_maps.values() for e in rm.entries):
+            quiet = [g.address for g in groups.values() if not g.send_community
+                     and any(n.peer_group == g.address and not n.send_community for n in neighbors)]
+            quiet += [n.address for n in neighbors if not n.peer_group and not n.send_community]
+            if quiet:
+                self.report.add("bgp", label, Severity.APPROX, "send-community",
+                                "Junos sends communities to every peer; the source sent none to " + ", ".join(quiet)
+                                + ": strip them with 'then community delete' in their export policy if that matters")
+        local = bgp.local_as
+        for name, group in groups.items():
+            members = [n for n in neighbors if n.peer_group == name]
+            if not members:
+                continue
+            path = base + (f"group {name}",)
+            fallback = sorted({bgp_text.family(n.address) for n in members} - {""})
+            self.peer(path, group, label, group_as=group.remote_as, fallback=fallback)
+            kind = "internal" if group.remote_as == local else "external"
+            if not group.remote_as:
+                remotes = {n.remote_as or group.remote_as for n in members}
+                kind = "internal" if remotes == {local} else "external"
+            self.add(*path, f"type {kind}")
+            self.preference(path, kind)
+        for neighbor in neighbors:
+            nlabel = f"neighbor {neighbor.address}" + (f" vrf {vrf}" if vrf else "")
             self.report.item("bgp", nlabel)
-            remote = bgp_text.remote_as(bgp, neighbor)
-            group_name = neighbor.peer_group
-            if not group_name or group_name not in bgp.peer_groups:
-                group_name = "IBGP" if remote == bgp.local_as else "EBGP"
-                self.add("protocols", "bgp", f"group {group_name}",
-                         f"type {'internal' if group_name == 'IBGP' else 'external'}")
+            pgroup = groups.get(neighbor.peer_group)
+            remote = neighbor.remote_as or (pgroup.remote_as if pgroup is not None else "")
+            if pgroup is None:
+                group_name = "IBGP" if remote == local else "EBGP"
+                kind = "internal" if group_name == "IBGP" else "external"
+                self.add(*base, f"group {group_name}", f"type {kind}")
+                self.preference(base + (f"group {group_name}",), kind)
                 own_as = neighbor.remote_as if group_name == "EBGP" else ""
             else:
-                own_as = neighbor.remote_as if neighbor.remote_as != bgp.peer_groups[group_name].remote_as else ""
-            path = ("protocols", "bgp", f"group {group_name}", f"neighbor {neighbor.address}")
+                group_name = neighbor.peer_group
+                own_as = neighbor.remote_as if neighbor.remote_as != pgroup.remote_as else ""
+            path = base + (f"group {group_name}", f"neighbor {neighbor.address}")
             self.add(*path)
             self.peer(path, neighbor, nlabel, group_as=own_as)
 
-    def peer(self, path: Tuple[str, ...], p: BgpNeighbor, label: str, group_as: str) -> None:
+    def preference(self, path: Tuple[str, ...], kind: str) -> None:
+        bgp = self.device.bgp
+        if bgp is not None and bgp.distance:
+            value = bgp.distance[0] if kind == "external" else bgp.distance[1]
+            self.add(*path, f"preference {value}")
+
+    def peer(self, path: Tuple[str, ...], p: BgpNeighbor, label: str, group_as: str,
+             fallback: Sequence[str] = ()) -> None:
         bgp = self.device.bgp
         assert bgp is not None
         if p.description:
@@ -794,28 +953,188 @@ class Writer:
                                 f"Junos sets the hold time only and sends keepalives at a third of it; keepalive "
                                 f"{p.keepalive} becomes {hold // 3}")
         if p.remove_private_as:
-            self.add(*path, "remove-private")
-        bgp_text.unwritten(p, {"password", "timers", "remove_private_as"}, self.report, label, "Junos")
-        families = p.families
-        if families and families != [bgp_text.family(p.address)]:
-            for family in families:
-                words = {"ipv4": "family inet", "ipv6": "family inet6", "evpn": "family evpn"}[family]
-                self.add(*path, words, "signaling" if family == "evpn" else "unicast")
+            mode = {"all": " all", "all replace-as": " all replace"}.get(p.remove_private_as_mode, "")
+            self.add(*path, f"remove-private{mode}")
+        if p.route_reflector_client:
+            self.add(*path, f"cluster {self.router_id() or bgp.router_id or '0.0.0.1'}")
+        if p.local_as:
+            options = {"no-prepend": " private", "no-prepend replace-as": " private no-prepend-global-as"}.get(
+                p.local_as_options, "")
+            self.add(*path, f"local-as {p.local_as}{options}")
+        written = {"password", "timers", "remove_private_as", "remove_private_as_mode", "route_reflector_client",
+                   "local_as", "maximum_prefix", "maximum_prefix_warning"}
+        bgp_text.unwritten(p, written, self.report, label, "Junos")
+        families = p.families or ([bgp_text.family(p.address)] if bgp_text.family(p.address) else list(fallback))
+        stated = p.families and p.families != [bgp_text.family(p.address)]
+        for family in families:
+            words = {"ipv4": "family inet", "ipv6": "family inet6", "evpn": "family evpn"}[family]
+            sub = "signaling" if family == "evpn" else "unicast"
+            if stated or p.maximum_prefix and family != "evpn":
+                self.add(*path, words, sub)
+            if p.maximum_prefix and family != "evpn":
+                self.add(*path, words, sub, "prefix-limit", f"maximum {p.maximum_prefix}")
+                if p.maximum_prefix_warning:
+                    self.add(*path, words, sub, "prefix-limit", f"teardown {p.maximum_prefix_warning}")
+        if p.maximum_prefix and p.maximum_prefix_warning:
+            self.report.add("bgp", label, Severity.APPROX, "prefix-limit",
+                            f"Junos warns at {p.maximum_prefix_warning}% and tears the session down at the limit; "
+                            "the source may only have warned")
+        if p.next_hop_self:
+            self.add("policy-options", "policy-statement NEXT-HOP-SELF", "then", "next-hop self")
+            self.add(*path, "export NEXT-HOP-SELF")
         for direction, plist, rmap in (("import", p.prefix_list_in, p.route_map_in),
                                        ("export", p.prefix_list_out, p.route_map_out)):
             if plist:
                 self.add(*path, f"{direction} {junospolicy.prefix_policy(self.add, plist, self.prefix_kinds)}")
             if rmap:
                 self.add(*path, f"{direction} {rmap}")
-        missing = [what for what, stated in (("next-hop-self", p.next_hop_self), ("shutdown", p.shutdown)) if stated]
-        if missing:
-            self.report.add("bgp", label, Severity.REVIEW, "junos-not-yet",
-                            f"not written for Junos yet: {', '.join(missing)}")
+        if p.shutdown:
+            self.report.add("bgp", label, Severity.REVIEW, "bgp-shutdown",
+                            "the session is shut down in the source; deactivate it on Junos (deactivate protocols "
+                            "bgp group ...) by hand")
 
     def load_balance(self) -> None:
         """Junos installs one path in the forwarding table unless a policy tells it to balance."""
         self.add("policy-options", "policy-statement LOAD-BALANCE", "then", "load-balance per-packet")
         self.add("routing-options", "forwarding-table", "export LOAD-BALANCE")
+
+    # EVPN and VXLAN, MC-LAG -------------------------------------------------------------------------------------
+
+    def evpn(self) -> None:
+        dev = self.device
+        vx = dev.vxlan
+        if vx is None:
+            return
+        label = "VXLAN"
+        self.report.item("interface", label)
+        source = self.unit_name(vx.source_interface) if vx.source_interface else ""
+        if source:
+            self.add("switch-options", f"vtep-source-interface {source}")
+        if vx.udp_port not in (None, 4789):
+            self.report.add("interface", label, Severity.REVIEW, "vxlan-port",
+                            f"Junos uses UDP port 4789 for VXLAN; port {vx.udp_port} is not written")
+        for vid, vni in sorted(vx.vlan_vnis.items()):
+            self.add("vlans", self.vlan_names.get(vid, f"VLAN{vid}"), "vxlan", f"vni {vni}")
+            if vid in vx.mcast_groups:
+                self.add("vlans", self.vlan_names.get(vid, f"VLAN{vid}"), "vxlan",
+                         f"multicast-group {vx.mcast_groups[vid]}")
+        if vx.mcast_groups:
+            self.report.add("interface", label, Severity.APPROX, "vxlan-mcast",
+                            "the multicast groups are written per VLAN (vxlan multicast-group); Junos takes them only "
+                            "where the platform replicates by multicast, and EVPN fabrics replicate by ingress "
+                            "replication")
+        if vx.flood_vteps:
+            for vtep in vx.flood_vteps:
+                self.add("switch-options", f"remote-vtep-list {vtep}")
+            for vid in vx.vlan_vnis:
+                if vid not in vx.evpn_vlans:
+                    self.add("vlans", self.vlan_names.get(vid, f"VLAN{vid}"), "vxlan", "ingress-node-replication")
+        if vx.evpn_vlans:
+            base = ("protocols", "evpn")
+            self.add(*base, "encapsulation vxlan")
+            vnis = [vx.vlan_vnis[v] for v in vx.evpn_vlans if v in vx.vlan_vnis]
+            for vni in vnis:
+                self.add(*base, f"extended-vni-list {vni}")
+            if dev.anycast_mac and any(i.virtual_ipv4 or i.virtual_ipv6 for i in dev.interfaces.values()):
+                self.add(*base, "default-gateway no-gateway-community")
+            vtep = self.address_of(vx.source_interface) if vx.source_interface else ""
+            rds = [i.rd for i in vx.evpn_instances.values() if i.rd]
+            rd = f"{vtep or self.router_id() or '0.0.0.0'}:1"
+            self.add("switch-options", f"route-distinguisher {rd}")
+            self.add("switch-options", "vrf-target auto")
+            if rds:
+                self.report.add("interface", label, Severity.APPROX, "evpn-rd",
+                                f"Junos' default switch has one route distinguisher ({rd}); the instances' own ("
+                                + ", ".join(rds) + ") are not written")
+            for inst in vx.evpn_instances.values():
+                imports, exports = inst.rt_import, inst.rt_export
+                for vid in inst.vlans:
+                    vni_id = vx.vlan_vnis.get(vid)
+                    if vni_id is None:
+                        continue
+                    path = base + ("vni-options", f"vni {vni_id}")
+                    if imports == exports and len(imports) == 1:
+                        self.add(*path, f"vrf-target target:{imports[0]}")
+                    else:
+                        for value in exports[:1]:
+                            self.add(*path, "vrf-target", f"export target:{value}")
+                        if imports[1:] or exports[1:] or imports != exports:
+                            self.report.add("interface", label, Severity.REVIEW, "evpn-rt",
+                                            f"instance {inst.name}: Junos sets one target per VNI; the import "
+                                            f"targets {', '.join(imports) or '-'} need a vrf-import policy in "
+                                            "switch-options, not written")
+                if inst.igmp:
+                    self.report.add("interface", label, Severity.APPROX, "evpn-igmp",
+                                    f"instance {inst.name}: IGMP joins become EVPN routes on Junos when IGMP snooping "
+                                    "runs in the VLANs (protocols igmp-snooping); 'redistribute igmp' has no line of "
+                                    "its own")
+        bgp = dev.bgp
+        if bgp is not None and bgp.evpn_host_flap:
+            window, moves, expiry = bgp.evpn_host_flap
+            dup = ("protocols", "evpn", "duplicate-mac-detection")
+            self.add(*dup, f"detection-window {window}")
+            self.add(*dup, f"detection-threshold {moves}")
+            if expiry:
+                self.add(*dup, f"auto-recovery-time {max(1, round(expiry / 60))}")
+                if expiry % 60:
+                    self.report.add("bgp", f"bgp {bgp.local_as}", Severity.APPROX, "host-flap",
+                                    f"Junos recovers a duplicate MAC after whole minutes; {expiry} s is rounded")
+        if vx.mlag_shared_mac:
+            self.report.add("interface", label, Severity.APPROX, "vxlan-mlag-mac",
+                            "the MLAG pair's shared router MAC (encapsulation mac-address mlag-system-id) has no "
+                            "Junos equivalent: Junos fabrics multihome with ESI LAGs")
+        if vx.qos_propagation:
+            self.report.add("interface", label, Severity.APPROX, "vxlan-qos",
+                            "VXLAN QoS propagation (" + ", ".join(vx.qos_propagation) + ") is left out: Junos copies "
+                            "the DSCP of the inner header into the outer one by itself")
+
+    def mclag(self) -> None:
+        """An MLAG pair as Junos MC-LAG: ICCP between the peers, the peer link as the ICL, mc-ae on each shared LAG."""
+        m = self.device.mlag
+        if m is None or m.stack:
+            if m is not None:
+                self.report.skip("interface", "multi-chassis LAG", "stackwise",
+                                 "StackWise Virtual makes two switches one; Junos does that with a Virtual Chassis, "
+                                 "which is set up outside the configuration")
+            return
+        label = "multi-chassis LAG"
+        self.report.item("interface", label)
+        local = self.address_of(m.local_interface) if m.local_interface else ""
+        if local:
+            self.add("protocols", "iccp", f"local-ip-addr {local}")
+        if m.peer_address:
+            peer = ("protocols", "iccp", f"peer {m.peer_address}")
+            self.add(*peer, "redundancy-group-id-list 1")
+            self.add(*peer, "liveness-detection", "minimum-interval 1000")
+            if m.heartbeat:
+                self.add(*peer, "backup-liveness-detection", f"backup-peer-ip {m.heartbeat}")
+            if m.peer_link:
+                self.add("multi-chassis", f"multi-chassis-protection {m.peer_address}",
+                         f"interface {self.port(m.peer_link)}")
+        self.add("switch-options", "service-id 1")
+        for iface in self.device.interfaces.values():
+            if iface.mlag_id is None or iface.kind != InterfaceKind.LAG:
+                continue
+            top = ("interfaces", self.port(iface.name), "aggregated-ether-options")
+            mc = top + ("mc-ae",)
+            self.add(*mc, f"mc-ae-id {iface.mlag_id}")
+            self.add(*mc, "redundancy-group 1")
+            self.add(*mc, f"chassis-id {0 if m.role != 'secondary' else 1}")
+            self.add(*mc, "mode active-active")
+            self.add(*mc, f"status-control {'standby' if m.role == 'secondary' else 'active'}")
+            if m.reload_delay:
+                self.add(*mc, f"init-delay-time {m.reload_delay}")
+            if not iface.lacp_system_id:
+                self.add(*top, "lacp", f"system-id 00:00:00:00:{iface.mlag_id // 256:02x}:{iface.mlag_id % 256:02x}")
+                self.add(*top, "lacp", f"admin-key {iface.mlag_id}")
+        self.report.add("interface", label, Severity.APPROX, "mclag",
+                        f"MLAG domain {m.domain or '-'} is written as Junos MC-LAG (ICCP, mc-ae): this switch is "
+                        "chassis-id 0 with status-control active, so give the peer chassis-id 1 and standby; the LACP "
+                        "system IDs and admin keys are made up and must match on both")
+        if m.dual_primary_delay is not None or m.reload_delay_non_mlag:
+            self.report.add("interface", label, Severity.APPROX, "mclag-options",
+                            "dual-primary detection and the reload delay of the other ports have no MC-LAG "
+                            "equivalent; prefer-status-control-active and the ICCP backup liveness come closest")
 
     # LLDP and spanning tree --------------------------------------------------------------------------------------
 

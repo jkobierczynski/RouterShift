@@ -28,8 +28,8 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 from . import acl as acl_text
 from . import routemap as routemap_text
 from .junostext import quote
-from .model import (Acl, AclAction, AclEntry, AsPathList, CommunityList, Device, PrefixEntry, PrefixList, RouteMap,
-                    RouteMapEntry)
+from .model import (Acl, AclAction, AclEntry, AsPathList, BgpAggregate, CommunityList, Device, PrefixEntry, PrefixList,
+                    RouteMap, RouteMapEntry)
 from .report import Report, Severity
 
 PROTOCOLS = {"connected": "direct", "static": "static", "ospf": "ospf", "bgp": "bgp", "rip": "rip", "isis": "isis"}
@@ -243,9 +243,21 @@ def prefix_policy(add: Add, name: str, kinds: Dict[str, str]) -> str:
 
 
 def export_policy(add: Add, name: str, sources: Sequence[str], maps: Dict[str, str], networks: Sequence[str] = (),
-                  default: str = "", metric_type: str = "", ospf_match: Sequence[str] = ()) -> None:
-    """The export policy that redistributes sources (connected, static, ...) and announces networks."""
+                  default: str = "", metric_type: str = "", ospf_match: Sequence[str] = (),
+                  aggregates: Sequence[BgpAggregate] = ()) -> None:
+    """The export policy that redistributes sources (connected, static, ...), announces networks and aggregates,
+    and keeps the routes a summary-only aggregate covers to itself."""
     base = ("policy-options", f"policy-statement {name}")
+    summary = [a for a in aggregates if a.summary_only]
+    for a in summary:
+        add(*base, "term summary-only", "from", f"route-filter {ipaddress.ip_network(a.prefix)} longer")
+    if summary:
+        add(*base, "term summary-only", "then reject")
+    for a in aggregates:
+        add(*base, "term aggregates", "from", f"route-filter {ipaddress.ip_network(a.prefix)} exact")
+    if aggregates:
+        add(*base, "term aggregates", "from", "protocol aggregate")
+        add(*base, "term aggregates", "then accept")
     for source in sources:
         term = base + (f"term {source}",)
         add(*term, "from", f"protocol {PROTOCOLS.get(source, source)}")
@@ -369,6 +381,7 @@ class Reader:
         self.filters: Dict[Tuple[str, str], Policy] = {}  # (family, name)
         self.route_filters: Dict[str, str] = {}  # route-filter-list or prefix-list name -> kind
         self.used_as_export: Dict[str, str] = {}  # policy -> what exports it ("bgp", "ospf", ...)
+        self.aggregates: Dict[str, List[BgpAggregate]] = {}  # export policy -> the aggregates it announces
 
     def policy_options(self, line: int, w: List[str]) -> bool:
         if not w:
@@ -447,7 +460,8 @@ class Reader:
             self.acl(family, policy, unread)
         for name in self.communities:
             values = self.communities[name]
-            if any(v.startswith("target:") for v in values) or self._generated_community(name):
+            if any(v.startswith("target:") for v in values) or self._generated_community(name) or \
+                    re.match(r"^.+-RT-(IMPORT|EXPORT)$", name):
                 continue
             cl = self.device.community_lists.setdefault(name, CommunityList(name))
             cl.origin.line = self.community_lines[name]
@@ -617,7 +631,7 @@ class Reader:
             e.sets[t[0]] = t[1]
         elif t[:2] == ["external", "type"] and len(t) == 3 and t[2] in ("1", "2"):
             e.sets["metric-type"] = f"type-{t[2]}"
-        elif t[0] == "next-hop" and len(t) == 2:
+        elif t[0] == "next-hop" and len(t) == 2 and t[1] not in ("self", "peer-address", "discard", "reject"):
             e.sets["next-hop"] = str(ipaddress.ip_address(t[1]))
         elif t[0] == "origin" and len(t) == 2 and t[1] in ("igp", "incomplete"):
             e.sets["origin"] = t[1]
@@ -635,6 +649,60 @@ class Reader:
             return False
         return True
 
+    def next_hop_self(self, name: str) -> bool:
+        policy = self.policies.get(name)
+        if policy is None or [t.thens for t in policy.terms.values()] != [[["next-hop", "self"]]] or any(
+                t.froms for t in policy.terms.values()):
+            return False
+        self.used_as_export[name] = "next-hop-self"
+        return True
+
+    def vrf_policy(self, name: str, direction: str) -> Optional[Tuple[List[str], str]]:
+        """A vrf-import or vrf-export policy RouterShift writes: (route targets, export route map)."""
+        policy = self.policies.get(name)
+        if policy is None:
+            return None
+        targets: List[str] = []
+        rmap = ""
+        for term in policy.terms.values():
+            if term.name == IMPLICIT and term.thens == [["reject"]] and not term.froms:
+                continue
+            if term.thens[-1:] != [["accept"]]:
+                return None
+            for f in term.froms:
+                if f[0] == "community" and len(f) == 2 and direction == "import":
+                    targets += [v[len("target:"):] for v in self.communities.get(f[1], []) if v.startswith("target:")]
+                elif f[0] == "policy" and len(f) == 2 and direction == "export":
+                    rmap = f[1]
+                else:
+                    return None
+            for t in term.thens[:-1]:
+                if t[:2] == ["community", "add"] and len(t) == 3 and direction == "export":
+                    targets += [v[len("target:"):] for v in self.communities.get(t[2], []) if v.startswith("target:")]
+                else:
+                    return None
+        self.used_as_export[name] = f"vrf-{direction}"
+        return targets, rmap
+
+    def leak_policy(self, name: str) -> Optional[Dict[str, str]]:
+        """An instance-import policy RouterShift writes: source instance -> route map."""
+        policy = self.policies.get(name)
+        if policy is None:
+            return None
+        leaks: Dict[str, str] = {}
+        for term in policy.terms.values():
+            if term.name == IMPLICIT and term.thens == [["reject"]] and not term.froms:
+                continue
+            if term.thens != [["accept"]]:
+                return None
+            source = next((f[1] for f in term.froms if f[0] == "instance" and len(f) == 2), "")
+            rmap = next((f[1] for f in term.froms if f[0] == "policy" and len(f) == 2), "")
+            if not source or len(term.froms) != (2 if rmap else 1):
+                return None
+            leaks[source] = rmap
+        self.used_as_export[name] = "instance-import"
+        return leaks
+
     # export policies --------------------------------------------------------------------------------------------
 
     def export(self, name: str) -> Optional[Tuple[List[str], Dict[str, str], List[str], str, str, List[str]]]:
@@ -649,13 +717,31 @@ class Reader:
         default = ""
         metric_type = ""
         ospf_match: List[str] = []
+        summary: List[str] = []
+        aggregated: List[str] = []
         for term in policy.terms.values():
-            if term.thens and term.thens[-1] != ["accept"]:
+            if term.thens and term.thens[-1] != ["accept"] and term.name != "summary-only":
                 return None
             if term.name in ("default-route", "default-route-always"):
                 if term.froms != [["route-filter", "0.0.0.0/0", "exact"]]:
                     return None
                 default = "always" if term.name.endswith("always") else "on"
+                continue
+            if term.name == "summary-only":
+                if term.thens != [["reject"]]:
+                    return None
+                for f in term.froms:
+                    if f[0] != "route-filter" or f[2:] != ["longer"]:
+                        return None
+                    summary.append(str(ipaddress.ip_network(f[1])))
+                continue
+            if term.name == "aggregates":
+                for f in term.froms:
+                    if f == ["protocol", "aggregate"]:
+                        continue
+                    if f[0] != "route-filter" or f[2:] != ["exact"]:
+                        return None
+                    aggregated.append(str(ipaddress.ip_network(f[1])))
                 continue
             if term.name == "networks":
                 for f in term.froms:
@@ -681,6 +767,7 @@ class Reader:
                 else:
                     return None
         self.used_as_export[name] = "export"
+        self.aggregates[name] = [BgpAggregate(prefix, prefix in summary) for prefix in aggregated]
         return sources, maps, networks, default, metric_type, ospf_match
 
 

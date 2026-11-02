@@ -118,7 +118,7 @@ def _hierarchy(text: str) -> List[Statement]:
 
 # Statements that hold a list of values
 LISTS = {"members", "vlan", "domain-search", "next-hop", "import", "export", "source-port", "destination-port",
-         "authentication-order", "events"}
+         "authentication-order", "events", "extended-vni-list"}
 
 
 @dataclass

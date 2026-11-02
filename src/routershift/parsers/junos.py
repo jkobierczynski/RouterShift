@@ -19,15 +19,16 @@ from typing import Callable, Dict, List, Optional, Set, Tuple
 from .. import aaa as aaa_text
 from .. import bgp as bgp_text
 from .. import dhcp as dhcp_text
+from .. import evpn as evpn_text
 from .. import fhrp as fhrp_text
 from .. import junospolicy
 from .. import ospf as ospf_text
 from .. import vrfs as vrfs_text
 from .. import vxlan as vxlan_text
 from ..junostext import Statement, read
-from ..model import (AaaMethod, AaaServer, BgpNeighbor, Device, DhcpPool, FhrpGroup, Interface, InterfaceKind,
-                     LacpMode, LocalUser, NtpKey, SnmpCommunity, StaticRoute, StpMode, SwitchportMode, Track, Unparsed,
-                     Vlan)
+from ..model import (AaaMethod, AaaServer, Bgp, BgpAggregate, BgpNeighbor, BgpVrf, Device, DhcpPool, EvpnInstance,
+                     FhrpGroup, Interface, InterfaceKind, LacpMode, LocalUser, Mlag, NtpKey, SnmpCommunity, StaticRoute,
+                     StpMode, SwitchportMode, Track, Unparsed, Vlan, Vxlan)
 
 _MEDIA = {"ge": "1g", "xe": "10g", "et": "100g", "mge": "2.5g", "fe": "100m"}
 _PHYSICAL = re.compile(r"^(ge|xe|et|mge|fe)-(\d+/\d+/\d+(?::\d+)?)$")
@@ -84,18 +85,34 @@ class Reader:
         self.router_ids: Dict[str, str] = {}  # routing instance ("" = the main one) -> router ID
         self.ospf_numbers: Dict[str, str] = {}
         self.local_as = ""
-        self.bgp_groups: Dict[str, BgpNeighbor] = {}
-        self.bgp_neighbors: Dict[str, BgpNeighbor] = {}
-        self.bgp_types: Dict[str, str] = {}  # group -> internal / external
-        self.bgp_families: Dict[str, List[str]] = {}  # group or neighbor -> families stated
+        self.bgp_groups: Dict[str, Dict[str, BgpNeighbor]] = {}  # routing instance -> groups
+        self.bgp_neighbors: Dict[str, Dict[str, BgpNeighbor]] = {}
+        self.bgp_types: Dict[Tuple[str, str], str] = {}  # (instance, group) -> internal / external
+        self.bgp_families: Dict[Tuple[str, str], List[str]] = {}  # (instance, group or neighbor) -> families
         self.bgp_line = 0
         self.irb_vlans: Dict[str, int] = {}
         self.edge_bpdu_block = False
         self.policy = junospolicy.Reader(self.device)
-        self.bgp_policies: Dict[Tuple[str, str], List[str]] = {}  # (group or neighbor, import|export) -> policies
-        self.bgp_export: List[str] = []
-        self.bgp_multipath_on = False
-        self.multipath = False
+        self.bgp_policies: Dict[Tuple[str, str, str], List[str]] = {}  # (instance, peer, import|export) -> policies
+        self.bgp_export: Dict[str, List[str]] = {}  # routing instance -> export policies
+        self.bgp_multipath: Dict[str, bool] = {}  # routing instance -> multiple-as
+        self.bgp_hold: Optional[int] = None
+        self.bgp_preference: Dict[Tuple[str, str], int] = {}
+        self.graceful_restart = False
+        self.restart_duration: Optional[int] = None
+        self.asdot = False
+        self.aggregate_routes: Dict[Tuple[str, str], bool] = {}  # (instance, prefix) -> as-set
+        self.instance_imports: Dict[str, List[str]] = {}
+        self.vrf_policies: Dict[str, List[Tuple[str, str, Statement]]] = {}
+        self.vni_targets: Dict[int, Dict[str, str]] = {}  # VNI -> both|import|export -> target
+        self.switch_target = ""  # switch-options vrf-target: the target of VNIs without their own
+        self.vlan_vxlan: Dict[str, Dict[str, str]] = {}  # VLAN name -> vni / multicast-group / ingress
+        self.esi: Dict[str, Dict[str, str]] = {}  # aggregate -> esi settings
+        self.mc_ae: Dict[str, Dict[str, str]] = {}  # aggregate -> mc-ae settings
+        self.iccp: Dict[str, str] = {}
+        self.protection: Dict[str, str] = {}  # peer -> interface
+        self.evpn_vnis: List[str] = []
+        self.host_flap: Dict[str, int] = {}
         self.ospf_exports: Dict[str, List[str]] = {}  # routing instance -> export policies of its OSPF
         self.generated: List[Statement] = []  # generate route 0.0.0.0/0 discard (for default-information always)
         self.load_balance: List[str] = []
@@ -159,7 +176,7 @@ class Reader:
             "policy-options": lambda s: self.policy.policy_options(s.line, s.words[1:]),
             "firewall": lambda s: self.policy.firewall(s.line, s.words[1:]),
             "forwarding-options": lambda s: self.forwarding_options(s, s.words[1:], ""),
-            "switch-options": self.switch_options, "poe": self.poe_line, "access": lambda s: self.access(s.words[1:], ""),
+            "switch-options": self.switch_options, "poe": self.poe_line, "multi-chassis": self.multi_chassis, "access": lambda s: self.access(s.words[1:], ""),
         }
         # routing instances first: their interfaces belong to them before OSPF reads them
         later.sort(key=lambda s: s.words[0] != "routing-instances" or "protocols" in s.words[:3])
@@ -194,6 +211,15 @@ class Reader:
         if rest[0] == "l3-interface" and len(rest) == 2:
             self.l3_units[rest[1]] = name
             return True
+        if rest[0] == "vxlan" and len(rest) >= 2:
+            vx_settings = self.vlan_vxlan.setdefault(name, {})
+            if rest[1] in ("vni", "multicast-group") and len(rest) == 3:
+                vx_settings[rest[1]] = rest[2]
+                return True
+            if rest[1:] == ["ingress-node-replication"]:
+                vx_settings["ingress"] = "on"
+                return True
+            return False
         if rest[:2] == ["forwarding-options", "dhcp-security"]:
             settings = self.snooping.setdefault(name, {})
             more = rest[2:]
@@ -293,6 +319,21 @@ class Reader:
             self.ifds[rest[2]] = lag[0]
         elif rest[:2] == ["aggregated-ether-options", "lacp"] and len(rest) == 3 and rest[2] in ("active", "passive"):
             self.lacp[port.name] = LacpMode(rest[2])
+        elif rest[:2] == ["aggregated-ether-options", "lacp"] and len(rest) == 4 and rest[2] in ("system-id",
+                                                                                                  "admin-key"):
+            self.esi.setdefault(port.name, {})[rest[2]] = rest[3]
+        elif rest[:2] == ["aggregated-ether-options", "mc-ae"] and len(rest) == 4:
+            self.mc_ae.setdefault(port.name, {})[rest[2]] = rest[3]
+        elif rest[0] == "esi" and len(rest) >= 2:
+            settings = self.esi.setdefault(port.name, {})
+            if len(rest) == 2 and rest[1] in ("all-active", "single-active"):
+                settings["mode"] = rest[1]
+            elif len(rest) == 2 and ":" in rest[1]:
+                settings["esi"] = rest[1]
+            elif rest[1:4] == ["df-election-type", "preference", "value"] and len(rest) == 5:
+                settings["preference"] = rest[4]
+            else:
+                return False
         elif rest[0] in ("ether-options", "gigether-options") and len(rest) == 3 and rest[1] == "speed" or \
                 rest[0] == "speed" and len(rest) == 2:
             port.speed = bandwidth(rest[-1])
@@ -624,6 +665,19 @@ class Reader:
 
     def switch_options(self, s: Statement) -> bool:
         w = s.words[1:]
+        if w[0] == "vtep-source-interface" and len(w) == 2:
+            iface = self.canonical(w[1])
+            self.vxlan().source_interface = iface.name if iface else w[1]
+            return iface is not None
+        if w[0] == "route-distinguisher" and len(w) == 2 or w in (["vrf-target", "auto"],) or \
+                w[0] == "service-id" and len(w) == 2:
+            return True  # the default switch's own: one for all instances
+        if w[0] == "vrf-target" and len(w) == 2 and w[1].startswith("target:"):
+            self.switch_target = w[1][len("target:"):]
+            return True
+        if w[0] == "remote-vtep-list" and len(w) == 2:
+            self.vxlan().flood_vteps.append(w[1])
+            return True
         if w[:2] == ["voip", "interface"] and len(w) == 5 and w[3] == "vlan":
             self.voip[w[2]] = w[4]
             return True
@@ -638,6 +692,13 @@ class Reader:
             else:
                 return False
             self.mac_limits[w[1]] = (limit, action)
+            return True
+        return False
+
+    def multi_chassis(self, s: Statement) -> bool:
+        w = s.words[1:]
+        if w[0] == "multi-chassis-protection" and len(w) == 4 and w[2] == "interface":
+            self.protection[w[1]] = w[3]
             return True
         return False
 
@@ -723,15 +784,27 @@ class Reader:
         if w[0] == "router-id" and len(w) == 2:
             self.router_ids[vrf] = w[1]
             return True
-        if w[0] == "autonomous-system" and len(w) == 2 and not vrf:
+        if w[0] == "autonomous-system" and len(w) in (2, 3) and not vrf and w[2:] in ([], ["asdot-notation"]):
             self.local_as = w[1]
+            self.asdot = len(w) == 3
             self.bgp_line = self.bgp_line or s.line
             return True
+        if w[0] == "graceful-restart" and not vrf:
+            self.graceful_restart = True
+            if w[1:2] == ["restart-duration"] and len(w) == 3:
+                self.restart_duration = int(w[2])
+                return True
+            return len(w) == 1
+        if w[0] == "aggregate" and len(w) >= 3 and w[1] == "route":
+            return w[3:] in ([], ["brief"], ["full"]) and self.aggregate_route(vrf, w[2], w[3:] == ["full"])
         if w[:2] == ["forwarding-table", "export"] and len(w) == 3 and not vrf:
             self.load_balance.append(w[2])
             return True
         if w[:3] == ["generate", "route", "0.0.0.0/0"] and w[3:] in ([], ["discard"]):
             self.generated.append(s)
+            return True
+        if w[0] == "instance-import" and len(w) == 2 and vrf:
+            self.instance_imports.setdefault(vrf, []).append(w[1])
             return True
         if w[0] == "rib" and len(w) >= 3 and w[1].endswith("inet6.0"):  # IPv6 routes: rib inet6.0 static ...
             return self.routing_options(s, w[2:], vrf)
@@ -765,6 +838,15 @@ class Reader:
                 return True
         return False
 
+    def vxlan(self) -> Vxlan:
+        if self.device.vxlan is None:
+            self.device.vxlan = Vxlan()
+        return self.device.vxlan
+
+    def aggregate_route(self, vrf: str, prefix: str, as_set: bool) -> bool:
+        self.aggregate_routes[(vrf, prefix)] = as_set
+        return True
+
     def routing_instance(self, s: Statement) -> bool:
         w = s.words
         if len(w) < 4:
@@ -783,6 +865,16 @@ class Reader:
         if rest[0] == "route-distinguisher" and len(rest) == 2:
             vrfs_text.info(self.device, vrf).rd = rest[1]
             return True
+        if rest[0] in ("vrf-import", "vrf-export") and len(rest) == 2:
+            self.vrf_policies.setdefault(vrf, []).append((rest[0][4:], rest[1], s))
+            return True
+        if rest[:3] == ["protocols", "evpn", "ip-prefix-routes"] and len(rest) >= 4:
+            more = rest[3:]
+            if more[0] == "vni" and len(more) == 2:
+                self.vxlan().vrf_vnis[vrf] = int(more[1])
+                vrfs_text.info(self.device, vrf).rt_evpn = True
+                return True
+            return more in (["advertise", "direct-nexthop"], ["encapsulation", "vxlan"])
         if rest[0] == "vrf-target":
             if len(rest) == 2 and target(rest[1]):
                 return vrfs_text.route_target(vrfs_text.info(self.device, vrf), "both", target(rest[1]))
@@ -791,7 +883,7 @@ class Reader:
             return False
         if rest[0] == "routing-options":
             return self.routing_options(s, rest[1:], vrf)
-        if rest[0] == "protocols" and len(rest) >= 2 and rest[1] == "ospf":
+        if rest[0] == "protocols" and len(rest) >= 2 and rest[1] in ("ospf", "bgp"):
             return self.protocols(s, rest[1:], vrf)
         if rest[0] == "forwarding-options":
             return self.forwarding_options(s, rest[1:], vrf)
@@ -804,9 +896,9 @@ class Reader:
     def protocols(self, s: Statement, w: List[str], vrf: str) -> bool:
         if w[0] == "ospf" and len(w) >= 2:
             return self.ospf(w[1:], vrf)
-        if w[0] == "bgp" and len(w) >= 2 and not vrf:
+        if w[0] == "bgp" and len(w) >= 2:
             self.bgp_line = self.bgp_line or s.line
-            return self.bgp(w[1:])
+            return self.bgp(w[1:], vrf)
         if w[0] == "lldp":
             m = self.device.management
             if w[1:] in ([], ["interface", "all"]):
@@ -835,9 +927,44 @@ class Reader:
             return True
         if w[:2] == ["dot1x", "authenticator"] and len(w) >= 3:
             return self.dot1x(w[2:])
+        if w[0] == "evpn" and len(w) >= 2 and not vrf:
+            return self.evpn(w[1:])
+        if w[0] == "iccp" and len(w) >= 3 and not vrf:
+            if w[1] == "local-ip-addr" and len(w) == 3:
+                self.iccp["local"] = w[2]
+                return True
+            if w[1] == "peer" and len(w) >= 4:
+                self.iccp["peer"] = w[2]
+                more = w[3:]
+                if more[:2] == ["backup-liveness-detection", "backup-peer-ip"] and len(more) == 3:
+                    self.iccp["heartbeat"] = more[2]
+                    return True
+                return more[0] in ("redundancy-group-id-list", "liveness-detection",
+                                   "session-establishment-hold-time")
+            return False
         if w == ["vrrp", "version-3"]:
             self.vrrp_v3 = True
             return True
+        return False
+
+    def evpn(self, w: List[str]) -> bool:
+        if w in (["encapsulation", "vxlan"], ["default-gateway", "no-gateway-community"]):
+            return True
+        if w[0] == "extended-vni-list" and len(w) == 2:
+            self.evpn_vnis.append(w[1])
+            return True
+        if w[0] == "vni-options" and len(w) >= 5 and w[1] == "vni" and w[3] == "vrf-target":
+            targets = self.vni_targets.setdefault(int(w[2]), {})
+            if len(w) == 5 and target(w[4]):
+                targets["both"] = target(w[4])
+                return True
+            if len(w) == 6 and w[4] in ("import", "export") and target(w[5]):
+                targets[w[4]] = target(w[5])
+                return True
+            return False
+        if w[0] == "duplicate-mac-detection" and len(w) == 3:
+            self.host_flap[w[1]] = int(w[2])
+            return w[1] in ("detection-window", "detection-threshold", "auto-recovery-time")
         return False
 
     def dot1x(self, w: List[str]) -> bool:
@@ -964,29 +1091,36 @@ class Reader:
             return True
         return False
 
-    def bgp(self, w: List[str]) -> bool:
+    def bgp(self, w: List[str], vrf: str = "") -> bool:
         if w[0] == "export" and len(w) == 2:
-            self.bgp_export.append(w[1])
+            self.bgp_export.setdefault(vrf, []).append(w[1])
             return True
         if w[0] == "multipath" and w[1:] in ([], ["multiple-as"]):
-            self.multipath = w[1:] == ["multiple-as"]
-            self.bgp_multipath_on = True
+            self.bgp_multipath[vrf] = w[1:] == ["multiple-as"]
+            return True
+        if w[0] == "hold-time" and len(w) == 2 and not vrf:
+            self.bgp_hold = int(w[1])
             return True
         if w[0] != "group" or len(w) < 3:
             return False
-        group = self.bgp_groups.setdefault(w[1], BgpNeighbor(w[1]))
+        groups = self.bgp_groups.setdefault(vrf, {})
+        group = groups.setdefault(w[1], BgpNeighbor(w[1]))
         rest = w[2:]
         if rest[0] == "type" and len(rest) == 2 and rest[1] in ("internal", "external"):
-            self.bgp_types[w[1]] = rest[1]
+            self.bgp_types[(vrf, w[1])] = rest[1]
+            return True
+        if rest[0] == "preference" and len(rest) == 2:
+            self.bgp_preference[(vrf, w[1])] = int(rest[1])
             return True
         if rest[0] == "neighbor" and len(rest) >= 2:
-            neighbor = self.bgp_neighbors.setdefault(rest[1], BgpNeighbor(rest[1], peer_group=w[1]))
-            return len(rest) == 2 or self.bgp_setting(neighbor, rest[2:])
-        return self.bgp_setting(group, rest)
+            neighbors = self.bgp_neighbors.setdefault(vrf, {})
+            neighbor = neighbors.setdefault(rest[1], BgpNeighbor(rest[1], peer_group=w[1]))
+            return len(rest) == 2 or self.bgp_setting(neighbor, rest[2:], vrf)
+        return self.bgp_setting(group, rest, vrf)
 
-    def bgp_setting(self, peer: BgpNeighbor, w: List[str]) -> bool:
+    def bgp_setting(self, peer: BgpNeighbor, w: List[str], vrf: str = "") -> bool:
         if w[0] in ("import", "export") and len(w) == 2:
-            self.bgp_policies.setdefault((peer.address, w[0]), []).append(w[1])
+            self.bgp_policies.setdefault((vrf, peer.address, w[0]), []).append(w[1])
             return True
         if w[0] == "peer-as" and len(w) == 2:
             peer.remote_as = w[1]
@@ -1009,14 +1143,36 @@ class Reader:
         elif w[0] == "hold-time" and len(w) == 2:
             peer.hold = int(w[1])
             peer.keepalive = peer.hold // 3
-        elif w == ["remove-private"]:
+        elif w[0] == "remove-private" and w[1:] in ([], ["all"], ["all", "replace"]):
             peer.remove_private_as = True
-        elif w[0] == "family" and len(w) >= 2:
-            family = {("inet", "unicast"): "ipv4", ("inet6", "unicast"): "ipv6",
-                      ("evpn", "signaling"): "evpn"}.get((w[1], w[2] if len(w) > 2 else ""))
-            if family is None or len(w) != 3:
+            peer.remove_private_as_mode = {1: "all", 2: "all replace-as"}.get(len(w) - 1, "")
+        elif w[0] == "cluster" and len(w) == 2:
+            peer.route_reflector_client = True
+        elif w[0] == "local-as" and len(w) >= 2:
+            peer.local_as = w[1]
+            options = w[2:]
+            if options == ["private"]:
+                peer.local_as_options = "no-prepend"
+            elif options == ["private", "no-prepend-global-as"]:
+                peer.local_as_options = "no-prepend replace-as"
+            elif options:
                 return False
-            self.bgp_families.setdefault(peer.address, []).append(family)
+        elif w[0] == "family" and len(w) >= 3:
+            family = {("inet", "unicast"): "ipv4", ("inet6", "unicast"): "ipv6",
+                      ("evpn", "signaling"): "evpn"}.get((w[1], w[2]))
+            if family is None:
+                return False
+            more = w[3:]
+            if more[:1] == ["prefix-limit"] and len(more) == 3 and more[1] in ("maximum", "teardown"):
+                if more[1] == "maximum":
+                    peer.maximum_prefix = int(more[2])
+                else:
+                    peer.maximum_prefix_warning = int(more[2])
+            elif more:
+                return False
+            families = self.bgp_families.setdefault((vrf, peer.address), [])
+            if family not in families:
+                families.append(family)
         else:
             return False
         return True
@@ -1054,6 +1210,7 @@ class Reader:
                         dev.vrfs.insert(0, MGMT_INSTANCE)
         self.finish_ports()
         self.finish_services()
+        self.finish_fabric()
         self.finish_exports()
         if self.local_as:
             self.finish_bgp()
@@ -1153,6 +1310,88 @@ class Reader:
             if "fail" in port_settings:
                 auth.dot1x_fail_vlan = int(self.vlan_id(port_settings["fail"])[0])
 
+    def finish_fabric(self) -> None:
+        """VXLAN, EVPN, multihoming, MC-LAG, and the route targets and leaks of VRFs."""
+        dev = self.device
+        for vrf, policies in self.vrf_policies.items():
+            info = vrfs_text.info(dev, vrf)
+            for direction, name, statement in policies:
+                found = self.policy.vrf_policy(name, direction)
+                if found is None:
+                    self.unparsed(statement, "a VRF policy RouterShift cannot read as route targets")
+                    continue
+                vrf_rts, rmap = found
+                for value in vrf_rts:
+                    vrfs_text.route_target(info, direction, value)
+                if rmap:
+                    info.export_map = rmap
+        for name, settings in self.vlan_vxlan.items():
+            vid = self.vlan_names.get(name)
+            if vid is None or "vni" not in settings:
+                continue
+            vx = self.vxlan()
+            vx.vlan_vnis[vid] = int(settings["vni"])
+            if "multicast-group" in settings:
+                vx.mcast_groups[vid] = settings["multicast-group"]
+            if "ingress" not in settings and (self.evpn_vnis or self.vni_targets):
+                if "all" in self.evpn_vnis or settings["vni"] in self.evpn_vnis or int(settings["vni"]) in \
+                        self.vni_targets:
+                    vx.evpn_vlans.append(vid)
+        if dev.vxlan is not None:
+            vx = dev.vxlan
+            vx.evpn_vlans.sort()
+            by_vni = {vni: vid for vid, vni in vx.vlan_vnis.items()}
+            rts: Dict[Tuple[str, str], List[int]] = {}
+            own = dict(self.vni_targets)
+            if self.switch_target:
+                for vid in vx.evpn_vlans:
+                    own.setdefault(vx.vlan_vnis[vid], {"both": self.switch_target})
+            for vni, targets in sorted(own.items()):
+                vid = by_vni.get(vni)
+                if vid is None:
+                    continue
+                imp = targets.get("both") or targets.get("import", "")
+                exp = targets.get("both") or targets.get("export", "")
+                rts.setdefault((imp, exp), []).append(vid)
+            for n, ((imp, exp), vids) in enumerate(rts.items(), 1):
+                owner = next((v for v, info in dev.vrf_info.items() if exp and exp in info.rt_export), "")
+                name = owner if owner and owner not in vx.evpn_instances else f"EVPN-{n}"
+                vx.evpn_instances[name] = EvpnInstance(name, vids, bundle=len(vids) > 1,
+                                                       rt_import=[imp] if imp else [], rt_export=[exp] if exp else [])
+        for name, settings in self.esi.items():
+            iface = dev.interfaces[name]
+            if "esi" in settings:
+                iface.evpn_esi = evpn_text.esi_from_junos(settings["esi"])
+                iface.evpn_single_active = settings.get("mode") == "single-active"
+                if "preference" in settings:
+                    iface.evpn_df_preference = int(settings["preference"])
+            if "system-id" in settings and name not in self.mc_ae:
+                iface.lacp_system_id = evpn_text.lacp_from_junos(settings["system-id"])
+        if self.iccp or self.mc_ae:
+            m = dev.mlag = Mlag()
+            m.peer_address = self.iccp.get("peer", "")
+            m.heartbeat = self.iccp.get("heartbeat", "")
+            local = self.iccp.get("local", "")
+            m.local_interface = vxlan_text.interface_of(dev, local) if local else ""
+            link = self.protection.get(m.peer_address, "")
+            m.peer_link = self.ifds.get(link, "")
+            for name, settings in self.mc_ae.items():
+                iface = dev.interfaces[name]
+                if "mc-ae-id" in settings:
+                    iface.mlag_id = int(settings["mc-ae-id"])
+                if settings.get("status-control") == "standby":
+                    m.role = "secondary"
+                if "init-delay-time" in settings:
+                    m.reload_delay = int(settings["init-delay-time"])
+        for vrf, names in self.instance_imports.items():
+            for name in names:
+                leaks = self.policy.leak_policy(name)
+                if leaks is None:
+                    dev.unparsed.append(Unparsed(0, f"set routing-instances {vrf} routing-options instance-import "
+                                                 f"{name}", "an instance-import policy RouterShift cannot read"))
+                    continue
+                vrfs_text.info(dev, vrf).leaks.update(leaks)
+
     def finish_services(self) -> None:
         dev = self.device
         for (vrf, group), units in self.relay_units.items():
@@ -1211,42 +1450,98 @@ class Reader:
         bgp = builder.bgp
         bgp.router_id = self.router_ids.get("", "")
         bgp.origin.line = self.bgp_line
-        for name, group in self.bgp_groups.items():
-            if self.bgp_types.get(name) == "internal" and not group.remote_as:
+        if self.bgp_hold is not None:
+            bgp.hold, bgp.keepalive = self.bgp_hold, self.bgp_hold // 3
+        bgp.graceful_restart = self.graceful_restart
+        bgp.graceful_restart_time = self.restart_duration
+        bgp.asdot = self.asdot
+        for vrf in sorted(set(self.bgp_groups) | set(self.bgp_neighbors) | set(self.bgp_export), key=bool):
+            groups, neighbors = self.bgp_instance(bgp, vrf)
+            exports = self.bgp_export.get(vrf, [])
+            target = bgp if not vrf else bgp.vrfs.setdefault(vrf, BgpVrf())
+            if vrf:
+                vrf_bgp = bgp.vrfs[vrf]
+                # a group named like a global peer group, with its settings, is that peer group used in the VRF
+                vrf_bgp.peer_groups.update({k: g for k, g in groups.items() if bgp.peer_groups.get(k) != g})
+                vrf_bgp.neighbors += neighbors
+                if vrf in self.bgp_multipath:
+                    vrf_bgp.maximum_paths = 64
+            else:
+                bgp.peer_groups.update(groups)
+                bgp.neighbors += neighbors
+            for name in exports:
+                found = self.policy.export(name)
+                if found is None:
+                    self.device.unparsed.append(Unparsed(self.bgp_line, f"set protocols bgp export {name}",
+                                                         "a BGP export policy RouterShift cannot read as "
+                                                         "redistribution"))
+                    continue
+                sources, maps, networks, _, _, ospf_match = found
+                v4 = [x for x in sources if x != "connected6"]
+                target.redistribute += [x for x in v4 if x not in target.redistribute]
+                target.redistribute_maps.update(maps)
+                target.networks += networks
+                target.ospf_match = ospf_match
+                for agg in self.policy.aggregates.get(name, []):
+                    agg.as_set = self.aggregate_routes.get((vrf, agg.prefix), False)
+                    target.aggregates.append(agg)
+        if "" in self.bgp_multipath:
+            bgp.maximum_paths = 64  # Junos installs as many equal paths as the platform allows
+            bgp.multipath_relax = self.bgp_multipath[""]
+        external = [v for (vrf, g), v in self.bgp_preference.items() if self.bgp_types.get((vrf, g)) == "external"]
+        internal = [v for (vrf, g), v in self.bgp_preference.items() if self.bgp_types.get((vrf, g)) == "internal"]
+        if external or internal:
+            bgp.distance = (external[0] if external else 20, internal[0] if internal else 200, 200)
+        if self.host_flap:
+            bgp.evpn_host_flap = (self.host_flap.get("detection-window", 180),
+                                  self.host_flap.get("detection-threshold", 5),
+                                  self.host_flap.get("auto-recovery-time", 0) * 60)
+        self.device.bgp = bgp
+
+    def bgp_instance(self, bgp: Bgp, vrf: str) -> Tuple[Dict[str, BgpNeighbor], List[BgpNeighbor]]:
+        """The groups and neighbors of BGP in one routing instance. Groups RouterShift writes for neighbors without a
+        peer group (IBGP, EBGP) are not peer groups of the source."""
+        groups: Dict[str, BgpNeighbor] = {}
+        neighbors: List[BgpNeighbor] = []
+        made_up = {"IBGP", "EBGP"}
+        for name, group in self.bgp_groups.get(vrf, {}).items():
+            if self.bgp_types.get((vrf, name)) == "internal" and not group.remote_as:
                 group.remote_as = self.local_as
             group.send_community = True  # Junos sends communities unless an export policy strips them
-            group.families = sorted(set(self.bgp_families.get(name, [])))
-            bgp.peer_groups[name] = group
-        for address, neighbor in self.bgp_neighbors.items():
-            neighbor.send_community = neighbor.peer_group not in bgp.peer_groups
-            stated = self.bgp_families.get(address) or self.bgp_families.get(neighbor.peer_group)
+            group.families = sorted(set(self.bgp_families.get((vrf, name), [])))
+            if name in made_up and group == BgpNeighbor(name, remote_as=group.remote_as, send_community=True,
+                                                        families=group.families):
+                continue
+            groups[name] = group
+        for address, neighbor in self.bgp_neighbors.get(vrf, {}).items():
+            if neighbor.peer_group in made_up and neighbor.peer_group not in groups:
+                if self.bgp_types.get((vrf, neighbor.peer_group)) == "internal" and not neighbor.remote_as:
+                    neighbor.remote_as = self.local_as
+                neighbor.peer_group = ""
+            neighbor.send_community = neighbor.peer_group not in groups
+            stated = self.bgp_families.get((vrf, address)) or self.bgp_families.get((vrf, neighbor.peer_group))
             neighbor.families = sorted(set(stated or [bgp_text.family(address)]))
-            bgp.neighbors.append(neighbor)
-        for peer in list(bgp.peer_groups.values()) + bgp.neighbors:
+            neighbors.append(neighbor)
+        for name, group in groups.items():
+            members = [n for n in neighbors if n.peer_group == name]
+            own = {bgp_text.family(n.address) for n in members}
+            if len(own) > 1 and set(group.families) == own:  # families of a mixed group: each member keeps its own
+                group.families = []
+                for n in members:
+                    if not self.bgp_families.get((vrf, n.address)):
+                        n.families = [bgp_text.family(n.address)]
+        for peer in list(groups.values()) + neighbors:
             for direction in ("import", "export"):
-                names = self.bgp_policies.get((peer.address, direction), [])
                 suffix = "in" if direction == "import" else "out"
-                for name in names:
+                for name in self.bgp_policies.get((vrf, peer.address, direction), []):
                     plist = name[len(junospolicy.PREFIX_POLICY):]
                     if name.startswith(junospolicy.PREFIX_POLICY) and plist in self.policy.route_filters:
                         setattr(peer, f"prefix_list_{suffix}", plist)
+                    elif name == "NEXT-HOP-SELF" and self.policy.next_hop_self(name):
+                        peer.next_hop_self = True
                     else:
                         setattr(peer, f"route_map_{suffix}", name)
-        for name in self.bgp_export:
-            found = self.policy.export(name)
-            if found is None:
-                self.device.unparsed.append(Unparsed(self.bgp_line, f"set protocols bgp export {name}",
-                                                     "a BGP export policy RouterShift cannot read as redistribution"))
-                continue
-            sources, maps, networks, _, _, ospf_match = found
-            bgp.redistribute += [x for x in sources if x not in bgp.redistribute]
-            bgp.redistribute_maps.update(maps)
-            bgp.networks += networks
-            bgp.ospf_match = ospf_match
-        if self.bgp_multipath_on:
-            bgp.maximum_paths = 64  # Junos installs as many equal paths as the platform allows
-            bgp.multipath_relax = self.multipath
-        self.device.bgp = bgp
+        return groups, neighbors
 
 
 def parse(text: str) -> Device:
