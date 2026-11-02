@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 import ipaddress
-from typing import Callable, Dict, List, Tuple
+from typing import Callable, Dict, List, Sequence, Tuple
 
 from .. import acl as acl_text
 from .. import multicast as multicast_text
@@ -17,6 +17,7 @@ from .. import tracking as tracking_text
 from .. import hosts as hosts_text
 from .. import bfd as bfd_text
 from .. import igp as igp_text
+from .. import aoscxfabric as fabric
 from .. import routemap as routemap_text
 from .. import bgp as bgp_text
 from .. import dhcp as dhcp_text
@@ -34,7 +35,7 @@ from .. import stp as stp_text
 from .. import qos as qos_text
 from .. import aaa as aaa_text
 from ..parsers.aoscx import AOSCX_ROLES
-from ..model import BgpNeighbor, Device, Interface, Ospf, InterfaceKind, LacpMode, StaticRoute, StpMode, SwitchportMode
+from ..model import BgpAggregate, BgpNeighbor, Device, Interface, Ospf, InterfaceKind, LacpMode, StaticRoute, StpMode, SwitchportMode
 from ..names import PortMapper
 from ..report import Report, Severity
 
@@ -435,6 +436,9 @@ class Writer:
         m = d.mlag
         if m is None:
             return
+        if m.stack:
+            self.out += fabric.vsf_lines(d, self.report, _IND, self.port)
+            return
         rep = self.report
         label = "multi-chassis LAG"
         rep.item("interface", label)
@@ -448,7 +452,10 @@ class Writer:
         if not m.role:
             rep.add("interface", label, Severity.REVIEW, "mlag-role", "role primary is written; make the peer secondary")
         source = d.interfaces.get(m.local_interface)
-        if m.peer_address and source is not None and source.ipv4:
+        heartbeat = fabric.heartbeat_keepalive(d, rep, label, self.vrf)
+        if heartbeat:
+            lines.append(heartbeat)
+        elif m.peer_address and source is not None and source.ipv4:
             vrf = f" vrf {self.vrf(source.vrf)}" if source.vrf else ""
             lines.append(f"keepalive peer {m.peer_address} source {source.ipv4[0].split('/')[0]}{vrf}")
             if d.platform == "eos":
@@ -460,6 +467,7 @@ class Writer:
                     f"keepalive source {m.local_interface or '?'} has no address; set the VSX keepalive by hand")
         if m.domain:
             rep.add("interface", label, Severity.APPROX, "mlag-domain", f"VSX has no domain name (was {m.domain})")
+        lines += fabric.vsx_options(d, rep, label, self.vrf)
         self.out += ["vsx"] + [_IND + line for line in lines]
 
     def vrfs(self) -> None:
@@ -474,9 +482,10 @@ class Writer:
             self.out.append(f"vrf {name}")
             if info and info.rd:
                 self.out.append(f"{_IND}rd {info.rd}")
-            if info and (info.rt_import or info.rt_export):
+            targets = fabric.vrf_targets(self.device, name, info, self.report) if info else []
+            if targets:
                 self.out.append(f"{_IND}address-family ipv4 unicast")
-                self.out += [f"{_IND * 2}route-target {d} {v}" for d, v in vrfs_text.targets(info)]
+                self.out += [_IND * 2 + line for line in targets]
             self.report.item("system", f"vrf {name}")
 
     def spanning_tree(self) -> None:
@@ -607,6 +616,7 @@ class Writer:
             if vlan.vlan_id in igmp:
                 self.out.append(f"{_IND}ip igmp snooping enable")
             self.report.item("vlan", str(vlan.vlan_id))
+        fabric.trunk_groups(self.device, self.report, self.port)
         d = self.device
         if d.multicast_routing or d.pim_rps:
             self.report.item("system", "multicast routing")
@@ -633,11 +643,8 @@ class Writer:
                 self.out += [f"{_IND * 2}vtep-peer {a}" for a in vx.flood_vteps]
         for vrf, vni in vx.vrf_vnis.items():
             self.out += [f"{_IND}vni {vni}", f"{_IND * 2}vrf {self.vrf(vrf)}"]
-        if vx.evpn_vlans:
-            self.out.append("evpn")
-            for vid in vx.evpn_vlans:
-                self.out += [f"{_IND}vlan {vid}", f"{_IND * 2}rd auto", f"{_IND * 2}route-target export auto",
-                             f"{_IND * 2}route-target import auto"]
+        self.out += fabric.evpn_lines(d, self.report, _IND, vxlan_text.LABEL)
+        fabric.evpn_domain(d, self.report)
 
     def monitor(self) -> None:
         """Mirror sessions and sFlow; AOS-CX NetFlow (IPFIX) is not written."""
@@ -698,6 +705,7 @@ class Writer:
             lines.append(f"encapsulation dot1q {iface.encapsulation_vlan}")
         if iface.kind in (InterfaceKind.ETHERNET, InterfaceKind.LAG):
             lines += self._layer2(iface, add)
+        fabric.interface_notes(iface, add)
         if iface.kind == InterfaceKind.LAG:
             lacp = {m.lacp_mode for m in self.device.interfaces.values() if m.lag == iface.name}
             mode = LacpMode.ACTIVE if LacpMode.ACTIVE in lacp else LacpMode.PASSIVE if lacp == {LacpMode.PASSIVE} \
@@ -800,6 +808,11 @@ class Writer:
         lines: List[str] = []
         if p.router_id:
             lines.append(f"router-id {p.router_id}")
+        elif self.device.system.router_id:
+            lines.append(f"router-id {self.device.system.router_id}")
+            self.report.add("ospf", label, Severity.APPROX, "router-id",
+                            f"AOS-CX has no global router ID: {self.device.system.router_id} is written as the OSPF "
+                            "router ID")
         if p.reference_bandwidth is not None:
             lines.append(f"reference-bandwidth {p.reference_bandwidth}")
         if p.passive_default:
@@ -865,15 +878,16 @@ class Writer:
         lines: List[str] = []
         if bgp.router_id:
             lines.append(f"bgp router-id {bgp.router_id}")
+        lines += fabric.bgp_globals(self.device, bgp, self.report)
         neighbors = bgp_text.flat(bgp)
         lines += self._bgp_body(neighbors, bgp.networks, bgp.redistribute, bgp.redistribute6, bgp.redistribute_maps,
-                                "")
+                                "", bgp.aggregates)
         if bgp.maximum_paths or bgp.maximum_paths_ibgp:
             most = max(bgp.maximum_paths or 0, bgp.maximum_paths_ibgp or 0)
             if bgp.maximum_paths and bgp.maximum_paths_ibgp and bgp.maximum_paths != bgp.maximum_paths_ibgp:
                 self.report.add("bgp", label, Severity.APPROX, "maximum-paths",
                                 f"AOS-CX has one maximum-paths for eBGP and iBGP; {most} is written for both")
-            lines.insert(1 if bgp.router_id else 0, f"maximum-paths {most}")
+            lines.insert(1 if lines and lines[0].startswith("bgp router-id") else 0, f"maximum-paths {most}")
         evpn = [p for p in neighbors if "evpn" in p.families]
         if evpn:
             lines.append("address-family l2vpn evpn")
@@ -885,21 +899,27 @@ class Writer:
             lines.append(f"vrf {name}")
             if v.maximum_paths:
                 lines.append(f"{_IND}maximum-paths {v.maximum_paths}")
-            lines += [_IND + line for line in self._bgp_body(v.neighbors, v.networks, v.redistribute, [],
-                                                              v.redistribute_maps, f" (vrf {name})")]
+            if v.peer_groups:
+                self.report.add("bgp", f"bgp vrf {name}", Severity.APPROX, "bgp-peer-group",
+                                f"peer groups {', '.join(v.peer_groups)} written out on each member")
+            peers = [bgp_text.effective(bgp, n, v) for n in v.neighbors]
+            lines += [_IND + line for line in self._bgp_body(peers, v.networks, v.redistribute, v.redistribute6,
+                                                              v.redistribute_maps, f" (vrf {name})", v.aggregates)]
             lines.append(f"{_IND}exit-vrf")
         self.out.append(f"router bgp {bgp.local_as}")
         self.out += [_IND + line for line in lines]
 
     def _bgp_body(self, neighbors: List[BgpNeighbor], networks: List[str], redistribute: List[str],
-                  redistribute6: List[str], maps: Dict[str, str], where: str) -> List[str]:
+                  redistribute6: List[str], maps: Dict[str, str], where: str,
+                  aggregates: Sequence[BgpAggregate] = ()) -> List[str]:
         """Neighbors and address families, of the default VRF or of one VRF."""
         lines: List[str] = []
         for peer in neighbors:
             label = f"neighbor {peer.address}{where}"
             self.report.item("bgp", label)
             bgp_text.unwritten(peer, {"password", "timers", "route_reflector_client", "remove_private_as",
-                                      "allowas_in"}, self.report, label, "AOS-CX")
+                                      "allowas_in", "maximum_prefix", "maximum_prefix_warning"}, self.report, label,
+                               "AOS-CX")
             pre = f"neighbor {peer.address}"
             if peer.remote_as:
                 lines.append(f"{pre} remote-as {peer.remote_as}")
@@ -931,6 +951,9 @@ class Writer:
                         body.append(f"neighbor {peer.address} send-community standard")
                     if peer.route_reflector_client:
                         body.append(f"neighbor {peer.address} route-reflector-client")
+                    if peer.maximum_prefix:
+                        body.append(f"neighbor {peer.address} maximum-prefix {peer.maximum_prefix}" +
+                                    (f" {peer.maximum_prefix_warning}" if peer.maximum_prefix_warning else ""))
                     if peer.allowas_in is not None:
                         body.append(f"neighbor {peer.address} allowas-in" +
                                     (f" {peer.allowas_in}" if peer.allowas_in else ""))
@@ -940,6 +963,7 @@ class Writer:
                             if name:
                                 body.append(f"neighbor {peer.address} {kind} {name} {direction}")
             body += [f"network {p}" for p in networks if (":" in p) == (af == "ipv6")]
+            body += fabric.aggregate_lines(list(aggregates), af)
             for r in redistribute6 if af == "ipv6" else redistribute:
                 rm = maps.get(r) if af == "ipv4" else None
                 body.append(f"redistribute {r}" + (f" route-map {rm}" if rm else ""))

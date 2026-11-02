@@ -39,7 +39,9 @@ WRITES: Dict[str, Set[str]] = {
               "console-login", "ptp", "event-handlers", "ospf-auth", "route-tag", "ospf-options", "bfd-global",
               "ecmp-hash"},
     "aoscx": {"anycast-gateway", "relay-vrf", "hardening", "svi-mac", "autostate", "unnumbered", "dot1x-fail-vlan",
-              "option82", "coa", "policy-lists", "route-tag"},
+              "option82", "coa", "policy-lists", "route-tag", "evpn-instances", "vxlan-mcast", "evpn-domain",
+              "mlag-options", "stackwise", "trunk-groups", "leaks", "evpn-vrf", "evpn-es", "bgp-options",
+              "bgp-vrf-ipv6", "bgp-vrf-groups", "bgp-misc", "router-id"},
 }
 
 Option = Tuple[str, str, object]  # (key, what the report calls it, whether the device has it)

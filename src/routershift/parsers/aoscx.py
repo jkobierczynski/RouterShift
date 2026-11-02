@@ -25,6 +25,7 @@ from .. import monitor as monitor_text
 from .. import vxlan as vxlan_text
 from .. import acl as acl_text
 from .. import bfd as bfd_text
+from .. import aoscxfabric as fabric
 from .. import routemap as routemap_text
 from .. import bgp as bgp_text
 from .. import dhcp as dhcp_text
@@ -82,8 +83,9 @@ class _Reader:
         self._auth_mode: Dict[str, str] = {}
         self._vxlan_source = ""  # interface vxlan: source ip, resolved to its interface at the end
         self._sflow_global = False  # sflow: every port samples unless ports name themselves
-        self._icmp_off: List[str] = []
-        self._gateways6: Dict[str, List[str]] = {}  # interface -> active-gateway ipv6 addresses  # no ip icmp redirect|unreachable: said of every routed interface
+        self._icmp_off: List[str] = []  # no ip icmp redirect|unreachable: said of every routed interface
+        self._gateways6: Dict[str, List[str]] = {}  # interface -> active-gateway ipv6 addresses
+        self._vsf_links: Dict[str, int] = {}  # vsf member link ports -> link number
 
     def unparsed(self, node: Node, section: str = "") -> None:
         self.device.unparsed.append(Unparsed(node.line, node.text, section))
@@ -126,6 +128,7 @@ class _Reader:
             "dhcpv4-snooping": self.snooping,
             "radius": lambda node: node.words == ["radius", "dyn-authorization", "enable"] and self._coa(),
             "vsx": self.vsx,
+            "vsf": self.vsf,
             "mirror": self.mirror,
             "evpn": self.evpn,
             "sflow": self.sflow,
@@ -501,6 +504,8 @@ class _Reader:
             elif c[:2] == ["address-family", "ipv4"]:
                 for g in child.children:
                     gw = g.words[:-1] if g.words[-1:] == ["evpn"] else g.words
+                    if g.words[-1:] == ["evpn"]:
+                        vrfs_text.info(self.device, name).rt_evpn = True
                     if not (gw[0] == "route-target" and len(gw) == 3
                             and vrfs_text.route_target(vrfs_text.info(self.device, name), gw[1], gw[2])):
                         self.unparsed(g, child.text)
@@ -782,6 +787,7 @@ class _Reader:
             v.neighbors = vb.finish().neighbors
             v.networks, v.redistribute, v.redistribute_maps = vb.bgp.networks, vb.bgp.redistribute, \
                 vb.bgp.redistribute_maps
+            v.redistribute6, v.aggregates = vb.bgp.redistribute6, vb.bgp.aggregates
             self.device.bgp.vrfs[name] = v
 
     def _bgp_block(self, b: bgp_text.Builder, children: List[Node], section: str,
@@ -843,6 +849,10 @@ class _Reader:
         if w[0] == "maximum-paths" and n == 2 and not af:
             b.bgp.maximum_paths = int(w[1])
             return True
+        if not af and fabric.read_bgp_global(b.bgp, w):
+            return True
+        if w[0] == "aggregate-address" and af in ("ipv4", "ipv6"):
+            return bgp_text.read_aggregate(b.bgp.aggregates, w[1:])
         if w[0] != "neighbor" or n < 3:
             return False
         peer = b.peer(w[1])
@@ -875,6 +885,9 @@ class _Reader:
             peer.route_reflector_client = True
         elif args == ["remove-private-as"]:
             peer.remove_private_as = True
+        elif args[0] == "maximum-prefix" and len(args) in (2, 3):
+            peer.maximum_prefix = int(args[1])
+            peer.maximum_prefix_warning = int(args[2]) if len(args) == 3 else None
         elif args[0] == "allowas-in" and len(args) in (1, 2):
             peer.allowas_in = int(args[1]) if len(args) == 2 else 0
         elif routemap_text.neighbor_policy(peer, args):
@@ -920,6 +933,29 @@ class _Reader:
             elif c[:2] == ["keepalive", "peer"] and len(c) in (5, 7) and c[3] == "source" and c[5:6] in ([], ["vrf"]):
                 m.peer_address = c[2]
                 self._vsx_source = c[4]
+            elif fabric.read_vsx_line(m, c):
+                pass
+            else:
+                self.unparsed(child, node.text)
+        return True
+
+    def vsf(self, node: Node) -> bool:
+        """vsf member N with link L PORTS, and vsf split-detect mgmt: a stack of two switches."""
+        w = node.words
+        if w == ["vsf", "split-detect", "mgmt"]:
+            return True  # VSF's own detection, over the management port
+        if w[:2] != ["vsf", "member"] or len(w) != 3 or not w[2].isdigit():
+            return False
+        m = self.device.mlag or Mlag()
+        self.device.mlag = m
+        m.stack = True
+        for child in node.children:
+            c = child.words
+            if c[0] == "link" and len(c) == 3 and c[1].isdigit():
+                for port in c[2].split(","):
+                    self._vsf_links[canonical(port)[0]] = int(c[1])
+            elif c[0] == "type" and len(c) == 2:
+                pass
             else:
                 self.unparsed(child, node.text)
         return True
@@ -957,14 +993,12 @@ class _Reader:
         """evpn / vlan N with rd auto and route-target export|import|both auto."""
         if node.words != ["evpn"]:
             return False
-        auto = (["rd", "auto"], ["route-target", "export", "auto"], ["route-target", "import", "auto"],
-                ["route-target", "both", "auto"], ["redistribute", "host-route"])
         for child in node.children:
             c = child.words
             if c[0] == "vlan" and len(c) == 2 and c[1].isdigit():
                 vxlan_text.vtep(self.device).evpn_vlans.append(int(c[1]))
                 for line in child.children:
-                    if line.words not in auto:
+                    if not fabric.read_evpn_line(self.device, int(c[1]), line.words):
                         self.unparsed(line, f"{node.text} / {child.text}")
             else:
                 self.unparsed(child, node.text)
@@ -1262,6 +1296,10 @@ class _Reader:
                     setattr(iface, "ip_redirects" if word == "redirect" else "ip_unreachables", False)
 
     def _finish(self) -> None:
+        for name, link in self._vsf_links.items():
+            if name not in self.device.interfaces:
+                self.device.interfaces[name] = Interface(name, InterfaceKind.ETHERNET)
+            self.device.interfaces[name].svl_link = link
         self._anycast()
         qos_text.adopt(self.device, self._class_acls)
         if self.device.vxlan is not None and self._vxlan_source:

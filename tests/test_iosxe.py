@@ -132,14 +132,9 @@ def test_bgp_round_trips(target: str) -> None:
     assert [u.text for u in back.unparsed] == [], target
     assert first.bgp is not None and back.bgp is not None
     expected = bgp_text.flat(first.bgp)
-    if target == "aoscx":  # AOS-CX leaves the prefix limit to a person, and says so
-        assert "the maximum-prefix limit not written for AOS-CX" in report.to_text()
-        for peer in expected:
-            peer.maximum_prefix = None
-    else:
-        # every neighbor option is written (the process-wide graceful restart is left to a person on some targets)
-        assert not [f for i in report.items.values() if i.kind == "bgp" for f in i.findings
-                    if f.code == "bgp-option"], target
+    # every neighbor option is written (the process-wide graceful restart is left to a person on some targets)
+    assert not [f for i in report.items.values() if i.kind == "bgp" for f in i.findings
+                if f.code == "bgp-option"], target
     assert bgp_text.flat(back.bgp) == expected, target
     assert [n for v in back.bgp.vrfs.values() for n in v.neighbors] == first.bgp.vrfs["CORP"].neighbors
     assert back.bgp.vrfs["CORP"].redistribute == ["connected"]
