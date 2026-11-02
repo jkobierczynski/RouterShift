@@ -104,7 +104,12 @@ class PortMapper:
         self._assign()
 
     def __call__(self, canonical_name: str) -> str:
-        return self._names.get(canonical_name, canonical_name)
+        found = self._names.get(canonical_name)
+        if found is None and self.target == "nxos":  # an interface the device does not define, named all the same
+            _, kind, _ = canonical(canonical_name)
+            if kind in (InterfaceKind.LAG, InterfaceKind.LOOPBACK, InterfaceKind.MANAGEMENT):
+                return self._nxos_logical(Interface(canonical_name, kind))
+        return found if found is not None else canonical_name
 
     def _override(self, iface: Interface) -> Optional[str]:
         for key in (iface.source_name, iface.name):

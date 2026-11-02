@@ -46,6 +46,8 @@ WRITES: Dict[str, Set[str]] = {
               "sflow-options", "banners", "local-logging", "roles", "ssh-keys", "snmp-views", "apis",
               "password-length", "syslog-transport", "trap-types", "console-login", "ptp", "event-handlers",
               "ospf-auth", "ospf-options", "bfd-global", "ecmp-hash"},
+    "nxos": {"relay-vrf", "hardening", "svi-mac", "autostate", "unnumbered", "dot1x-fail-vlan", "option82", "coa",
+             "console-login", "snmp-views", "trap-types"},
 }
 
 Option = Tuple[str, str, object]  # (key, what the report calls it, whether the device has it)

@@ -399,6 +399,10 @@ class _Reader:
                 community.access, args = "rw" if args[1] == "network-admin" else "ro", []
             if args[:1] == ["use-acl"] and len(args) == 2:  # NX-OS
                 args = args[1:]
+                known = next((c for c in s.communities if c.name == community.name), None)
+                if known is not None and self.nxos:
+                    known.acl = args[0]
+                    return True
             if len(args) > 1:
                 return False
             community.acl = args[0] if args else ""
@@ -421,6 +425,11 @@ class _Reader:
         if w[1] == "vrf" and len(w) == 3:
             s.vrf = w[2]
             return True
+        if w[1] == "host" and len(w) == 5 and w[3] == "use-vrf" and self.nxos:
+            for h in s.hosts:
+                if h.address == str(ipaddress.ip_address(w[2])):
+                    h.vrf = w[4]
+            return True
         if w[1] == "host" and len(w) >= 4:
             return self._snmp_host(w[2:], origin)
         if w[1] == "group" and len(w) >= 5 and w[3] == "v3":
@@ -433,6 +442,17 @@ class _Reader:
             return not args and group.level in ("noauth", "auth", "priv")
         if w[1] == "user" and len(w) >= 5 and w[4] == "v3":
             return self._snmp_user(w[2], w[3], w[5:], origin)
+        if w[1] == "user" and len(w) >= 4 and self.nxos:  # NX-OS: snmp-server user U ROLE auth sha K priv aes-128 K
+            role, args = ("", w[3:]) if w[3] == "auth" else (w[3], w[4:])
+            if args[:1] == ["auth"] and len(args) >= 2 and args[1].startswith("sha-"):
+                args = ["auth", "sha-2", args[1][4:]] + args[2:]
+            if "priv" in args:
+                i = args.index("priv")
+                if args[i + 1:i + 2] == ["aes-128"]:
+                    args[i + 1:i + 2] = ["aes", "128"]
+                elif len(args) == i + 2:
+                    args[i + 1:i + 1] = ["des"]  # NX-OS: priv KEY alone is DES
+            return self._snmp_user(w[2], role, args, origin)
         if w[1] == "view" and len(w) == 5 and w[4] in ("included", "excluded"):
             s.views.setdefault(w[2], []).append((w[3], w[4] == "included"))
             return True
@@ -1092,11 +1112,22 @@ class _Reader:
                     group.vrf = c[3] if len(c) == 4 and c[2] == "vrf" else group.vrf
                 elif c[:3] == ["ip", "vrf", "forwarding"] and len(c) == 4:
                     group.vrf = c[3]
+                elif c[0] == "use-vrf" and len(c) == 2 and self.nxos:
+                    group.vrf = c[1]
+                elif c[0] == "source-interface" and len(c) >= 2 and self.nxos:
+                    a.source[group.protocol] = names.canonical(" ".join(c[1:]))[0]
                 elif c[0] in ("ip",) and c[1] in ("radius", "tacacs") and c[2:3] == ["source-interface"]:
                     a.source[group.protocol] = names.canonical(c[-1])[0]
                 else:
                     self.unparsed(child, node.text)
             return True
+        if self.nxos and w[1:3] == ["authorization", "config-commands"]:
+            return True  # written with the commands list
+        if self.nxos and w[1] in ("authorization", "accounting") and w[2] == "default" and len(w) >= 4 or \
+                self.nxos and w[1:3] == ["authorization", "commands"] and w[3:4] == ["default"]:
+            # NX-OS: aaa accounting default ... (every session); aaa authorization commands default ... (no levels)
+            w = w[:2] + (["exec", "default", "start-stop"] if w[1] == "accounting" else ["commands", "15"] + w[3:4]) + \
+                w[3 if w[1] == "accounting" else 4:]
         if w[1] in ("authentication", "authorization", "accounting") and len(w) >= 4:
             method = AaaMethod(w[1], w[2], origin=origin)
             args = w[3:]
@@ -1122,7 +1153,7 @@ class _Reader:
                 else:
                     return False
             a.methods.append(method)
-            if self.device.platform == "eos" and method.service == "login" and method.name == "console":
+            if self.device.platform in ("eos", "nxos") and method.service == "login" and method.name == "console":
                 self.device.management.console_login = "console"  # EOS: the list the console uses
             return True
         return False
@@ -1554,7 +1585,7 @@ class _Reader:
         elif w in (["authentication", "port-control", "auto"], ["access-session", "port-control", "auto"],
                    ["dot1x", "port-control", "auto"]):
             pass  # the port authenticates: what with is said by the dot1x and mab lines
-        elif w == ["mab"] or w == ["dot1x", "mac", "based", "authentication"]:
+        elif w == ["mab"] or w == ["dot1x", "mac", "based", "authentication"] or w == ["dot1x", "mac-auth-bypass"]:
             iface.mab = True
         elif w[0] in ("authentication", "access-session") and w[1:2] == ["host-mode"] and n == 3 and \
                 w[2] in ("single-host", "multi-host", "multi-auth", "multi-domain"):
@@ -1562,11 +1593,11 @@ class _Reader:
         elif w[:2] == ["dot1x", "host-mode"] and n in (3, 4) and w[2] in ("single-host", "multi-host"):
             # EOS: multi-host authenticated = every host logs in
             iface.dot1x_host_mode = "multi-auth" if w[3:] == ["authenticated"] else w[2]
-        elif w in (["authentication", "periodic"], ["dot1x", "reauthentication"]):
+        elif w in (["authentication", "periodic"], ["dot1x", "reauthentication"], ["dot1x", "re-authentication"]):
             iface.dot1x_reauth = True
         elif w[:3] == ["authentication", "timer", "reauthenticate"] and n == 4:
             iface.dot1x_reauth_period = int(w[3])
-        elif w[:3] == ["dot1x", "timeout", "reauth-period"] and n == 4:
+        elif w[:3] in (["dot1x", "timeout", "reauth-period"], ["dot1x", "timeout", "re-authperiod"]) and n == 4:
             iface.dot1x_reauth_period = int(w[3])
         elif w[:6] == ["dot1x", "authentication", "failure", "action", "traffic", "allow"] and n == 8 and \
                 w[6] == "vlan":
@@ -1622,9 +1653,13 @@ class _Reader:
         args = w[3:]
         while args:
             if args[0] == "key" and len(args) >= 2:
-                form = args[1] if len(args) == 3 else "0"
-                server.key = args[-1] if form == "0" else self._type7(args[-1]) if form == "7" else ""
-                args = []
+                if args[1] in ("0", "6", "7") and len(args) >= 3:
+                    form, value, args = args[1], args[2], args[3:]
+                else:
+                    form, value, args = "0", args[1], args[2:]
+                server.key = value if form == "0" else self._type7(value) if form == "7" else ""
+            elif args[0] in ("authentication", "accounting") and self.nxos:
+                args = args[1:]  # NX-OS: what the server is used for; RouterShift writes both
             elif len(args) >= 2 and args[0] in ("vrf", "auth-port", "acct-port", "port", "timeout"):
                 if args[0] == "vrf":
                     server.vrf = args[1]
@@ -3033,8 +3068,8 @@ class _Reader:
             elif c[0] == "route-target" and len(c) == 3 and vrfs_text.route_target(
                     vrfs_text.info(self.device, name), c[1], c[2]):
                 pass
-            elif c[:2] == ["ip", "route"] and len(c) >= 4:  # NX-OS: static routes in vrf context
-                if not self.route(child, ["vrf", name] + c[2:], 4):
+            elif c[0] in ("ip", "ipv6") and c[1:2] == ["route"] and len(c) >= 4:  # NX-OS: routes in vrf context
+                if not self.route(child, ["vrf", name] + c[2:], 4 if c[0] == "ip" else 6):
                     self.unparsed(child, node.text)
             elif c[0] == "address-family" and c[1:2] == ["ipv4"] and child.children:
                 info = vrfs_text.info(self.device, name)
@@ -3724,7 +3759,7 @@ class _Reader:
             iface.duplex = w[1]
         elif w in (["ip", "dhcp", "snooping", "trust"], ["ip", "arp", "inspection", "trust"]):
             setattr(iface, "dhcp_trust" if w[1] == "dhcp" else "arp_trust", True)
-        elif w == ["ip", "verify", "source"]:
+        elif w == ["ip", "verify", "source"] or w == ["ip", "verify", "source", "dhcp-snooping-vlan"]:
             iface.source_guard = True
         elif w[:2] == ["switchport", "port-security"]:
             return self._port_security(iface, w[2:])
@@ -3782,7 +3817,12 @@ class _Reader:
             iface.helper_source = names.canonical(" ".join(w[4:]))[0]
         elif w[:4] == ["ip", "dhcp", "relay", "address"] and n in (5, 7):
             iface.helper_addresses.append(str(ipaddress.ip_address(w[4])))
+            if n == 7 and w[5] == "use-vrf" and self.nxos:
+                iface.helper_vrf = w[6]
+                return True
             return n == 5
+        elif w == ["medium", "p2p"] and self.nxos:
+            pass  # NX-OS: a point-to-point port, as an unnumbered port must be
         elif w[:3] == ["ip", "port", "access-group"] and n == 5 and w[4] == "in":
             iface.acl_in = w[3]
         elif w[:3] == ["ip", "address", "virtual"] and n == 4:  # EOS anycast gateway

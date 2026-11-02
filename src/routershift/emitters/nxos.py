@@ -22,6 +22,7 @@ from .. import acl as acl_text
 from .. import bgp as bgp_text
 from .. import fhrp
 from .. import hosts as hosts_text
+from .. import nxosaccess
 from .. import ospf as ospf_text
 from .. import partial
 from .. import routemap as routemap_text
@@ -40,7 +41,8 @@ ROLES = [(15, "network-admin"), (0, "network-operator")]
 HASHES = ("md5-crypt", "sha256-crypt", "sha512-crypt")
 MGMT_VRF = "management"
 PERMIT_ALL = "RS-PERMIT-ALL"  # the route map NX-OS needs for redistribution where the source had none
-WRITTEN = {"acl", "policy", "dhcp-relay", "fhrp", "speed", "storm", "stp-guards"}
+WRITTEN = {"acl", "policy", "dhcp-relay", "fhrp", "speed", "storm", "stp-guards", "voice", "l2sec", "dot1x", "poe",
+           "dhcp", "aaa"}
 _MGMT_NAMES = {"mgmt-vrf", "mgmt-intf", "management", "mgmt"}
 
 
@@ -59,6 +61,11 @@ class Writer:
 
     def vrf(self, name: str) -> str:
         return MGMT_VRF if name in self.mgmt_vrfs else name
+
+    def adder(self, label: str) -> nxosaccess.Add:
+        def add(severity: Severity, code: str, message: str) -> None:
+            self.report.add("interface", label, severity, code, message)
+        return add
 
     def label(self, iface: Interface) -> str:
         return f"{iface.source_name or iface.name} -> {self.port(iface.name)}"
@@ -147,9 +154,9 @@ class Writer:
             self.out.append(f"logging server {server}{level}{self.use_vrf()}")
         if sy.logging_source and sy.syslog_servers:
             self.out.append(f"logging source-interface {self.port(sy.logging_source)}")
-        for name, source in sy.transfer_source.items():
-            self.report.skip("system", f"{name} source interface", partial.CODE,
-                             f"not written for NX-OS yet ({source}); configure it by hand")
+        for name in sy.transfer_source:
+            self.report.item("system", f"{name} source interface")
+        self.out += nxosaccess.transfer_lines(self.device, self.port)
         m = self.device.management
         if m.telnet:
             self.features.add("telnet")
@@ -203,25 +210,10 @@ class Writer:
                              "NX-OS has no enable password; the role of each user sets what it may do")
 
     def snmp(self) -> None:
-        sn = self.device.snmp
-        if sn.location:
-            self.out.append(f"snmp-server location {sn.location}")
-        if sn.contact:
-            self.out.append(f"snmp-server contact {sn.contact}")
-        for c in sn.communities:
-            label = snmp_text.community_label(self.device, c)
-            self.report.item("management", label)
-            group = "network-admin" if c.access == "rw" else "network-operator"
-            self.out.append(f"snmp-server community {c.name} group {group}")
-            if c.acl:
-                self.report.add("management", label, Severity.REVIEW, partial.CODE,
-                                f"the manager list {c.acl} is not written for NX-OS yet (use-acl)")
-        rest = [what for what, stated in (("notification hosts", bool(sn.hosts or sn.traps)),
-                                          ("SNMPv3 users and groups", bool(sn.users or sn.groups)),
-                                          ("the source interface", bool(sn.source))) if stated]
-        if rest:
-            self.report.skip("management", "SNMP", partial.CODE,
-                             f"not written for NX-OS yet: {', '.join(rest)}; configure by hand")
+        self.out += nxosaccess.aaa_lines(self.device, self.report, IND, self.vrf, self.port, self.features)
+        self.out += nxosaccess.snmp_lines(self.device, self.report, self.vrf, self.port)
+        nxosaccess.unwritable(self.device, self.report)
+        self.out.append("!")
 
     # ACLs and policies -----------------------------------------------------------------------------------------------
 
@@ -254,11 +246,14 @@ class Writer:
                 self.out.append(f"{IND}name {vlan.name.replace(' ', '_')}")
             if vlan.shutdown:
                 self.out.append(f"{IND}shutdown")
-            if vlan.dhcp_snooping or vlan.arp_inspection or vlan.igmp_querier:
+            if vlan.igmp_querier:
                 self.report.add("vlan", str(vid), Severity.REVIEW, partial.CODE,
-                                "DHCP snooping, ARP inspection and the IGMP querier are not written for NX-OS yet")
+                                "the IGMP querier is not written for NX-OS yet")
         if self.device.vlans:
             self.out.append("!")
+        l2sec = nxosaccess.l2sec_lines(self.device, self.report, self.features)
+        if l2sec:
+            self.out += l2sec + ["!"]
 
     def spanning_tree(self) -> None:
         dev = self.device
@@ -362,6 +357,9 @@ class Writer:
             lines.append(f"encapsulation dot1q {iface.encapsulation_vlan}")
         if physical and not iface.lag:
             lines += self.switchport(iface)
+            if iface.mode != SwitchportMode.ROUTED:
+                lines += nxosaccess.port_lines(self.device, iface, self.adder(label), label, self.report,
+                                               self.features)
         if iface.kind == InterfaceKind.ETHERNET:
             if iface.speed:
                 lines.append(f"speed {iface.speed}")
@@ -449,10 +447,10 @@ class Writer:
             elif acl:
                 self.report.add("interface", label, Severity.REVIEW, "acl-missing",
                                 f"ACL {acl} is applied but not defined; left out")
+        lines += nxosaccess.layer3_lines(iface, self.adder(label), self.port)
         if iface.helper_addresses:
             self.features.add("dhcp")
-        for helper in iface.helper_addresses:
-            lines.append(f"ip dhcp relay address {helper}")
+        lines += nxosaccess.relay_lines(iface, self.vrf, self.port)
         lines += self.ospf_interface(iface)
         lines += self.fhrp_lines(iface, name)
         return lines
