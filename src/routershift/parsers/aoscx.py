@@ -214,6 +214,8 @@ class _Reader:
             return True
         if w[1:2] == ["route"]:
             return self.route(node, w[2:])
+        if w[1] in ("community-list", "aspath-list"):
+            return routemap_text.aoscx_list(self.device, w)
         return False
 
     def ipv6(self, node: Node) -> bool:
@@ -573,9 +575,8 @@ class _Reader:
                 route.vrf = rest.pop(0)
             elif word == "distance" and rest:
                 route.distance = int(rest.pop(0))
-            elif word == "tag" and rest:
-                rest.pop(0)
-                ok = False
+            elif word == "tag" and rest and rest[0].isdigit():
+                route.tag = int(rest.pop(0))
             elif word in ("blackhole", "reject", "nullroute"):
                 route.discard = True
             elif _is_address(word) and not route.next_hop:

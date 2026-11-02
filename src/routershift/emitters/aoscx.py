@@ -848,6 +848,7 @@ class Writer:
         routemap_text.items(self.device, self.report)
         for pl in self.device.prefix_lists.values():
             self.out += routemap_text.ios_prefix_lines(pl, "aoscx")
+        self.out += routemap_text.ios_list_lines(self.device, "aoscx", self.report)
         skip = bfd_text.pbr_only(self.device)  # reported with the interface
         for rm in self.device.route_maps.values():
             if rm.name not in skip:
@@ -1068,6 +1069,8 @@ class Writer:
                     words.append(self.port(route.interface))
             if route.distance is not None:
                 words += ["distance", str(route.distance)]
+            if route.tag is not None:
+                words += ["tag", str(route.tag)]
             if route.vrf:
                 words += ["vrf", self.vrf(route.vrf)]
             if route.name:
