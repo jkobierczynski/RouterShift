@@ -165,6 +165,9 @@ def later_features(device: Device, report: Report, port: Callable[[str], str]) -
     if device.igmp_querier_address or device.igmp_querier_version or any(
             v.igmp_querier_address or v.igmp_querier_version for v in device.vlans.values()):
         found.append(("vlan", "IGMP snooping", "the querier's address and version:", Severity.APPROX))
+    if device.qos_profiles or device.qos_dscp_tc or device.qos_tc_dscp:
+        found.append(("qos", "DSCP to traffic-class map", "the DSCP map and the queuing profiles " +
+                      ", ".join(device.qos_profiles) + ":", Severity.REVIEW))
     # (new device-level settings go above this line)
     for iface in device.interfaces.values():
         label = _interface_item(report, iface, port)
@@ -173,6 +176,8 @@ def later_features(device: Device, report: Report, port: Callable[[str], str]) -
                                   ("the SVI MAC address", iface.mac_address), ("no autostate", iface.autostate is False),
                                   ("the unnumbered address", iface.unnumbered),
                                   ("the trunk groups", iface.trunk_groups),
+                                  ("the queuing profile " + iface.qos_profile, iface.qos_profile),
+                                  ("the port's own queue settings", iface.queues),
                                   ("the StackWise Virtual link", iface.svl_link is not None or iface.svl_dad)) if v]
         if options:
             found.append(("interface", label, ", ".join(options) + ":", Severity.REVIEW))

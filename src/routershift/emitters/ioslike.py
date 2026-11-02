@@ -28,6 +28,7 @@ from .. import multicast as multicast_text
 from .. import monitor as monitor_text
 from .. import tracking as tracking_text
 from .. import vxlan as vxlan_text
+from .. import queuing as queuing_text
 from .. import evpn as evpn_text
 from .. import hosts as hosts_text
 from .. import igp as igp_text
@@ -2231,6 +2232,8 @@ class Writer:
                             rep.add("qos", qos_text.action_label(p, a), Severity.APPROX, "qos-burst",
                                     "the source states no burst: written as 1/8 s of the rate")
             self.out.append("!")
+        self.out += queuing_text.ios_lines(self.device, rep) if self.ios else \
+            queuing_text.eos_lines(self.device, self.ind, rep)
 
     def _qos_interface(self, iface: Interface, add: _Add) -> List[str]:
         lines = []
@@ -2245,6 +2248,29 @@ class Writer:
             else:
                 lines.append(f"service-policy {direction} {name}" if self.ios else
                              f"service-policy type qos {direction} {name}")
+        if iface.qos_profile and iface.qos_profile not in self.device.qos_profiles:
+            add(Severity.REVIEW, "qos-profile", f"QoS profile {iface.qos_profile} is applied but not defined; left out")
+        elif iface.qos_profile and self.ios:
+            if iface.qos_policy_out:
+                add(Severity.REVIEW, "qos-profile", f"the port has an output policy already; queuing profile "
+                                                    f"{iface.qos_profile} left out")
+            else:
+                lines.append(f"service-policy output {queuing_text.ios_interface_policy(self.device, iface.qos_profile)}")
+            p = self.device.qos_profiles[iface.qos_profile]
+            if p.input_policy and not iface.qos_policy_in and p.input_policy in self.device.qos_policies:
+                lines.append(f"service-policy input {p.input_policy}")
+        elif iface.qos_profile:
+            lines.append(f"service-profile {iface.qos_profile}")
+        if iface.queues and self.ios:
+            add(Severity.REVIEW, "qos-port-queues", "queue settings of this port on top of its profile (" + ", ".join(
+                f"traffic class {tc}" + (" ECN" if q.ecn else "") for tc, q in sorted(iface.queues.items())) +
+                ") are not written: on IOS give the port a policy of its own")
+        elif iface.queues:
+            for tc, q in sorted(iface.queues.items(), reverse=True):
+                lines.append(f"tx-queue {tc}")
+                lines += [self.ind + line for line in queuing_text.eos_queue_lines(
+                    q, self.report, f"interface {iface.name}")
+                    if not line.endswith("priority") or q.priority]
         if iface.qos_trust and not self.ios:
             lines.append(f"qos trust {'disabled' if iface.qos_trust == 'none' else iface.qos_trust}")
         elif iface.qos_trust and iface.qos_trust != "dscp":

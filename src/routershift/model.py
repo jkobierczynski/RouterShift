@@ -222,6 +222,8 @@ class Interface:
     qos_trust: str = ""  # "dscp", "cos" or "none"; "" = the platform default
     qos_policy_in: str = ""  # QosPolicy names
     qos_policy_out: str = ""
+    qos_profile: str = ""  # QosProfile name (EOS service-profile, IOS service-policy output of a queuing policy)
+    queues: Dict[int, "QosQueue"] = field(default_factory=dict)  # queue settings of this port on top of its profile
     mpls: bool = False  # MPLS label switching with LDP on the interface
     lldp_tx: bool = True  # LLDP sends on the port (where LLDP runs)
     lldp_rx: bool = True  # LLDP listens on the port
@@ -815,6 +817,37 @@ class QosPolicy:
 
 
 @dataclass
+class QosQueue:
+    """One egress queue (EOS tx-queue, an IOS queuing class), by the traffic class it serves (0-7)."""
+
+    traffic_class: int
+    priority: bool = False  # strict priority
+    priority_level: Optional[int] = None  # IOS priority level 1 or 2
+    priority_percent: Optional[int] = None  # IOS priority level N percent P: the share it may take under congestion
+    bandwidth_percent: Optional[int] = None  # the share of the port it is guaranteed (EOS bandwidth percent)
+    bandwidth_remaining: Optional[int] = None  # the share of what the priority queues leave (IOS bandwidth remaining)
+    shape_percent: Optional[int] = None  # the most of the port it may use
+    shape_kbps: Optional[int] = None
+    wred: bool = False  # weighted random early drop (IOS random-detect [dscp-based])
+    ecn: Optional[Tuple[int, int, int]] = None  # ECN marking: minimum and maximum threshold (kbytes), mark percent
+    queue_limit: Optional[int] = None  # IOS queue-limit, packets
+    fair_queue: bool = False  # IOS fair-queue
+    source_class: str = ""  # the IOS class it was read from
+
+
+@dataclass
+class QosProfile:
+    """Egress queuing and trust of a port (EOS qos profile, IOS output policy-map with queuing classes)."""
+
+    name: str
+    trust: str = ""  # "dscp", "cos", "none"; "" = the platform default
+    queues: Dict[int, QosQueue] = field(default_factory=dict)
+    shape_kbps: Optional[int] = None  # the whole port is shaped (IOS parent policy shape average)
+    input_policy: str = ""  # EOS: service-policy type qos input inside the profile
+    origin: Origin = field(default_factory=Origin)
+
+
+@dataclass
 class Wlan:
     """A wireless network (SSID) on a controller: its VLAN and security."""
     name: str
@@ -1026,6 +1059,9 @@ class Device:
     tracks: Dict[str, Track] = field(default_factory=dict)
     qos_classes: Dict[str, QosClass] = field(default_factory=dict)
     qos_policies: Dict[str, QosPolicy] = field(default_factory=dict)
+    qos_profiles: Dict[str, QosProfile] = field(default_factory=dict)
+    qos_dscp_tc: Dict[int, int] = field(default_factory=dict)  # DSCP -> traffic class (queue) it is put in
+    qos_tc_dscp: Dict[int, int] = field(default_factory=dict)  # traffic class -> DSCP it is rewritten to
     snmp: Snmp = field(default_factory=Snmp)
     users: List[LocalUser] = field(default_factory=list)
     aaa: Aaa = field(default_factory=Aaa)

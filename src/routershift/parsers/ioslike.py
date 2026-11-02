@@ -32,6 +32,7 @@ from .. import evpn as evpn_text
 from .. import igp as igp_text
 from .. import routemap as routemap_text
 from .. import qos as qos_text
+from .. import queuing as queuing_text
 from .. import confparse, names
 from .. import dhcp as dhcp_text
 from .. import vpn as vpn_text
@@ -39,7 +40,7 @@ from .. import aaa as aaa_text
 from ..confparse import Node
 from ..errors import ParseError
 from ..model import (IpSla, Netflow, Sflow, AaaGroup, AaaMethod, AaaServer, Acl, Device, LocalUser, DhcpPool, FhrpGroup, IkePolicy, IpsecPeer, IpsecTransform, NtpKey, PreSharedKey,
-                     EvpnInstance, Vxlan, SnmpCommunity, SnmpGroup, SnmpHost, SnmpUser, NatPool, NatRule, Interface, InterfaceKind, LacpMode, Origin, Ospf, OspfNetwork, Wlan, Mlag, Rip, Isis,
+                     EvpnInstance, Vxlan, QosProfile, QosQueue, SnmpCommunity, SnmpGroup, SnmpHost, SnmpUser, NatPool, NatRule, Interface, InterfaceKind, LacpMode, Origin, Ospf, OspfNetwork, Wlan, Mlag, Rip, Isis,
                      QosAction, QosClass, QosPolicy, StaticRoute, BgpNeighbor, BgpVrf, StpMode, SwitchportMode, Unparsed, Vlan)
 
 # Lines that only describe the file or the software, not the device's behaviour.
@@ -166,7 +167,9 @@ class _Reader:
         self._bgp_vrfs: Dict[str, Tuple[bgp_text.Builder, BgpVrf]] = {}
         self._bgp_router_id = ""  # EOS: a VRF that names the same router ID needs none of its own
         self._syslog_hosts: List[Tuple[Node, str, str]] = []  # every logging host line, its address and VRF
-        self._pbr_policies: List[Node] = []  # EOS policy-map type pbr, read once the classes are known
+        self._pbr_policies: List[Node] = []
+        self._qos_queuing: List[Tuple[QosProfile, List[Tuple[str, QosQueue]]]] = []  # IOS queuing policies
+        self._qos_parents: Dict[str, Tuple[str, int]] = {}  # IOS parent shaper -> (child policy, kbit/s)  # EOS policy-map type pbr, read once the classes are known
 
     def unparsed(self, node: Node, section: str = "") -> None:
         group, reason = self._reason if self._reason else ("", "")
@@ -228,6 +231,7 @@ class _Reader:
             "class-map": self.class_map,
             "policy-map": self.policy_map,
             "mls": lambda node: node.words == ["mls", "qos"],
+            "qos": self.qos_global,
             "mpls": self.mpls,
             "wlan": self.wlan,
             "wireless": self.wireless,
@@ -875,6 +879,8 @@ class _Reader:
             w = w[2:]
         if len(w) != 1:
             return False
+        if queuing_text.is_queuing([g.words for c in node.children for g in c.children]):
+            return self._ios_queuing_policy(node, w[0])
         policy = QosPolicy(w[0], origin=Origin(node.line, node.text))
         self.device.qos_policies[policy.name] = policy
         for child in node.children:
@@ -891,6 +897,83 @@ class _Reader:
                 if not understood:
                     self.unparsed(line, f"{node.text} / {child.text}")
         return True
+
+    def qos_global(self, node: Node) -> bool:
+        """EOS: qos map dscp D.. to traffic-class N, qos map traffic-class N to dscp D, qos profile NAME."""
+        w = node.words
+        if w[1:2] == ["map"] and len(w) >= 4:
+            return queuing_text.eos_map_line(self.device, w[2:])
+        if w[1:2] == ["profile"] and len(w) == 3:
+            profile = QosProfile(w[2], origin=Origin(node.line, node.text))
+            self.device.qos_profiles[profile.name] = profile
+            for child in node.children:
+                c = child.words
+                try:
+                    if c[0] == "tx-queue" and len(c) == 2:
+                        q = queuing_text.queue(profile.queues, int(c[1]))
+                        for grand in child.children:
+                            if not queuing_text.eos_queue_line(q, grand.words):
+                                self.unparsed(grand, f"{node.text} / {child.text}")
+                        continue
+                    ok = queuing_text.eos_profile_line(profile, c)
+                except (ValueError, IndexError):
+                    ok = False
+                if not ok:
+                    self.unparsed(child, node.text)
+            return True
+        return False
+
+    def _ios_queuing_policy(self, node: Node, name: str) -> bool:
+        """IOS: an output policy-map whose classes queue (priority, bandwidth, shape, random-detect), read as a
+        queuing profile; a parent that shapes class-default around a child policy shapes the whole port."""
+        profile = QosProfile(name, origin=Origin(node.line, node.text))
+        classes: List[Tuple[str, QosQueue]] = []
+        for child in node.children:
+            c = child.words
+            if c[0] != "class" or len(c) != 2:
+                self.unparsed(child, node.text)
+                continue
+            q = QosQueue(0)
+            for line in child.children:
+                lw = line.words
+                if lw[:2] == ["shape", "average"] and len(lw) == 3 and lw[2].isdigit() and \
+                        c[1] == qos_text.DEFAULT_CLASS and [g.words[:1] for g in line.children] == [["service-policy"]]:
+                    self._qos_parents[name] = (line.children[0].words[-1], max(1, int(lw[2]) // 1000))
+                    continue
+                try:
+                    ok = queuing_text.ios_queue_line(q, lw) and not line.children
+                except (ValueError, IndexError):
+                    ok = False
+                if not ok:
+                    self.unparsed(line, f"{node.text} / {child.text}")
+            classes.append((c[1], q))
+        if name in self._qos_parents and all(q == QosQueue(0) for _, q in classes):
+            return True  # only the shaper: the profile is made from the child policy once it is read
+        self._qos_queuing.append((profile, classes))
+        return True
+
+    def _finish_qos(self) -> None:
+        """IOS queuing policies become profiles once every class-map is read; output policies that queue are the
+        port's profile."""
+        d = self.device
+        for profile, classes in self._qos_queuing:
+            for name, why in queuing_text.assign_classes(d, profile, classes).items():
+                origin = profile.origin
+                d.unparsed.append(Unparsed(origin.line, f"class {name}", origin.text, f"QoS queuing class {name}",
+                                           f"in policy-map {profile.name}: {why}"))
+            d.qos_profiles[profile.name] = profile
+        for parent, (child, kbps) in self._qos_parents.items():
+            base = d.qos_profiles.get(child)
+            if base is None:
+                continue
+            d.qos_profiles[parent] = QosProfile(parent, base.trust, dict(base.queues), kbps, origin=base.origin)
+        for iface in d.interfaces.values():
+            if iface.qos_policy_out in d.qos_profiles:
+                iface.qos_profile, iface.qos_policy_out = iface.qos_policy_out, ""
+        used = {i.qos_profile for i in d.interfaces.values()}
+        for parent, (child, _) in self._qos_parents.items():
+            if parent in d.qos_profiles and child not in used:
+                d.qos_profiles.pop(child, None)
 
     def _pbr_class(self, node: Node, w: List[str]) -> bool:
         """EOS: class-map type pbr [match-any] NAME with match ip access-group ACL."""
@@ -2819,6 +2902,12 @@ class _Reader:
 
     def _interface_block(self, iface: Interface, node: Node) -> bool:
         """Interface lines with a block of their own: EOS evpn ethernet-segment."""
+        if node.words[0] == "tx-queue" and len(node.words) == 2 and node.words[1].isdigit():
+            q = queuing_text.queue(iface.queues, int(node.words[1]))
+            for child in node.children:
+                if not queuing_text.eos_queue_line(q, child.words):
+                    self.unparsed(child, f"interface {iface.source_name} / {node.text}")
+            return True
         if node.words == ["evpn", "ethernet-segment"]:
             for child in node.children:
                 try:
@@ -3210,6 +3299,10 @@ class _Reader:
             iface.qos_trust = w[3]
         elif w[:2] == ["qos", "trust"] and n == 3 and w[2] in ("dscp", "cos", "disabled"):
             iface.qos_trust = "none" if w[2] == "disabled" else w[2]
+        elif w == ["no", "qos", "trust"]:
+            iface.qos_trust = "none"
+        elif w[0] == "service-profile" and n == 2:
+            iface.qos_profile = w[1]
         elif w in (["no", "lldp", "transmit"], ["no", "lldp", "receive"]):
             setattr(iface, "lldp_tx" if w[2] == "transmit" else "lldp_rx", False)
         elif w[0] == "mlag" and n == 2 and w[1].isdigit():
@@ -3320,6 +3413,7 @@ class _Reader:
         for node in self._pbr_policies:
             self._pbr_policy(node, node.words[3])
         self._finish_syslog()
+        self._finish_qos()
         self._finish_vpn()
         multicast_text.finish(self.device)
         self._finish_monitor()
