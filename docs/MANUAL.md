@@ -12,12 +12,13 @@ It is a reference, not a migration tool: read the output and the report before a
 2. [Platforms](#platforms)
 3. [Converting a configuration](#converting-a-configuration)
 4. [Reading the report](#reading-the-report)
-5. [Port names and port maps](#port-names-and-port-maps)
-6. [The vendor-neutral model](#the-vendor-neutral-model)
-7. [What converts](#what-converts)
-8. [Secrets](#secrets)
-9. [Using RouterShift from Python](#using-routershift-from-python)
-10. [Troubleshooting](#troubleshooting)
+5. [Round trips](#round-trips)
+6. [Port names and port maps](#port-names-and-port-maps)
+7. [The vendor-neutral model](#the-vendor-neutral-model)
+8. [What converts](#what-converts)
+9. [Secrets](#secrets)
+10. [Using RouterShift from Python](#using-routershift-from-python)
+11. [Troubleshooting](#troubleshooting)
 
 ## Installing
 
@@ -77,6 +78,8 @@ Pipes work too:
 ```
 ssh admin@sw1 'show running-config' | routershift convert --from eos --to nxos - > nxos.cfg 2> report.txt
 ```
+
+To see what a conversion loses, convert there and back with [`routershift roundtrip`](#round-trips).
 
 To see what RouterShift understood, without converting:
 
@@ -140,6 +143,50 @@ With `--report-format json` the report is:
 
 `kind` is the area, `code` a stable short name for the kind of finding (for example `fhrp-protocol`,
 `not-yet`, `not-converted`), handy for filtering.
+
+## Round trips
+
+A round trip converts a configuration to another platform and back, reads both ends, and lists every setting
+that did not come back as it was. It shows what a conversion loses, including what it loses without the report
+saying so:
+
+```
+routershift roundtrip --from eos --via ios running-config.txt
+routershift roundtrip --from eos --via all running-config.txt     # through every other platform, a summary first
+routershift roundtrip --from eos --via junos running-config.txt --report-format json -o trip.json
+```
+
+```
+RouterShift 0.2.0 round trip
+eos -> ios -> eos: 367 settings, 331 came back unchanged, 19 lost, 17 changed, 10 added
+
+Lost: in the original, gone after the round trip (19):
+  interfaces.Ethernet1.qos_trust = dscp
+  sflow.polling_interval = 30
+  users[0] = {name: admin, privilege: 15, password_hash: <removed>, hash_type: sha512-crypt}
+
+Changed: back with another value (17):
+  interfaces.Ethernet49/1.mtu: 9214 -> 9198
+  system.service_vrf: MGMT -> Mgmt-vrf
+```
+
+* The comparison is on the [vendor-neutral model](#the-vendor-neutral-model), so the order of commands and each
+  platform's spelling do not count; the paths are the ones `routershift parse` prints.
+* **Lost** settings were in the original and are gone; **changed** ones came back with another value (a VRF
+  renamed to the target's convention, an MTU without the header, a track numbered instead of named); **added**
+  ones were not in the original, most often a default the other platform spells out.
+* A setting left at the platform default (empty, `false` or not stated) counts as not set on both sides.
+* List entries (ACL entries, servers, routes) are matched wherever they are in the list, so an entry split in two
+  shows as one added entry, not as every entry after it changed.
+* Ports keep their own names on the way back: the outward port names, reversed, serve as the port map home.
+  `--port-map` applies to the outward conversion.
+* Lines either reader did not read are listed first: those are a writer and a reader that disagree.
+* Secrets show as `<removed>`, as in the report.
+* `--strict` exits with status 3 when anything is lost or changed or a line is not read back, for use in scripts.
+
+A round trip says what does not survive a conversion and back; the one-way report says what happens on the way
+there. Read the two together: a setting lost in the round trip that the report calls exact is a bug worth
+[reporting](../CONTRIBUTING.md#reporting-a-problem).
 
 ## Port names and port maps
 

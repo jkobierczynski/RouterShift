@@ -8,6 +8,11 @@ Add a line under "Unreleased" in every pull request that changes what RouterShif
 
 ## Unreleased
 
+* `routershift roundtrip` converts a configuration to another platform (or, with `--via all`, every other one) and
+  back, and lists every setting of the model that was lost, changed or added on the way, and every line either
+  reader did not read. `--report-format json` and `--strict` (exit status 3 when anything did not come back) make
+  it usable in scripts. The tests run every sample through every platform and back against a baseline, so a
+  setting that starts to get lost fails the build.
 * Junos is written and read to the same depth as IOS and EOS: policy statements and firewall filters, port
   settings, gateways, DHCP, layer 2 security, AAA and 802.1X, EVPN/VXLAN, MC-LAG, route leaking, multicast, class
   of service, control-plane protection, MACsec, monitoring, management (login classes, SNMPv3, APIs), PTP, event
