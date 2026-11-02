@@ -241,6 +241,8 @@ class PortMapper:
             return f"lo0.{name[len('Loopback'):]}"
         if iface.kind == InterfaceKind.MANAGEMENT:
             return "me0"
+        if iface.kind == InterfaceKind.TUNNEL and name[len("Tunnel"):].isdigit():
+            return f"{'st0' if iface.tunnel_mode == 'ipsec' or iface.tunnel_profile else 'gr-0/0/0'}.{name[len('Tunnel'):]}"
         if iface.kind == InterfaceKind.SUBINTERFACE and iface.parent:
             return f"{self(iface.parent)}.{name.rsplit('.', 1)[1]}"
         return name

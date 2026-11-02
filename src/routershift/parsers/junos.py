@@ -26,6 +26,7 @@ from .. import junosqos
 from .. import junossec
 from .. import junosauto, junosmon
 from .. import junosrouting
+from .. import junosigp
 from .. import junosmgmt
 from .. import monitor as monitor_text
 from .. import qos as qos_text
@@ -121,6 +122,7 @@ class Reader:
         self.mon = junosmon.MonitorReader(self.device)
         self.auto = junosauto.AutoReader(self.device)
         self.pbr = junosrouting.PbrReader(self.device)
+        self.igp = junosigp.IgpReader(self.device)
         self.forwarding: Set[str] = set()  # forwarding instances (filter-based forwarding)
         self.hash_seen = False
         self.hash_removed: List[str] = []
@@ -325,6 +327,10 @@ class Reader:
             iface = self.iface(f"Loopback{unit}", InterfaceKind.LOOPBACK, full)
         elif ifd in _MANAGEMENT and unit == "0":
             iface = self.iface("Management0", InterfaceKind.MANAGEMENT, full)
+        elif ifd in (junosigp.GRE, junosigp.SECURE) and unit.isdigit():
+            iface = self.iface(f"Tunnel{unit}", InterfaceKind.TUNNEL, full)
+            if ifd == junosigp.SECURE:
+                iface.tunnel_mode = "ipsec"
         else:
             parent = self.port(ifd)
             if parent is None:
@@ -416,6 +422,8 @@ class Reader:
             self.virtual_mac = fhrp_text.mac(rest[1])
         elif rest == ["virtual-gateway-accept-data"]:
             pass
+        elif rest[0] == "tunnel" and len(rest) >= 2 and iface.kind == InterfaceKind.TUNNEL:
+            return self.igp.tunnel(iface, rest[1:])
         elif rest[0] == "proxy-arp" and rest[1:] in ([], ["restricted"], ["unrestricted"]):
             iface.proxy_arp = True
         else:
@@ -423,6 +431,8 @@ class Reader:
         return True
 
     def family(self, s: Statement, iface: Interface, family: str, rest: List[str]) -> bool:
+        if family in ("iso", "mpls"):
+            return self.igp.family(iface, iface.name, family, rest)
         if family in ("inet", "inet6"):
             addresses = iface.ipv4 if family == "inet" else iface.ipv6
             if not rest:
@@ -1107,6 +1117,12 @@ class Reader:
             return self.bgp(w[1:], vrf)
         if w[0] in ("pim", "igmp", "msdp", "igmp-snooping"):
             return self.multicast(w, vrf)
+        if w[0] == "rip" and len(w) >= 2 and not vrf:
+            return self.igp.rip(w[1:])
+        if w[0] == "isis" and len(w) >= 2 and not vrf:
+            return self.igp.isis(w[1:])
+        if w[0] in ("mpls", "ldp") and len(w) >= 2 and not vrf:
+            return self.igp.mpls(w[0], w[1:])
         if w[0] == "ptp" and len(w) >= 2 and not vrf:
             return self.auto.ptp(w[1:])
         if w[0] == "sflow" and len(w) >= 2 and not vrf:
@@ -1460,6 +1476,8 @@ class Reader:
         self.finish_services()
         self.finish_fabric()
         self.finish_exports()
+        self.igp.finish(self.canonical, self.policy.export, self.policy.policies,
+                        lambda line, text, why: dev.unparsed.append(Unparsed(line, text, why)))
         if self.local_as:
             self.finish_bgp()
         unread = lambda line, text, why: dev.unparsed.append(Unparsed(line, text, why))  # noqa: E731

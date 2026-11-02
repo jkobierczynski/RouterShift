@@ -30,6 +30,7 @@ from .. import junosqos
 from .. import junossec
 from .. import junosauto, junosmon
 from .. import junosrouting
+from .. import junosigp
 from .. import bfd as bfd_text
 from .. import junosmgmt
 from .. import ospf as ospf_text
@@ -49,10 +50,11 @@ CLASSES = [(15, "super-user"), (5, "operator"), (0, "read-only")]
 HASHES = ("md5-crypt", "sha256-crypt", "sha512-crypt", "junos")
 MGMT_INSTANCE = "mgmt_junos"
 # What partial.device need not report: the device-wide features this writer writes
-WRITTEN = {"acl", "policy", "dhcp", "l2sec", "aaa", "mlag", "vxlan", "multicast", "qos", "monitor", "track"}
+WRITTEN = {"acl", "policy", "dhcp", "l2sec", "aaa", "mlag", "vxlan", "multicast", "qos", "monitor", "track", "nat",
+           "vpn", "mpls", "rip", "isis"}
 # What partial.port need not report
 PORT_WRITTEN = {"dhcp-relay", "fhrp", "voice", "speed", "l2sec", "storm", "poe", "dot1x", "stp-guards", "mlag",
-                "multicast", "qos", "monitor", "bfd", "pbr"}
+                "multicast", "qos", "monitor", "bfd", "pbr", "mpls", "isis", "nat", "vpn"}
 _NAME_CHARS = re.compile(r"[^A-Za-z0-9_.-]+")
 
 
@@ -84,6 +86,7 @@ class Writer:
         self.filter_names: Dict[str, str] = {}
         self.rid: Optional[str] = None
         self.pbr_filters: Dict[str, str] = {}
+        self.igp = junosigp.IgpWriter(device, self.add, report, self.unit_name, self.split, self.address_of)
         self.bfd_ports: Set[str] = set()  # ports whose BFD timers a session carries
         self.bfd_multihop_used = False
         self.relays: List[Interface] = []
@@ -130,6 +133,7 @@ class Writer:
         junosrouting.ecmp(self.device, self.add, self.report)
         junosrouting.bfd_global(self.device, self.report, self.bfd_multihop_used)
         self.unused_bfd()
+        self.igp.write()
         junosauto.write_ptp(self.device, self.add, self.report, self.unit_name)
         junosauto.write_events(self.device, self.add, self.report, self.port)
         self.dhcp_relay()
@@ -178,8 +182,10 @@ class Writer:
                             f"DNS, NTP and syslog servers are reached through routing-instance {instance}; check the "
                             "release takes it on name-server")
         for name, source in sy.transfer_source.items():
-            self.report.skip("system", f"{name} source interface", "junos-not-yet",
-                             f"not written for Junos yet ({source}); configure it by hand")
+            self.report.skip("system", f"{name} source interface", "transfer-source",
+                             f"Junos has no source interface per transfer protocol ({source}); 'system "
+                             "default-address-selection' makes the loopback the source of all the switch sends; "
+                             "left out")
 
     def timezone(self, tz: str) -> None:
         """Junos takes a tz database name; a fixed offset in whole hours becomes Etc/GMT-N (the sign inverted)."""
@@ -332,7 +338,8 @@ class Writer:
     def interfaces(self) -> None:
         lags = 0
         for iface in self.device.interfaces.values():
-            if iface.kind in (InterfaceKind.TUNNEL, InterfaceKind.OTHER):
+            if iface.kind == InterfaceKind.OTHER or iface.kind == InterfaceKind.TUNNEL and \
+                    not self.port(iface.name).startswith((junosigp.GRE, junosigp.SECURE)):
                 self.report.skip("interface", self.label(iface), "junos-not-yet",
                                  "tunnel interfaces are not written for Junos yet; configure it by hand")
                 continue
@@ -393,6 +400,8 @@ class Writer:
                 self.switch_filters(iface, switching)
             else:
                 self.layer3(iface, path)
+            if iface.kind == InterfaceKind.TUNNEL:
+                self.igp.tunnel(iface, path, self.label(iface))
             if physical:
                 self.poe(iface)
             self.leftovers(iface)
@@ -632,6 +641,7 @@ class Writer:
         """What a port carries that this writer does not write yet."""
         written = set(PORT_WRITTEN) | {"acl"}
         partial.port(iface, self.report, self.label(iface), PLATFORM, written)
+        self.igp.port_notes(iface, self.label(iface))
         if iface.cdp:
             self.report.add("interface", self.label(iface), Severity.APPROX, "cdp", "Junos has no CDP")
 
