@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from typing import Dict, Optional, Tuple
 
+from . import gaps
 from .emitters import EMITTERS
 from .errors import RoutershiftError
 from .model import Device
@@ -39,4 +40,7 @@ def convert(text: str, source: str, target: str,
     device = parse(text, source)
     report = Report(source, target)
     ports = PortMapper(device, target, port_map)
-    return EMITTERS[target](device, ports, report), report
+    output = EMITTERS[target](device, ports, report)
+    gaps.unwritten(device, report, target, ports)
+    gaps.partly_converted(device.unparsed, report)
+    return output, report

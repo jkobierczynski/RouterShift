@@ -11,11 +11,12 @@ import ipaddress
 from typing import Dict, List, Optional, Tuple
 
 from .acl import safe_name
-from .model import AclAction, Device, PrefixEntry, PrefixList, RouteMap, RouteMapEntry
+from .model import AclAction, AsPathList, CommunityList, Device, PrefixEntry, PrefixList, RouteMap, RouteMapEntry
 from .report import Report, Severity
 
 SUPPORTED = ("ios", "eos", "aoscx", "comware")
-SET_KEYS = ("local-preference", "metric", "weight", "tag", "next-hop", "origin", "as-path-prepend", "community")
+SET_KEYS = ("local-preference", "metric", "metric-type", "weight", "tag", "next-hop", "origin", "as-path-prepend",
+            "community", "extcommunity-rt")
 _ORIGINS = ("igp", "incomplete")
 
 
@@ -72,10 +73,10 @@ def ios_prefix_entry(pl: PrefixList, w: List[str]) -> bool:
     ge = le = None
     rest = w[2:]
     while rest:
-        if rest[0] in ("ge", "le") and len(rest) >= 2 and rest[1].isdigit():
-            if rest[0] == "ge":
+        if rest[0] in ("ge", "le", "eq") and len(rest) >= 2 and rest[1].isdigit():
+            if rest[0] in ("ge", "eq"):
                 ge = int(rest[1])
-            else:
+            if rest[0] in ("le", "eq"):  # EOS and NX-OS: eq N is ge N le N
                 le = int(rest[1])
             rest = rest[2:]
         else:
@@ -114,6 +115,23 @@ def ios_route_map_line(e: RouteMapEntry, w: List[str]) -> bool:
         e.match_acls.extend(w[3:])
     elif w[:2] == ["match", "tag"] and n >= 3 and all(x.isdigit() for x in w[2:]):
         e.match_tags.extend(int(x) for x in w[2:])
+    elif w[:2] == ["match", "as-path"] and n >= 3:
+        e.match_as_paths.extend(w[2:])
+    elif w[:2] == ["match", "community"] and n >= 3 and "exact-match" not in w:
+        e.match_communities.extend(w[2:])
+    elif w[:3] == ["match", "origin-as", "validity"] and n == 4 and w[3] in ("valid", "invalid", "not-found"):
+        e.match_rpki = w[3]  # EOS
+    elif w[:2] == ["match", "rpki"] and n == 3 and w[2] in ("valid", "invalid", "not-found"):
+        e.match_rpki = w[2]  # IOS
+    elif w[:2] == ["set", "metric-type"] and n == 3 and w[2] in ("type-1", "type-2"):
+        e.sets["metric-type"] = w[2]
+    elif w[:3] == ["set", "extcommunity", "rt"] and n >= 4:
+        values = w[3:]
+        if values[-1] == "additive":
+            e.extcommunity_additive, values = True, values[:-1]
+        if not values or not all(":" in v for v in values):
+            return False
+        e.sets["extcommunity-rt"] = " ".join(values)
     elif w[0] == "set" and n == 3 and w[1] in ("local-preference", "metric", "weight", "tag") and w[2].isdigit():
         e.sets[w[1]] = w[2]
     elif w[:3] == ["set", "ip", "next-hop"] and n == 4:
@@ -150,13 +168,51 @@ def ios_prefix_lines(pl: PrefixList, platform: str) -> List[str]:
     return [f"{family} prefix-list {pl.name} {line}" for line in body]
 
 
-def ios_route_map_lines(rm: RouteMap, platform: str, report: Report, ind: str) -> List[str]:
+def unwritable(e: RouteMapEntry, platform: str) -> Tuple[List[str], List[str]]:
+    """The match and set clauses of an entry the target cannot hold: (matches, sets), as the report names them. The
+    clauses the reader could not read count too."""
+    matches = [c for c in e.unconverted if c.startswith("match")]
+    sets = [c for c in e.unconverted if not c.startswith("match")]
+    full = platform in ("ios", "eos")
+    if not full:
+        matches += [f"match as-path {x}" for x in e.match_as_paths]
+        matches += [f"match community {x}" for x in e.match_communities]
+        sets += [f"set extcommunity rt {e.sets['extcommunity-rt']}"] if "extcommunity-rt" in e.sets else []
+        sets += [f"set metric-type {e.sets['metric-type']}"] if "metric-type" in e.sets else []
+    if e.match_rpki and platform not in ("ios", "eos"):
+        matches.append(f"match RPKI {e.match_rpki}")
+    return matches, sets
+
+
+def skipped_entry(rm: RouteMap, e: RouteMapEntry, matches: List[str], report: Report, comment: str,
+                  word: str = "entry") -> List[str]:
+    """An entry whose match the target cannot hold is left out: written without it, it would apply to every route."""
+    report.add("policy", label(rm.name, "route-map"), Severity.REVIEW, "rm-match-unconverted",
+               f"{word} {e.seq} ({e.action.value}) is left out: its {'; '.join(matches)} is not converted, and "
+               "without it the entry would apply to every route; rebuild the entry by hand")
+    return [f"{comment} route-map {rm.name} {e.action.value} {e.seq} left out: {'; '.join(matches)} not converted",
+            comment]
+
+
+def unwritten_sets(rm: RouteMap, e: RouteMapEntry, sets: List[str], report: Report, word: str = "entry") -> None:
+    if sets:
+        report.add("policy", label(rm.name, "route-map"), Severity.REVIEW, "rm-set-unconverted",
+                   f"{word} {e.seq}: {'; '.join(sets)} not converted; the entry is written without it")
+
+
+def ios_route_map_lines(rm: RouteMap, platform: str, report: Report, ind: str,
+                        as_paths: Optional[Dict[str, str]] = None) -> List[str]:
     """route-map blocks for IOS, EOS and AOS-CX; what the target cannot match on is reported."""
     lab = label(rm.name, "route-map")
     out: List[str] = []
     one = platform in ("eos", "aoscx")  # one prefix list or tag per match line... and per entry
     for e in rm.entries:
         head = f"route-map {rm.name} {e.action.value} " + (f"seq {e.seq}" if platform == "aoscx" else str(e.seq))
+        matches, sets = unwritable(e, platform)
+        if matches:
+            out += skipped_entry(rm, e, matches, report, "!")
+            continue
+        unwritten_sets(rm, e, sets, report)
         body = []
         if e.description:
             body.append(f"description {e.description}")
@@ -191,9 +247,20 @@ def ios_route_map_lines(rm: RouteMap, platform: str, report: Report, ind: str) -
                                f"entry {e.seq} matches any of tags {e.match_tags}; one is written")
             else:
                 body.append("match tag " + " ".join(str(t) for t in e.match_tags))
+        if platform in ("ios", "eos"):
+            body += [f"match as-path {(as_paths or {}).get(x, x) if platform == 'ios' else x}"
+                     for x in e.match_as_paths]
+            body += [f"match community {x}" for x in e.match_communities]
+        if e.match_rpki:
+            body.append(f"match rpki {e.match_rpki}" if platform == "ios" else
+                        f"match origin-as validity {e.match_rpki}")
+            if platform == "ios":
+                report.add("policy", lab, Severity.REVIEW, "rm-rpki",
+                           f"entry {e.seq} matches the RPKI state {e.match_rpki}; the RPKI servers are not converted, "
+                           "so add them (bgp rpki server) or the entry matches nothing")
         for key in SET_KEYS:
             value = e.sets.get(key)
-            if value is None:
+            if value is None or key in ("extcommunity-rt", "metric-type") and platform not in ("ios", "eos"):
                 continue
             if key == "next-hop":
                 body.append(f"set ip next-hop {value}")
@@ -201,6 +268,8 @@ def ios_route_map_lines(rm: RouteMap, platform: str, report: Report, ind: str) -
                 body.append(f"set as-path prepend {value}")
             elif key == "community":
                 body.append(f"set community {value}" + (" additive" if e.community_additive else ""))
+            elif key == "extcommunity-rt":
+                body.append(f"set extcommunity rt {value}" + (" additive" if e.extcommunity_additive else ""))
             else:
                 body.append(f"set {key} {value}")
         out.append(head)
@@ -298,6 +367,11 @@ def comware_route_policy_lines(rm: RouteMap, report: Report, ind: str) -> List[s
     lab = label(rm.name, "route-map")
     out: List[str] = []
     for e in rm.entries:
+        matches, sets = unwritable(e, "comware")
+        if matches:
+            out += skipped_entry(rm, e, matches, report, "#", "node")
+            continue
+        unwritten_sets(rm, e, sets, report, "node")
         body = []
         if e.description:
             body.append(f"description {e.description}")
@@ -320,7 +394,7 @@ def comware_route_policy_lines(rm: RouteMap, report: Report, ind: str) -> List[s
                            f"node {e.seq} matches any of tags {e.match_tags}; one is written")
         for key in SET_KEYS:
             value = e.sets.get(key)
-            if value is None:
+            if value is None or key in ("extcommunity-rt", "metric-type"):
                 continue
             if key == "next-hop":
                 body.append(f"apply ip-address next-hop {value}")
@@ -345,6 +419,9 @@ def items(device: Device, report: Report) -> None:
         report.item("policy", label(pl.name, "prefix-list"))
     for rm in device.route_maps.values():
         report.item("policy", label(rm.name, "route-map"))
+        if not rm.entries:
+            report.skip("policy", label(rm.name, "route-map"), "rm-empty",
+                        "no entry of it could be read; it is not written")
 
 
 def unsupported(device: Device, report: Report, platform: str) -> None:
@@ -401,7 +478,82 @@ def ios_route_map_node(device: Device, w: List[str], children: List[List[str]]) 
             ok = False
         if not ok:
             bad.append(n)
+            if c[0] in ("match", "set", "continue"):
+                e.unconverted.append(" ".join(c))
     return bad
+
+
+def as_path_numbers(device: Device) -> Dict[str, str]:
+    """IOS XE numbers its AS-path lists (1-500): the number each named list is written as."""
+    taken = {int(x) for x in device.as_path_lists if x.isdigit()}
+    free = (k for k in range(1, 501) if k not in taken)
+    return {name: name if name.isdigit() else str(next(free)) for name in device.as_path_lists}
+
+
+def ios_community_list(device: Device, w: List[str]) -> bool:
+    """ip community-list [standard|expanded|regexp] NAME permit|deny VALUES (IOS, EOS)."""
+    args = w[2:]
+    expanded = False
+    if args[:1] in (["standard"], ["expanded"], ["regexp"]):
+        expanded, args = args[0] != "standard", args[1:]
+    if len(args) < 3 or args[1] not in ("permit", "deny"):
+        return False
+    name = args[0]
+    if not expanded and name.isdigit():
+        expanded = int(name) >= 100  # IOS numbered lists: 1-99 standard, 100-500 expanded
+    cl = device.community_lists.setdefault(name, CommunityList(name, expanded))
+    cl.entries.append((args[1], " ".join(args[2:])))
+    return True
+
+
+def ios_as_path_list(device: Device, w: List[str]) -> bool:
+    """ip as-path access-list NAME permit|deny REGEX [any|igp|egp|incomplete] (EOS adds the origin)."""
+    args = w[3:]
+    if len(args) < 3 or args[1] not in ("permit", "deny"):
+        return False
+    expression = args[2:]
+    if len(expression) > 1 and expression[-1] in ("any", "igp", "egp", "incomplete"):
+        if expression[-1] != "any":
+            return False  # an origin the other platforms cannot match on
+        expression = expression[:-1]
+    apl = device.as_path_lists.setdefault(args[0], AsPathList(args[0]))
+    apl.entries.append((args[1], " ".join(expression)))
+    return True
+
+
+def ios_list_lines(device: Device, platform: str, report: Report) -> List[str]:
+    """Community and AS-path lists for IOS and EOS. IOS XE numbers its AS-path lists, so names get numbers."""
+    out: List[str] = []
+    for cl in device.community_lists.values():
+        report.item("policy", label(cl.name, "community-list"))
+        kind = ("regexp" if platform == "eos" else "expanded") if cl.expanded else ("" if platform == "eos" else
+                                                                                   "standard")
+        for action, value in cl.entries:
+            out.append(" ".join(x for x in ("ip community-list", kind, cl.name, action, value) if x))
+    numbers = as_path_numbers(device)
+    for apl in device.as_path_lists.values():
+        lab = label(apl.name, "as-path list")
+        report.item("policy", lab)
+        name = apl.name
+        if platform == "ios" and numbers[name] != name:
+            name = numbers[name]
+            report.add("policy", lab, Severity.APPROX, "as-path-number",
+                       f"written as AS-path list {name}: IOS XE numbers its AS-path lists")
+        out += [f"ip as-path access-list {name} {action} {regex}" + (" any" if platform == "eos" else "")
+                for action, regex in apl.entries]
+    if out:
+        out.append("!")
+    return out
+
+
+def lists_unsupported(device: Device, report: Report, platform: str) -> None:
+    """A target that writes no community or AS-path lists."""
+    for cl in device.community_lists.values():
+        report.skip("policy", label(cl.name, "community-list"), "policy-unsupported",
+                    f"{platform}: community lists are not written yet; configure them by hand")
+    for apl in device.as_path_lists.values():
+        report.skip("policy", label(apl.name, "as-path list"), "policy-unsupported",
+                    f"{platform}: AS-path lists are not written yet; configure them by hand")
 
 
 def neighbor_policy(peer: object, w: List[str]) -> bool:

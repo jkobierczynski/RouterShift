@@ -165,7 +165,7 @@ class Report:
             name = block[1] if block else f"in '{redact(head)}'"
             self.skip("unparsed", name, "not-converted", f"line {entry.line}: {redact(entry.text)} not converted")
         for label, (reason, lines) in sorted(recognised.items()):
-            count = f"{len(lines)} line" + ("s" if len(lines) > 1 else "")
+            count = f"{len(set(lines))} line" + ("s" if len(set(lines)) > 1 else "")
             self.skip("known", label, "not-converted", f"{reason} ({count}: {_ranges(lines)})")
 
     def counts(self) -> Dict[str, int]:

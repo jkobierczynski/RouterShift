@@ -10,14 +10,16 @@ import copy
 import ipaddress
 from typing import Dict, List, Optional, Set, Tuple
 
-from .model import Bgp, BgpNeighbor
+from .model import Bgp, BgpAggregate, BgpNeighbor, BgpVrf
 from .aaa import PLACEHOLDER
 from .report import Report, Severity
 
 # Neighbor settings beyond the basics, as the report names them
 OPTIONS = {"password": "the session password", "timers": "the keepalive and hold timers",
            "route_reflector_client": "route-reflector-client", "maximum_prefix": "the maximum-prefix limit",
-           "remove_private_as": "remove-private-as", "allowas_in": "allowas-in"}
+           "maximum_prefix_warning": "the maximum-prefix warning threshold",
+           "remove_private_as": "remove-private-as", "remove_private_as_mode": "remove-private-as all/replace-as",
+           "allowas_in": "allowas-in", "local_as": "local-as", "ttl_security": "TTL security (GTSM)"}
 
 REDISTRIBUTE = ("connected", "static", "ospf")
 
@@ -41,6 +43,10 @@ class Builder:
         self.deactivated: Dict[str, Set[str]] = {}
         self.note: Optional[Tuple[str, str]] = None  # report group and reason for a line read only in part
         self.type7 = False  # IOS: "password 7 X" is the reversible type 7, read back to the clear text
+        self.declared: Set[str] = set()  # peer groups this builder's configuration defines (not only refers to)
+
+    def defined(self, name: str) -> bool:
+        return name in self.declared
 
     def peer(self, name: str, group: bool = False) -> BgpNeighbor:
         if name in self.bgp.peer_groups:
@@ -72,10 +78,12 @@ class Builder:
         return self.bgp
 
 
-def effective(bgp: Bgp, neighbor: BgpNeighbor) -> BgpNeighbor:
-    """A neighbor with the settings of its peer group filled in, for targets without peer groups."""
+def effective(bgp: Bgp, neighbor: BgpNeighbor, vrf: Optional[BgpVrf] = None) -> BgpNeighbor:
+    """A neighbor with the settings of its peer group filled in, for targets without peer groups (and for neighbors in a
+    VRF, whose group may be the VRF's own or the process's)."""
     result = copy.deepcopy(neighbor)
-    group = bgp.peer_groups.get(neighbor.peer_group)
+    group = (vrf.peer_groups if vrf is not None else {}).get(neighbor.peer_group) or \
+        bgp.peer_groups.get(neighbor.peer_group)
     if group is None:
         return result
     result.peer_group = ""
@@ -88,10 +96,29 @@ def effective(bgp: Bgp, neighbor: BgpNeighbor) -> BgpNeighbor:
     result.send_community = result.send_community or group.send_community
     result.bfd = result.bfd or group.bfd
     for attr in ("route_map_in", "route_map_out", "prefix_list_in", "prefix_list_out", "password", "keepalive",
-                 "hold", "route_reflector_client", "maximum_prefix", "remove_private_as", "allowas_in"):
+                 "hold", "route_reflector_client", "maximum_prefix", "maximum_prefix_warning", "remove_private_as",
+                 "remove_private_as_mode", "allowas_in", "local_as", "local_as_options", "ttl_security"):
         setattr(result, attr, getattr(result, attr) or getattr(group, attr))
     result.families = sorted(set(result.families) | set(group.families))
     return result
+
+
+def read_aggregate(aggregates: List[BgpAggregate], w: List[str]) -> bool:
+    """aggregate-address PREFIX|ADDRESS MASK [summary-only] [as-set] (IOS, EOS, NX-OS)."""
+    if len(w) >= 2 and "." in w[1] and "/" not in w[0]:
+        prefix, rest = str(ipaddress.ip_network(f"{w[0]}/{w[1]}")), w[2:]
+    else:
+        prefix, rest = str(ipaddress.ip_network(w[0])), w[1:]
+    if not set(rest) <= {"summary-only", "as-set"}:
+        return False
+    aggregates.append(BgpAggregate(prefix, "summary-only" in rest, "as-set" in rest))
+    return True
+
+
+def aggregate_line(a: BgpAggregate, ios: bool) -> str:
+    net = ipaddress.ip_network(a.prefix)
+    where = f"{net.network_address} {net.netmask}" if ios and net.version == 4 else str(net)
+    return f"aggregate-address {where}" + (" as-set" if a.as_set else "") + (" summary-only" if a.summary_only else "")
 
 
 def flat(bgp: Bgp) -> List[BgpNeighbor]:

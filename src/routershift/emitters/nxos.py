@@ -242,7 +242,7 @@ class Writer:
         for pl in self.device.prefix_lists.values():
             self.out += routemap_text.ios_prefix_lines(pl, "ios")
         for rm in self.device.route_maps.values():
-            self.out += routemap_text.ios_route_map_lines(rm, "ios", self.report, IND)
+            self.out += routemap_text.ios_route_map_lines(rm, "nxos", self.report, IND)
 
     # layer 2 ---------------------------------------------------------------------------------------------------------
 

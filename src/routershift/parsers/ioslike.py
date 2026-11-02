@@ -77,6 +77,38 @@ def _range_ports(text: str) -> List[str]:
     return ports
 
 
+def _eos_range_ports(text: str) -> List[str]:
+    """EOS interface range in the name: "Ethernet27/1-28/1", "Ethernet1/1-4", "Ethernet1-4,7" -> each port; [] when the
+    name is no range or cannot be read. A range over the first number keeps the rest (27/1-28/1: 27/1 and 28/1)."""
+    if not re.search(r"\d-\d|\d,", text):
+        return []
+    ports: List[str] = []
+    prefix = ""
+    for part in text.split(","):
+        m = re.fullmatch(r"\s*([A-Za-z][A-Za-z-]*?)?(\d+(?:/\d+)*)(?:-(\d+(?:/\d+)*))?\s*", part)
+        if not m:
+            return []
+        prefix = m.group(1) or prefix
+        if not prefix:
+            return []
+        first = [int(x) for x in m.group(2).split("/")]
+        if not m.group(3):
+            ports.append(f"{prefix}{m.group(2)}")
+            continue
+        last = [int(x) for x in m.group(3).split("/")]
+        if len(last) < len(first):  # 1/1-4: the last number counts
+            last = first[:len(first) - len(last)] + last
+        differ = [n for n in range(len(first)) if first[n] != last[n]]
+        if len(last) != len(first) or len(differ) != 1 or last[differ[0]] < first[differ[0]] or \
+                last[differ[0]] - first[differ[0]] > 512:
+            return []
+        at = differ[0]
+        for value in range(first[at], last[at] + 1):
+            numbers = first[:at] + [value] + first[at + 1:]
+            ports.append(prefix + "/".join(str(x) for x in numbers))
+    return ports
+
+
 def _cidr(address: str, mask: str) -> str:
     return str(ipaddress.ip_interface(f"{address}/{mask}"))
 
@@ -124,6 +156,9 @@ class _Reader:
         self._templates: Dict[Tuple[str, str], Tuple[BgpNeighbor, List[str]]] = {}  # IOS BGP peer templates
         self._inherits: List[Tuple[str, str, str]] = []  # neighbor, peer-session|peer-policy, template
         self._bgp_vrfs: Dict[str, Tuple[bgp_text.Builder, BgpVrf]] = {}
+        self._bgp_router_id = ""  # EOS: a VRF that names the same router ID needs none of its own
+        self._syslog_hosts: List[Tuple[Node, str, str]] = []  # every logging host line, its address and VRF
+        self._pbr_policies: List[Node] = []  # EOS policy-map type pbr, read once the classes are known
 
     def unparsed(self, node: Node, section: str = "") -> None:
         group, reason = self._reason if self._reason else ("", "")
@@ -293,7 +328,10 @@ class _Reader:
             self._ntp_key(int(w[2])).trusted = True
             return True
         if w[1] in ("source", "local-interface", "source-interface") and len(w) >= 3:
-            s.ntp_source = names.canonical(" ".join(w[2:]))[0]
+            args = w[2:]
+            if args[0] == "vrf" and len(args) == 3:  # EOS: ntp local-interface vrf V X
+                s.service_vrf, args = s.service_vrf or args[1], args[2:]
+            s.ntp_source = names.canonical(" ".join(args))[0]
             return True
         return False
 
@@ -325,6 +363,8 @@ class _Reader:
             return True
         if w[1:3] == ["enable", "traps"]:
             s.traps = True
+            if len(w) > 3:
+                s.trap_types.append(" ".join(w[3:]))
             return True
         if w[1] in ("trap-source", "local-interface") and len(w) == 3:
             s.source = names.canonical(w[2])[0]
@@ -409,21 +449,59 @@ class _Reader:
                 return False
             s.syslog_servers.append(str(ipaddress.ip_address(w[2])))
             return True
+        if len(w) in (4, 5) and w[1] == "vrf" and w[3] == "source-interface":  # EOS: logging vrf V source-interface X
+            s.logging_source = names.canonical(w[4] if len(w) == 5 else "")[0]
+            s.service_vrf = s.service_vrf or w[2]
+            return len(w) == 5
         args = w[2:] if len(w) >= 3 and w[1] == "host" else w[1:]
+        vrf = ""
         if args and args[0] == "vrf" and len(args) >= 3:  # EOS: logging vrf X host Y
-            self.device.system.service_vrf = args[1]
-            args = args[2:]
+            vrf, args = args[1], args[2:]
         if args[:1] == ["host"]:
             args = args[1:]
-        if args[-4:] == ["transport", "udp", "port", "514"] or args[-2:] == ["transport", "udp"]:
-            args = args[:-4] if args[-1] == "514" else args[:-2]  # the default
-        if len(args) == 3 and args[1] == "vrf":  # IOS: logging host Y vrf X
-            self.device.system.service_vrf = args[2]
+        protocol, port = "udp", 514
+        if len(args) >= 3 and args[1] == "vrf":  # IOS: logging host Y vrf X [transport ...]
+            vrf, args = args[2], args[:1] + args[3:]
+        if args[1:2] == ["transport"] and args[2:3] in (["udp"], ["tcp"], ["tls"]):  # IOS: transport P [port N]
+            protocol, rest = args[2], args[3:]
+            if rest[:1] == ["port"] and len(rest) == 2:
+                port, rest = int(rest[1]), []
+            if rest:
+                return False
             args = args[:1]
-        if len(args) == 1 and _is_address(args[0]):
-            self.device.system.syslog_servers.append(args[0])
-            return True
-        return False
+        elif len(args) >= 2 and args[1].isdigit():  # EOS: logging host A [PORT] [protocol udp|tcp|tls]
+            port, args = int(args[1]), args[:1] + args[2:]
+        if args[1:2] == ["protocol"] and len(args) == 3 and args[2] in ("udp", "tcp", "tls"):
+            protocol, args = args[2], args[:1]
+        if len(args) != 1 or not _is_address(args[0]):
+            return False
+        address = args[0]
+        if (protocol, port) != ("udp", 514):
+            s.syslog_transport[address] = (protocol, port)
+        self._syslog_hosts.append((node, address, vrf))
+        return True
+
+    def _finish_syslog(self) -> None:
+        """The model keeps one VRF for every syslog server: the one most servers use. A server named again in another
+        VRF, or only reachable in another, is listed for review."""
+        s = self.device.system
+        hosts = self._syslog_hosts
+        if not hosts:
+            return
+        vrfs = [vrf for _, _, vrf in hosts]
+        if not s.service_vrf or s.service_vrf not in vrfs:
+            s.service_vrf = max(dict.fromkeys(vrfs), key=vrfs.count)
+        for node, address, vrf in hosts:
+            if vrf == s.service_vrf:
+                if address not in s.syslog_servers:
+                    s.syslog_servers.append(address)
+                continue
+            self.device.unparsed.append(Unparsed(
+                node.line, node.text, "", "Syslog servers in another VRF",
+                f"RouterShift sends every syslog server through one VRF ({s.service_vrf or 'the default VRF'}); this "
+                f"server is in {vrf or 'the default VRF'}" +
+                ("; it is written in that VRF already" if any(a == address for _, a, v in hosts if v == s.service_vrf)
+                 else "; add it by hand")))
 
     def clock(self, node: Node) -> bool:
         if len(node.words) >= 3 and node.words[1] == "timezone":
@@ -457,6 +535,10 @@ class _Reader:
         if w[1:2] == ["multicast-routing"] and w[2:] in ([], ["distributed"]):
             self.device.multicast_routing = True
             return True
+        if w[1:2] == ["community-list"] and not node.children:
+            return routemap_text.ios_community_list(self.device, w)
+        if w[1:3] == ["as-path", "access-list"] and not node.children:
+            return routemap_text.ios_as_path_list(self.device, w)
         if w[1:3] == ["pim", "rp-address"] and len(w) == 4:
             self.device.pim_rps.append(str(ipaddress.IPv4Address(w[3])))
             return True
@@ -734,6 +816,8 @@ class _Reader:
                 else:
                     return False
             a.methods.append(method)
+            if self.device.platform == "eos" and method.service == "login" and method.name == "console":
+                self.device.management.console_login = "console"  # EOS: the list the console uses
             return True
         return False
 
@@ -772,7 +856,8 @@ class _Reader:
         """IOS: policy-map NAME; EOS: policy-map type quality-of-service NAME"""
         w = node.words[1:]
         if w[:2] == ["type", "pbr"] and len(w) == 3:
-            return self._pbr_policy(node, w[2])
+            self._pbr_policies.append(node)  # its classes may come later in the file
+            return True
         if w[:2] == ["type", "quality-of-service"]:
             w = w[2:]
         if len(w) != 1:
@@ -802,7 +887,7 @@ class _Reader:
             return False
         acls = self._pbr_classes.setdefault(w[0], [])
         for child in node.children:
-            c = child.words
+            c = child.words[1:] if child.words[0].isdigit() else child.words  # EOS may number the lines
             if c[:3] == ["match", "ip", "access-group"] and len(c) == 4:
                 acls.append(c[3])
             else:
@@ -816,10 +901,13 @@ class _Reader:
         rm.origin = Origin(node.line, node.text)
         for child in node.children:
             c = child.words
-            if c[0] != "class" or len(c) != 2 or c[1] not in self._pbr_classes:
+            seq = 10 * (len(rm.entries) + 1)
+            if c[0].isdigit():  # EOS: 10 class C
+                seq, c = int(c[0]), c[1:]
+            if c[:1] != ["class"] or len(c) != 2 or c[1] not in self._pbr_classes:
                 self.unparsed(child, node.text)
                 continue
-            e = routemap_text.entry(rm, 10 * (len(rm.entries) + 1), "permit")
+            e = routemap_text.entry(rm, seq, "permit")
             e.match_acls += self._pbr_classes[c[1]]
             for line in child.children:
                 x = line.words
@@ -852,9 +940,11 @@ class _Reader:
         actions = {"transmit"}
         while args:
             if args[0] in ("bc", "burst-size") and len(args) >= 2:
-                args = args[2 + (args[2:3] in (["bytes"], ["kbytes"], ["mbytes"])):]
+                scale = {"bytes": 1, "kbytes": 1000, "mbytes": 1000000}.get(args[2] if len(args) > 2 else "", 0)
+                action.burst_bytes = int(args[1]) * (scale or 1)
+                args = args[2 + bool(scale):]
             elif args[0].isdigit():
-                args = args[1:]  # IOS: the burst
+                action.burst_bytes, args = int(args[0]), args[1:]  # IOS: the burst
             elif args[0] in ("conform-action", "exceed-action") and len(args) >= 2:
                 actions.add(f"{args[0]}:{args[1]}")
                 args = args[2:]
@@ -1626,6 +1716,8 @@ class _Reader:
         return True
 
     def bgp(self, node: Node, local_as: str) -> bool:
+        self._bgp_router_id = next((c.words[-1] for c in node.children if c.words[0] in ("router-id", "bgp") and
+                                    c.words[-2:-1] == ["router-id"]), "")
         b = bgp_text.Builder(local_as)
         b.type7 = self.device.platform == "ios"
         b.bgp.origin = Origin(node.line, node.text)
@@ -1643,8 +1735,8 @@ class _Reader:
             if w[0] == "template" and len(w) == 3 and w[1] in ("peer-session", "peer-policy"):
                 self._bgp_template(child, w[2], node.text)
                 continue
-            if w[0] == "address-family" and len(w) in (3, 4) and w[1] == "ipv4" and w[-2] == "vrf":
-                self._ios_bgp_vrf(b, w[-1], child, node.text)
+            if w[0] == "address-family" and len(w) in (3, 4) and w[1] in ("ipv4", "ipv6") and w[-2] == "vrf":
+                self._ios_bgp_vrf(b, w[-1], child, node.text, w[1])
                 continue
             if w[0] == "address-family" and w[1:2] in (["vpnv4"], ["vpnv6"]):
                 self._reason = ("MPLS L3VPN (VPNv4) peering",
@@ -1683,8 +1775,17 @@ class _Reader:
         self._apply_templates(b)
         self.device.bgp = b.finish()
         for name, (vb, v) in self._bgp_vrfs.items():
-            v.neighbors = vb.finish().neighbors
-            if v.neighbors or v.networks or v.redistribute or v.maximum_paths:
+            finished = vb.finish()
+            v.neighbors = finished.neighbors
+            # a VRF neighbor may use a peer group of the process (EOS): only the VRF's own groups are kept here
+            v.peer_groups = {k: g for k, g in finished.peer_groups.items()
+                             if k not in self.device.bgp.peer_groups or vb.defined(k)}
+            for neighbor in v.neighbors:
+                group = self.device.bgp.peer_groups.get(neighbor.peer_group)
+                if neighbor.peer_group not in v.peer_groups and group is not None:
+                    neighbor.families = sorted(set(neighbor.families) | set(
+                        f for f in group.families if f != "evpn" and f == bgp_text.family(neighbor.address)))
+            if v.neighbors or v.networks or v.redistribute or v.redistribute6 or v.maximum_paths or v.aggregates:
                 self.device.bgp.vrfs[name] = v
         return True
 
@@ -1727,8 +1828,8 @@ class _Reader:
             self._inherit(b.peer(address), kind, name)
         self._inherits = []
 
-    def _ios_bgp_vrf(self, b: bgp_text.Builder, name: str, node: Node, bgp_text_: str) -> None:
-        """IOS: address-family ipv4 vrf NAME, with the VRF's neighbors, networks and redistribution."""
+    def _ios_bgp_vrf(self, b: bgp_text.Builder, name: str, node: Node, bgp_text_: str, af: str = "ipv4") -> None:
+        """IOS: address-family ipv4|ipv6 vrf NAME, with the VRF's neighbors, networks and redistribution."""
         vb, v = self._bgp_vrfs.setdefault(name, (bgp_text.Builder(b.bgp.local_as), BgpVrf()))
         vb.default_ipv4, vb.type7 = False, b.type7
         self._add_vrf(name)
@@ -1740,12 +1841,17 @@ class _Reader:
                 if c[0] == "maximum-paths" and len(c) in (2, 3) and c[-1].isdigit():
                     v.maximum_paths = int(c[-1])
                     ok = len(c) == 2 or c[1] in ("eibgp", "ibgp")
-                elif c[0] in ("network", "redistribute"):
-                    ok = self.bgp_line(vb, c, "ipv4")
-                    v.networks, v.redistribute, v.redistribute_maps = (
-                        vb.bgp.networks, vb.bgp.redistribute, vb.bgp.redistribute_maps)
+                elif c[0] in ("network", "redistribute", "aggregate-address"):
+                    if c[0] == "network" and af == "ipv6" and len(c) == 2:
+                        vb.bgp.networks.append(str(ipaddress.IPv6Network(c[1])))
+                        ok = True
+                    else:
+                        ok = self.bgp_line(vb, c, af)
+                    v.networks, v.redistribute, v.redistribute_maps, v.aggregates = (
+                        vb.bgp.networks, vb.bgp.redistribute, vb.bgp.redistribute_maps, vb.bgp.aggregates)
+                    v.redistribute6 = vb.bgp.redistribute6
                 elif c[0] == "neighbor" and len(c) >= 3:
-                    ok = ioslike_neighbor(vb, c[1], c[2:], "ipv4")
+                    ok = ioslike_neighbor(vb, c[1], c[2:], af)
                 else:
                     ok = False
             except (ValueError, IndexError):
@@ -1876,8 +1982,8 @@ class _Reader:
         lines: List[Tuple[Node, str]] = []
         for child in node.children:
             c = child.words
-            if c[0] == "address-family" and c[1:] in (["ipv4"], ["ipv4", "unicast"]):
-                lines += [(grand, "ipv4") for grand in child.children]
+            if c[0] == "address-family" and c[1:] in (["ipv4"], ["ipv4", "unicast"], ["ipv6"], ["ipv6", "unicast"]):
+                lines += [(grand, c[1]) for grand in child.children]
             elif self.nxos and c[0] == "neighbor" and len(c) in (2, 4):
                 self._nxos_neighbor(vb, child)
             else:
@@ -1888,11 +1994,17 @@ class _Reader:
                 if c[0] == "rd" and len(c) == 2 and not af:
                     info.rd = c[1]
                     ok = True
-                elif c[0] == "route-target" and len(c) in (3, 4) and c[2:3] != ["evpn"] and not af:
+                elif c[0] == "route-target" and len(c) in (3, 4) and not af and ":" in c[-1]:
                     ok = vrfs_text.route_target(info, c[1], c[-1])
+                    info.rt_evpn = info.rt_evpn or c[2:3] == ["evpn"]
+                elif c[0] == "route-target" and len(c) == 5 and c[1] == "export" and c[3] == "route-map" and not af:
+                    info.export_map, ok = c[4], True  # EOS: route-target export evpn|vpn-ipv4 route-map RM
+                    info.rt_evpn = info.rt_evpn or c[2] == "evpn"
+                elif c[0] == "router-id" and len(c) == 2 and not af and c[1] == self._bgp_router_id:
+                    ok = True  # the same as the process's own
                 elif c[0] == "maximum-paths" and len(c) == 2:
                     v.maximum_paths, ok = int(c[1]), True
-                elif c[0] in ("network", "redistribute", "neighbor"):
+                elif c[0] in ("network", "redistribute", "neighbor", "aggregate-address"):
                     ok = self.bgp_line(vb, c, af)
                 else:
                     ok = False
@@ -1901,6 +2013,7 @@ class _Reader:
             if not ok:
                 self.unparsed(child, node.text)
         v.networks, v.redistribute, v.redistribute_maps = vb.bgp.networks, vb.bgp.redistribute, vb.bgp.redistribute_maps
+        v.redistribute6, v.aggregates = vb.bgp.redistribute6, vb.bgp.aggregates
 
     @staticmethod
     def bgp_line(b: bgp_text.Builder, w: List[str], af: str) -> bool:
@@ -1928,6 +2041,21 @@ class _Reader:
             elif rest:
                 return False  # a metric
             (bgp.redistribute6 if af == "ipv6" else bgp.redistribute).append(w[1])
+        elif w[0] == "aggregate-address" and n >= 2:
+            return bgp_text.read_aggregate(bgp.aggregates, w[1:])
+        elif w[0] == "maximum-paths" and n == 4 and w[1].isdigit() and w[2] == "ecmp" and w[3].isdigit():
+            bgp.maximum_paths = int(w[1])  # EOS: maximum-paths N ecmp M (M: the hardware's ECMP width)
+        elif w[:2] == ["timers", "bgp"] and n == 4 and w[2].isdigit() and w[3].isdigit():
+            bgp.keepalive, bgp.hold = int(w[2]), int(w[3])
+        elif w in (["graceful-restart"], ["bgp", "graceful-restart"]):
+            bgp.graceful_restart = True
+        elif w[-3:-1] == ["graceful-restart", "restart-time"] and n in (3, 4) and w[-1].isdigit() and \
+                (n == 3 or w[0] == "bgp"):
+            bgp.graceful_restart_time = int(w[-1])
+        elif w[:2] == ["distance", "bgp"] and n == 5 and all(x.isdigit() for x in w[2:]):
+            bgp.distance = (int(w[2]), int(w[3]), int(w[4]))
+        elif w == ["bgp", "bestpath", "as-path", "multipath-relax"]:
+            bgp.multipath_relax = True
         elif w[0] == "maximum-paths" and n in (2, 3) and w[-1].isdigit() and af != "ipv6":
             if n == 3 and w[1] == "ibgp":
                 bgp.maximum_paths_ibgp = int(w[2])
@@ -1997,7 +2125,7 @@ class _Reader:
         elif w[0] == "area" and n in (3, 4) and w[2] in ("stub", "nssa") and w[3:] in ([], ["no-summary"]):
             p.area_types[ospf_text.area(w[1])] = " ".join(w[2:])
         elif w[0] == "redistribute" and n >= 2 and w[1] in ospf_text.REDISTRIBUTE:
-            rest = [x for x in (w[3:] if w[1] == "bgp" else w[2:]) if x != "subnets"]
+            rest = [x for x in (w[3:] if w[1] == "bgp" and w[2:3] and w[2].isdigit() else w[2:]) if x != "subnets"]
             if rest[:1] == ["route-map"] and len(rest) == 2:
                 p.redistribute_maps[w[1]] = rest[1]
             elif rest:
@@ -2012,8 +2140,22 @@ class _Reader:
             return False  # its metric, type or route map are listed for review
         elif w[:2] == ["auto-cost", "reference-bandwidth"] and n in (3, 4) and w[3:] in ([], ["Mbps"], ["Gbps"]):
             p.reference_bandwidth = int(w[2]) * (1000 if w[3:] == ["Gbps"] else 1)
-        elif w[0] == "log-adjacency-changes" or w == ["max-lsa", "12000"]:
-            pass  # logging, and the EOS default
+        elif w == ["max-lsa", "12000"]:
+            pass  # the EOS default
+        elif w[0] == "log-adjacency-changes" and n in (1, 2) and w[1:] in ([], ["detail"]):
+            p.log_adjacency = "detail" if n == 2 else "on"
+        elif w[:2] == ["distribute-list", "route-map"] and n == 4 and w[3] == "in":
+            p.distribute_list_in = w[2]
+        elif (w[:4] == ["timers", "spf", "delay", "initial"] and n == 7 or w[:3] == ["timers", "throttle", "spf"]
+              and n == 6) and all(x.isdigit() for x in w[-3:]):
+            p.spf_timers = (int(w[-3]), int(w[-2]), int(w[-1]))
+        elif (w[:5] == ["timers", "lsa", "rx", "min", "interval"] and n == 6 or w[:3] == ["timers", "lsa", "arrival"]
+              and n == 4) and w[-1].isdigit():
+            p.lsa_arrival = int(w[-1])
+        elif w[0] == "max-lsa" and n >= 2 and w[1].isdigit():
+            p.max_lsa = " ".join(w[1:])
+        elif w in (["graceful-restart"], ["nsf", "ietf"], ["nsf"]):
+            p.graceful_restart = True
         else:
             return False
         return True
@@ -2088,10 +2230,16 @@ class _Reader:
                 if not self.route(child, ["vrf", name] + c[2:], 4):
                     self.unparsed(child, node.text)
             elif c[0] == "address-family" and c[1:2] == ["ipv4"] and child.children:
+                info = vrfs_text.info(self.device, name)
                 for g in child.children:
                     gw = g.words
+                    if gw[0] == "route-target" and len(gw) == 4 and gw[3] == "stitching":  # IOS XE EVPN
+                        info.rt_evpn, gw = True, gw[:3]
                     if gw == ["exit-address-family"] or gw[0] == "route-target" and len(gw) == 3 and \
-                            vrfs_text.route_target(vrfs_text.info(self.device, name), gw[1], gw[2]):
+                            vrfs_text.route_target(info, gw[1], gw[2]):
+                        continue
+                    if gw[:2] == ["export", "map"] and len(gw) == 3:
+                        info.export_map = gw[2]
                         continue
                     self.unparsed(g, child.text)
             elif c[0] in ("description", "exit-address-family") or c[0] == "address-family" and not child.children:
@@ -2146,6 +2294,10 @@ class _Reader:
         w = node.words
         if w[1:] == ["console"] and not node.children:
             return True  # NX-OS lists the console line with nothing set
+        if w[1:] == ["con", "0"] and [c.words[:2] for c in node.children] == [["login", "authentication"]] and \
+                len(node.children[0].words) == 3:
+            self.device.management.console_login = node.children[0].words[2]
+            return True
         if w[1:2] != ["vty"]:
             return False
         m = self.device.management
@@ -2234,10 +2386,11 @@ class _Reader:
             return False
         server = w[1]
         setattr(m, server, True)
+        in_vrf = False  # the server runs in a VRF, whatever it does in the default VRF
         for child in node.children:
             c = child.words
             if c in (["shutdown"], ["no", "shutdown"]):
-                setattr(m, server, c[0] == "no")
+                setattr(m, server, c[0] == "no" or in_vrf)
             elif server == "ssh" and c[0] == "idle-timeout" and len(c) == 2 and c[1].isdigit():
                 m.exec_timeout = int(c[1])
             elif server == "ssh" and c[:2] == ["ip", "access-group"] and len(c) in (4, 6) and c[-1] == "in":
@@ -2245,6 +2398,8 @@ class _Reader:
             elif server == "ssh" and c[0] == "vrf" and len(c) == 2 \
                     and all(g.words in (["no", "shutdown"],) for g in child.children):
                 m.vrf = c[1]
+                if child.children:
+                    in_vrf = m.ssh = True
             else:
                 self.unparsed(child, node.text)
         return True
@@ -2371,7 +2526,9 @@ class _Reader:
         missing: List[str] = []
         while args:
             word = args.pop(0)
-            if word == "tag" and args:
+            if word == "tag" and args and args[0].isdigit() and self.device.platform in ("ios", "eos"):
+                route.tag = int(args.pop(0))
+            elif word == "tag" and args:
                 missing.append(f"tag {args.pop(0)}")
             elif word in ("global", "permanent", "multicast"):
                 missing.append(word)
@@ -2413,6 +2570,11 @@ class _Reader:
                 self.interface(Node(node.line, f"interface {port}", node.children))
             return bool(ports)
         source = " ".join(node.words[1:])
+        ports = _eos_range_ports(source) if self.device.platform == "eos" else []
+        for port in ports:
+            self.interface(Node(node.line, f"interface {port}", node.children))
+        if ports:
+            return True
         if source.lower().startswith("vxlan" if self.device.platform == "eos" else "nve"):
             return self._vxlan_interface(node)
         canon, kind, media = names.canonical(source)
@@ -2661,6 +2823,9 @@ class _Reader:
         elif w[0] == "storm-control" and n == 4 and w[2] == "level" and w[1] in (
                 "broadcast", "multicast", "unicast", "unknown-unicast"):
             iface.storm_control[w[1]] = float(w[3])
+        elif w[:3] == ["storm-control", "all", "level"] and n == 4 and self.device.platform == "eos":
+            for kind in ("broadcast", "multicast", "unknown-unicast"):  # EOS: all = every flooded kind
+                iface.storm_control[kind] = float(w[3])
         elif w == ["switchport"]:
             if iface.mode == SwitchportMode.ROUTED:
                 iface.mode = SwitchportMode.ACCESS
@@ -2705,11 +2870,17 @@ class _Reader:
             self._ospf_passive[iface.name] = True
         elif w[:2] == ["spanning-tree", "port"] and w[2:4] == ["type", "edge"] and w[4:] in ([], ["trunk"]):
             iface.stp_portfast = True
+        elif w[:4] == ["ip", "dhcp", "relay", "source-interface"] and n >= 5:  # IOS
+            iface.helper_source = names.canonical(" ".join(w[4:]))[0]
         elif w[:4] == ["ip", "dhcp", "relay", "address"] and n in (5, 7):
             iface.helper_addresses.append(str(ipaddress.ip_address(w[4])))
             return n == 5
         elif w[:3] == ["ip", "port", "access-group"] and n == 5 and w[4] == "in":
             iface.acl_in = w[3]
+        elif w[:3] == ["ip", "address", "virtual"] and n == 4:  # EOS anycast gateway
+            iface.virtual_ipv4.append(str(ipaddress.IPv4Interface(w[3])))
+        elif w[:3] == ["ipv6", "address", "virtual"] and n == 4:
+            iface.virtual_ipv6.append(str(ipaddress.IPv6Interface(w[3])))
         elif w[:2] == ["ip", "address"] and n >= 3:
             return self._ip_address(iface, w[2:])
         elif w[:2] == ["ipv6", "address"] and n >= 3:
@@ -2723,8 +2894,24 @@ class _Reader:
         elif w[:2] in (["ipv6", "traffic-filter"], ["ipv6", "access-group"]) and n == 4 and w[3] in ("in", "out"):
             setattr(iface, f"acl6_{w[3]}", w[2])
         elif w[:2] == ["ip", "helper-address"] and n >= 3:
-            iface.helper_addresses.append(w[-1])
-            return n == 3
+            return self._helper(iface, w[2:])
+        elif w == ["ip", "igmp"] and self.device.platform == "eos":
+            pass  # EOS: IGMP towards hosts on the SVI, which IOS runs wherever PIM does
+        elif w[:3] == ["ip", "verify", "unicast"] and w[3:4] == ["source"] and w[4:5] == ["reachable-via"] and \
+                n in (6, 7) and w[5] in ("rx", "any") and w[6:] in ([], ["allow-default"]):
+            iface.urpf = "strict" if w[5] == "rx" else "loose"
+            return n == 6
+        elif w in (["ip", "redirects"], ["no", "ip", "redirects"]):
+            iface.ip_redirects = w[0] != "no"
+        elif w in (["ip", "unreachables"], ["no", "ip", "unreachables"]):
+            iface.ip_unreachables = w[0] != "no"
+        elif w in (["ip", "proxy-arp"], ["no", "ip", "proxy-arp"]):
+            iface.proxy_arp = w[0] != "no"
+        elif w[:3] == ["ip", "ospf", "authentication"] and n in (3, 4) and w[3:] in ([], ["message-digest"]):
+            iface.ospf_auth = "message-digest" if n == 4 else "simple"
+        elif w[:3] == ["ip", "ospf", "message-digest-key"] and n in (6, 7) and w[3].isdigit() and \
+                w[4] in ("md5", "sha1", "sha256", "sha384", "sha512"):
+            iface.ospf_keys[int(w[3])] = w[4]  # the key itself is a secret the writer asks for again
         elif w[:2] == ["encapsulation", "dot1Q"] or w[:2] == ["encapsulation", "dot1q"]:
             tag = w[3] if n >= 4 and w[2] == "vlan" else w[2] if n >= 3 else ""
             if not tag.isdigit():
@@ -2831,6 +3018,28 @@ class _Reader:
         return True
 
     @staticmethod
+    def _helper(iface: Interface, args: List[str]) -> bool:
+        """IOS: ip helper-address [vrf V | global] A; EOS: ip helper-address A [vrf V] [source-interface X]."""
+        if args[:1] == ["vrf"] and len(args) == 3:
+            iface.helper_vrf, args = args[1], args[2:]
+        elif args[:1] == ["global"] and len(args) == 2:
+            iface.helper_vrf, args = "global", args[1:]
+        address, rest = args[0], args[1:]
+        if not _is_address(address):
+            return False
+        while rest:
+            if rest[0] == "vrf" and len(rest) >= 2:
+                iface.helper_vrf, rest = rest[1], rest[2:]
+            elif rest[0] == "source-interface" and len(rest) >= 2:
+                iface.helper_source, rest = names.canonical(rest[1])[0], rest[2:]
+            elif rest[0] == "source-address" and len(rest) >= 2:
+                return False
+            else:
+                return False
+        iface.helper_addresses.append(address)
+        return True
+
+    @staticmethod
     def _port_security(iface: Interface, args: List[str]) -> bool:
         """switchport port-security [maximum N | mac-address maximum N | violation shutdown|restrict|protect]"""
         iface.port_security = True
@@ -2881,6 +3090,9 @@ class _Reader:
         return len(args) in (1, 2)
 
     def _finish(self) -> None:
+        for node in self._pbr_policies:
+            self._pbr_policy(node, node.words[3])
+        self._finish_syslog()
         self._finish_vpn()
         multicast_text.finish(self.device)
         self._finish_monitor()
@@ -2901,6 +3113,8 @@ class _Reader:
             if pool.network:
                 pool.ranges = dhcp_text.subtract(pool.network, pool.ranges, self._dhcp_excluded.get(pool.vrf, []))
         for iface in self.device.interfaces.values():
+            if iface.virtual_ipv4 or iface.virtual_ipv6:
+                self.device.anycast_mac = self._varp_mac
             for group in iface.fhrp:
                 if group.protocol == "anycast":
                     group.mac = self._varp_mac
@@ -2970,6 +3184,7 @@ def ioslike_neighbor(b: bgp_text.Builder, name: str, w: List[str], af: str) -> b
     n = len(w)
     if w in (["peer-group"], ["peer", "group"]):
         b.peer(name, group=True)
+        b.declared.add(name)
         return True
     peer = b.peer(name)
     if w[0] == "peer-group" and n == 2 or w[:2] == ["peer", "group"] and n == 3:
@@ -3008,16 +3223,25 @@ def ioslike_neighbor(b: bgp_text.Builder, name: str, w: List[str], af: str) -> b
     elif w == ["route-reflector-client"]:
         peer.route_reflector_client = True
     elif w[0] in ("maximum-prefix", "maximum-routes") and n >= 2 and w[1].isdigit():
-        peer.maximum_prefix = int(w[1])
-        if n > 2:
-            b.note = ("BGP neighbor options", "the prefix limit is converted; its warning threshold and restart "
-                      "timer are not")
-        return n == 2
-    elif w[0] == "remove-private-as" and n <= 3:
+        # EOS: maximum-routes 0 is no limit
+        peer.maximum_prefix = int(w[1]) if int(w[1]) or w[0] == "maximum-prefix" else None
+        rest = w[2:]
+        if rest[:1] == ["warning-limit"] and rest[2:3] == ["percent"] and len(rest) == 3:  # EOS
+            peer.maximum_prefix_warning, rest = int(rest[1]), []
+        elif rest[:1] and rest[0].isdigit():  # IOS: maximum-prefix N [threshold]
+            peer.maximum_prefix_warning, rest = int(rest[0]), rest[1:]
+        if rest:
+            b.note = ("BGP neighbor options", "the prefix limit is converted; its restart timer and warning-only "
+                      "are not")
+        return not rest
+    elif w[0] == "remove-private-as" and n <= 3 and w[1:] in ([], ["all"], ["all", "replace-as"]):
         peer.remove_private_as = True
-        if n > 1:
-            b.note = ("BGP neighbor options", "remove-private-as is converted; 'all' and 'replace-as' are not")
-        return n == 1
+        peer.remove_private_as_mode = " ".join(w[1:])
+    elif w[0] == "local-as" and n >= 2 and w[1].replace(".", "").isdigit() and \
+            set(w[2:]) <= {"no-prepend", "replace-as", "dual-as"}:
+        peer.local_as, peer.local_as_options = w[1], " ".join(w[2:])
+    elif (w[:2] == ["ttl", "maximum-hops"] or w[:2] == ["ttl-security", "hops"]) and n == 3 and w[2].isdigit():
+        peer.ttl_security = int(w[2])  # EOS ttl maximum-hops and IOS ttl-security hops are both GTSM
     elif w[0] == "allowas-in" and n in (1, 2):
         peer.allowas_in = int(w[1]) if n == 2 else 0
     elif w in (["next-hop-self", "all"],):
