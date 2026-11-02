@@ -18,6 +18,7 @@ from .. import hosts as hosts_text
 from .. import bfd as bfd_text
 from .. import igp as igp_text
 from .. import aoscxfabric as fabric
+from .. import aoscxqos
 from .. import routemap as routemap_text
 from .. import bgp as bgp_text
 from .. import dhcp as dhcp_text
@@ -534,8 +535,11 @@ class Writer:
             self.out += [_IND + line for line in lines]
 
     def qos(self) -> None:
-        """Classes hold their own entries (match/ignore): DSCP values, and the entries of the ACL a class used."""
+        """Classes hold their own entries (match/ignore): DSCP values, and the entries of the ACL a class used; the DSCP
+        map and the schedule profiles."""
         rep = self.report
+        self.queuing = aoscxqos.Writer(self.device, rep, _IND)
+        self.out += self.queuing.lines()
         for c in self.device.qos_classes.values():
             label = f"class {c.name}"
             rep.item("qos", label)
@@ -585,7 +589,7 @@ class Writer:
                 add(Severity.REVIEW, "qos-policy", f"policy {name} is applied but not defined; left out")
         if iface.qos_trust:
             lines.append(f"qos trust {iface.qos_trust}")
-        return lines
+        return lines + self.queuing.interface(iface, add)
 
     def vlans(self) -> None:
         voice = {i.voice_vlan for i in self.device.interfaces.values() if i.voice_vlan is not None}

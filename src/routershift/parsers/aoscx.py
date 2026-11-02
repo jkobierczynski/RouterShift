@@ -26,6 +26,7 @@ from .. import vxlan as vxlan_text
 from .. import acl as acl_text
 from .. import bfd as bfd_text
 from .. import aoscxfabric as fabric
+from .. import aoscxqos
 from .. import multicast as multicast_text
 from .. import routemap as routemap_text
 from .. import bgp as bgp_text
@@ -40,7 +41,7 @@ from .. import confparse
 from ..confparse import Node
 from ..errors import ParseError
 from ..model import (BgpVrf, Sflow, AaaGroup, AaaMethod, AaaServer, Acl, Device, LocalUser, DhcpPool, FhrpGroup, NtpKey, SnmpCommunity, SnmpHost, SnmpUser, Interface, InterfaceKind, LacpMode, Origin, Ospf, QosAction, QosClass,
-                     QosPolicy, StaticRoute, StpMode, SwitchportMode, Unparsed, Vlan, Mlag)
+                     QosPolicy, QosProfile, StaticRoute, StpMode, SwitchportMode, Unparsed, Vlan, Mlag)
 from .ioslike import _is_address, _vlan_ids
 
 MGMT_VRF = "mgmt"
@@ -87,6 +88,7 @@ class _Reader:
         self._icmp_off: List[str] = []  # no ip icmp redirect|unreachable: said of every routed interface
         self._gateways6: Dict[str, List[str]] = {}  # interface -> active-gateway ipv6 addresses
         self._vsf_links: Dict[str, int] = {}  # vsf member link ports -> link number
+        self._schedule: Dict[str, str] = {}  # port -> the schedule profile it applies
 
     def unparsed(self, node: Node, section: str = "") -> None:
         self.device.unparsed.append(Unparsed(node.line, node.text, section))
@@ -130,6 +132,7 @@ class _Reader:
             "radius": lambda node: node.words == ["radius", "dyn-authorization", "enable"] and self._coa(),
             "vsx": self.vsx,
             "vsf": self.vsf,
+            "qos": self.qos,
             "mirror": self.mirror,
             "evpn": self.evpn,
             "sflow": self.sflow,
@@ -965,6 +968,21 @@ class _Reader:
                 self.unparsed(child, node.text)
         return True
 
+    def qos(self, node: Node) -> bool:
+        """qos dscp-map D local-priority N; qos schedule-profile NAME with strict and dwrr queues."""
+        w = node.words
+        if w[:2] == ["qos", "schedule-profile"] and len(w) == 3:
+            profile = self.device.qos_profiles.setdefault(w[2], QosProfile(w[2], origin=Origin(node.line, node.text)))
+            for child in node.children:
+                try:
+                    ok = aoscxqos.read_schedule_line(profile, child.words)
+                except ValueError:
+                    ok = False
+                if not ok:
+                    self.unparsed(child, node.text)
+            return True
+        return aoscxqos.read_dscp_map(self.device, w)
+
     def vsf(self, node: Node) -> bool:
         """vsf member N with link L PORTS, and vsf split-detect mgmt: a stack of two switches."""
         w = node.words
@@ -1215,6 +1233,8 @@ class _Reader:
             setattr(iface, f"acl{'6' if w[2] == 'ipv6' else ''}_{w[4].replace('routed-', '')}", w[3])
         elif w[:2] == ["apply", "policy"] and n == 4 and w[3] in ("in", "out", "routed-in", "routed-out"):
             setattr(iface, f"qos_policy_{w[3].replace('routed-', '')}", w[2])
+        elif w[:3] == ["apply", "qos", "schedule-profile"] and n == 4:
+            self._schedule[iface.name] = w[3]
         elif w[:2] == ["qos", "trust"] and n == 3 and w[2] in ("dscp", "cos", "none"):
             iface.qos_trust = w[2]
         elif w in (["dhcpv4-snooping", "trust"], ["arp", "inspection", "trust"]):
@@ -1328,6 +1348,7 @@ class _Reader:
             self.device.interfaces[name].svl_link = link
         self._anycast()
         qos_text.adopt(self.device, self._class_acls)
+        aoscxqos.finish(self.device, self._schedule)
         if self.device.vxlan is not None and self._vxlan_source:
             self.device.vxlan.source_interface = vxlan_text.interface_of(self.device, self._vxlan_source)
         if self._sflow_global and not monitor_text.sflow_ports(self.device):
