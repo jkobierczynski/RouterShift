@@ -25,7 +25,8 @@ from .report import Report, Severity, redact
 # Writers that write every setting below
 _FULL = ("ios", "eos")
 
-_NAMES = {"aoscx": "AOS-CX", "aoss": "AOS-S", "comware": "Comware", "junos": "Junos", "nxos": "NX-OS"}
+_NAMES = {"aoscx": "AOS-CX", "aoss": "AOS-S", "comware": "Comware", "junos": "Junos", "nxos": "NX-OS",
+          "iosxr": "IOS-XR"}
 
 # The settings below each other writer writes (or reports itself, where the target has no equivalent), by key
 WRITES: Dict[str, Set[str]] = {
@@ -54,6 +55,13 @@ WRITES: Dict[str, Set[str]] = {
              "sflow-options", "netflow-sampling", "banners", "local-logging", "roles", "ssh-keys", "apis",
              "password-length", "syslog-transport", "ptp", "event-handlers", "ospf-auth",
              "ospf-options", "bfd-global", "ecmp-hash"},
+    # IOS-XR: the writer writes these, or reports them itself where IOS-XR has no place for them
+    "iosxr": {"policy-lists", "relay-vrf", "hardening", "svi-mac", "autostate", "unnumbered", "route-tag", "router-id",
+              "bgp-options", "bgp-vrf-ipv6", "bgp-vrf-groups", "bgp-misc", "ospf-auth", "ospf-options", "banners",
+              "local-logging", "syslog-transport", "trap-types", "console-login", "snmp-views", "ssh-keys", "roles",
+              "apis", "password-length", "lldp-options", "anycast-gateway", "leaks", "evpn-vrf", "evpn-domain",
+              "pim-rp", "msdp", "multicast-vrf", "option82", "coa", "event-handlers", "ecmp-hash", "bfd-global",
+              "twamp", "copp", "qos-burst", "mirror-acl", "sflow-options", "netflow-sampling"},
 }
 
 Option = Tuple[str, str, object]  # (key, what the report calls it, whether the device has it)

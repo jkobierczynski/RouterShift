@@ -75,7 +75,7 @@ def test_infinite_lease() -> None:
         assert pool.lease_seconds == 0, target
 
 
-@pytest.mark.parametrize("target", sorted(set(PLATFORMS) - {"junos", "nxos"}))
+@pytest.mark.parametrize("target", sorted(set(PLATFORMS) - {"junos", "nxos", "iosxr"}))
 def test_every_writer_round_trips(target: str) -> None:
     text = ("ip dhcp excluded-address 10.20.0.1 10.20.0.9\nip dhcp excluded-address 10.20.0.200 10.20.0.254\n"
             "ip dhcp pool VOICE\n network 10.20.0.0 255.255.255.0\n default-router 10.20.0.1\n"

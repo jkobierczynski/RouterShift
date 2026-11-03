@@ -3434,6 +3434,9 @@ class _Reader:
         if w[1:] in (["ip", "domain", "lookup"], ["ip", "domain-lookup"]):
             self.device.system.dns_lookup = False
             return True
+        if w[1:] in (["logging", "console"], ["logging", "monitor"]):  # what the writers write for -1
+            setattr(self.device.system, f"logging_{w[2]}_level", -1)
+            return True
         if w[1:] in (["lldp", "run"], ["cdp", "run"], ["cdp", "enable"]):
             setattr(m, w[1], False)
             return True

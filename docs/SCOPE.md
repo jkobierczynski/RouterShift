@@ -14,6 +14,7 @@ approximated and what a person has to look at.
 | `junos` | Juniper Junos (EX and QFX with ELS, MX, SRX in switching/routing) | `show configuration`, or `\| display set` | curly braces, for `load merge terminal` | 4 (done) |
 | `nxos` | Cisco NX-OS (Nexus 9000/3000, 9.x and 10.x) | `show running-config` | CLI configuration | 4 (done) |
 | `aoscx` | HPE Aruba AOS-CX (10.x) | `show running-config` | CLI configuration | 4 (done) |
+| `iosxr` | Cisco IOS-XR (ASR 9000, NCS 5500/540, 8000; 7.x) | `show running-config` | CLI configuration | 4 (done) |
 | `aoss` | HPE Aruba AOS-S (ProCurve / ProVision, 16.x) | `show running-config` | CLI configuration | 1 (done) |
 | `comware` | HPE Comware 7 (FlexFabric, 5130/5140/5510...) | `display current-configuration` | system-view commands | 1 (done) |
 
@@ -170,6 +171,33 @@ platform converts to and from all the others.
     ip`; PBR is `ip policy route-map`.
 * What NX-OS does not have is reported instead of written: the DHCP server, PoE, the voice VLAN, IPsec, TWAMP,
   output QoS policies and MAC ACLs, more than one sFlow collector.
+
+### IOS-XR specifics
+
+* Port names: `GigabitEthernet0/0/0/N`, `TenGigE0/0/0/N` (and the other speeds) by the port's speed class, numbered
+  from 0; `Bundle-EtherN` for LAGs, `BVIN` for SVIs, `LoopbackN`, `MgmtEth0/RP0/CPU0/0`, `tunnel-ipN`.
+* IOS-XR has no VLANs or switchports. A VLAN is a bridge domain `VLANn` (or `VLANn-NAME`) in bridge group `VLANS`,
+  routed through `BVIn` when it has an SVI. An access port is an `l2transport` interface in its bridge domain; a
+  trunk gets one `l2transport` subinterface per VLAN (`encapsulation dot1q n`, `rewrite ingress tag pop 1
+  symmetric`), and its native VLAN one with `encapsulation untagged`. A trunk of all VLANs gets the VLANs the device
+  defines.
+* Route maps become RPL route policies (an `if` / `elseif` / `else` chain); prefix lists, community lists and
+  AS-path lists become `prefix-set`, `community-set` and `as-path-set`. A prefix-set has no deny entries: a list's
+  deny entries become a second set `NAME-DENY`, matched with `and not destination in NAME-DENY`. An eBGP neighbor
+  without a policy gets `RS-PASS-ALL` (IOS-XR drops eBGP routes without one); a prefix list on a neighbor becomes
+  policy `RS-PL-NAME-IN`/`-OUT`. All of these are read back as the source's form.
+* BGP peer groups in a VRF become global neighbor-groups (renamed `GROUP-vrf` on a clash); the RD is written under
+  `router bgp vrf`. VPNv4 peering is recognised and not converted, as in the IOS reader.
+* HSRP and VRRP are `router hsrp` / `router vrrp` blocks; DHCP relay is a `dhcp ipv4` relay profile `RS-RELAY-n`.
+* QoS is MQC (`class-map`, `policy-map` with `police rate N kbps`); NetFlow is a `flow exporter-map`
+  `RS-EXPORTER`, a `flow monitor-map RS-MONITOR` with record ipv4 and a `sampler-map RS-SAMPLER`; SPAN is
+  `monitor-session` (a numbered session becomes `SPANn`); IP SLA is an `ipsla` block with numbered operations and
+  tracks are `track NAME` (`type rtr N reachability` or `type line-protocol state`), used by static routes and
+  `track object` in HSRP and VRRP groups.
+* The router ID is set per protocol (OSPF `router-id`, BGP `bgp router-id`).
+* What IOS-XR does not have is reported instead of written: spanning tree, port security, DHCP snooping, 802.1X,
+  PoE, the voice VLAN, storm control, sFlow, the DHCP server, NAT, IPsec, CoPP (LPTS), port trust and the DSCP map,
+  NetFlow on layer 2 ports, ACLs on layer 2 ports.
 
 ## Access lists
 

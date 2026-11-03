@@ -175,13 +175,13 @@ def unwritable(e: RouteMapEntry, platform: str) -> Tuple[List[str], List[str]]:
     clauses the reader could not read count too."""
     matches = [c for c in e.unconverted if c.startswith("match")]
     sets = [c for c in e.unconverted if not c.startswith("match")]
-    full = platform in ("ios", "eos", "aoscx", "nxos")
+    full = platform in ("ios", "eos", "aoscx", "nxos", "iosxr")
     if not full:
         matches += [f"match as-path {x}" for x in e.match_as_paths]
         matches += [f"match community {x}" for x in e.match_communities]
         sets += [f"set extcommunity rt {e.sets['extcommunity-rt']}"] if "extcommunity-rt" in e.sets else []
         sets += [f"set metric-type {e.sets['metric-type']}"] if "metric-type" in e.sets else []
-    if e.match_rpki and platform not in ("ios", "eos"):
+    if e.match_rpki and platform not in ("ios", "eos", "iosxr"):
         matches.append(f"match RPKI {e.match_rpki}")
     return matches, sets
 

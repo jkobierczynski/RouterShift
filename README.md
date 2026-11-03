@@ -5,7 +5,7 @@ configuration, turns it into a vendor-neutral model, and writes it out for anoth
 platform, together with a report that says, item by item, what was converted
 exactly, what was approximated and what a person has to look at.
 
-Platforms: Cisco IOS / IOS XE and NX-OS, Arista EOS, Juniper Junos, HPE Aruba
+Platforms: Cisco IOS / IOS XE, NX-OS and IOS-XR, Arista EOS, Juniper Junos, HPE Aruba
 AOS-CX, AOS-S (ProCurve) and Comware 7. The [manual](docs/MANUAL.md) explains how to
 use it, [docs/SCOPE.md](docs/SCOPE.md) lists what converts per area and platform,
 [CONTRIBUTING.md](CONTRIBUTING.md) explains how to help and [CHANGELOG.md](CHANGELOG.md)
@@ -77,6 +77,12 @@ queuing policies, CoPP, MACsec, MAC ACLs, NAT, SPAN, sFlow, NetFlow, IP SLA and 
 syslog over TLS, roles, SSH keys, NX-API, PTP, EEM applets, OSPF authentication and options, BFD, ECMP hashing, RIP,
 IS-IS, MPLS/LDP, GRE tunnels and PBR. What NX-OS has no form for (the DHCP server, PoE, IPsec, TWAMP, ...) is left
 out and reported, and the nearest construct is flagged as approximated.
+Cisco IOS-XR reads and writes to the same depth for what a router carries: AAA with TACACS+ and RADIUS groups,
+SNMPv3, ACLs, prefix lists, community and AS-path lists and route maps as RPL sets and route policies, bundles and
+subinterfaces, VLANs as bridge domains with BVIs, VRFs, static routes, OSPF, IS-IS, MPLS/LDP, BGP with neighbor
+groups and VRFs, HSRP and VRRP, DHCP relay, PIM and IGMP, QoS policy maps, NetFlow, SPAN, IP SLA and tracking, and
+the SSH, NETCONF and gRPC servers. The switch features IOS-XR has no form for (spanning tree, port security, 802.1X,
+PoE, sFlow, ...) are left out and reported.
 BGP covers IOS XE peer templates (written into each neighbor), BGP inside VRFs (IOS `address-family ipv4 vrf`, EOS,
 NX-OS and AOS-CX `vrf`, Comware `ip vpn-instance`), session passwords, timers, route-reflector clients, prefix
 limits, allowas-in, remove-private-as and maximum-paths.

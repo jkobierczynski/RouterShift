@@ -24,6 +24,7 @@ PLATFORMS = {
     "comware": "HPE Comware 7",
     "junos": "Juniper Junos",
     "nxos": "Cisco NX-OS",
+    "iosxr": "Cisco IOS-XR",
 }
 
 

@@ -11,7 +11,7 @@ from typing import Callable, Dict
 from ..model import Device
 from ..names import PortMapper
 from ..report import Report
-from . import aoscx, aoss, comware, ioslike, junos, nxos
+from . import aoscx, aoss, comware, ioslike, iosxr, junos, nxos
 
 EMITTERS: Dict[str, Callable[[Device, PortMapper, Report], str]] = {
     "ios": lambda device, ports, report: ioslike.emit(device, "ios", ports, report),
@@ -21,4 +21,5 @@ EMITTERS: Dict[str, Callable[[Device, PortMapper, Report], str]] = {
     "comware": comware.emit,
     "junos": junos.emit,
     "nxos": nxos.emit,
+    "iosxr": iosxr.emit,
 }
