@@ -253,10 +253,36 @@ def test_vrrp_group() -> None:
     assert "IOS-XR has no shutdown for a group" in report.to_text()
 
 
-def test_dhcp_server_is_reported() -> None:
-    text = "ip dhcp pool VOICE\n network 10.20.0.0 255.255.255.0\n default-router 10.20.0.1\n"
+def test_dhcp_server_and_rip() -> None:
+    text = ("interface GigabitEthernet0/1\n ip address 10.20.0.1 255.255.255.0\n"
+            "interface GigabitEthernet0/2\n ip address 10.30.0.1 255.255.255.0\n"
+            "ip dhcp excluded-address 10.20.0.1 10.20.0.9\n"
+            "ip dhcp pool VOICE\n network 10.20.0.0 255.255.255.0\n default-router 10.20.0.1\n"
+            " dns-server 10.0.0.53\n domain-name voice.example\n lease 0 12\n"
+            "router rip\n version 2\n network 10.0.0.0\n passive-interface GigabitEthernet0/2\n"
+            " redistribute static\n default-metric 3\n no auto-summary\n")
     out, report = convert(text, "ios", "iosxr")
-    assert "the DHCP server is not written for IOS-XR yet" in report.to_text()
+    assert "pool vrf default ipv4 VOICE\n network 10.20.0.0/24\n address-range 10.20.0.10 10.20.0.254\n" in out
+    assert (" profile VOICE server\n  pool VOICE\n  default-router 10.20.0.1\n  dns-server 10.0.0.53\n"
+            "  domain-name voice.example\n  lease 0 12 0\n") in out
+    assert " interface GigabitEthernet0/0/0/0 server profile VOICE\n" in out
+    assert ("router rip\n interface GigabitEthernet0/0/0/0\n !\n interface GigabitEthernet0/0/0/1\n"
+            "  passive-interface\n !\n redistribute static\n default-metric 3\n") in out
+    assert " yet" not in report.to_text()
+    back = parse(out, "iosxr")
+    assert back.unparsed == []
+    [pool] = back.dhcp_pools
+    assert (pool.network, pool.ranges, pool.dns_servers, pool.lease_seconds) == (
+        "10.20.0.0/24", [("10.20.0.10", "10.20.0.254")], ["10.0.0.53"], 12 * 3600)
+    assert back.rip is not None and back.rip.networks == ["10.20.0.0/24", "10.30.0.0/24"]
+    assert back.rip.passive_interfaces == [back.interfaces[n].name for n in back.interfaces][1:2]
+
+
+def test_nat_and_ipsec_are_reported() -> None:
+    text = ("interface GigabitEthernet0/1\n ip address 192.0.2.1 255.255.255.0\n ip nat outside\n"
+            "ip nat inside source static 10.0.0.5 192.0.2.5\n")
+    _, report = convert(text, "ios", "iosxr")
+    assert "CGN service card" in report.to_text() and " yet" not in report.to_text()
 
 
 def test_qos_flow_mirror_and_tracking() -> None:

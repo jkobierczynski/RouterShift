@@ -21,7 +21,7 @@ the other switch features have no IOS-XR form and are reported.
 from __future__ import annotations
 
 import ipaddress
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from .. import aaa as aaa_text
 from .. import acl as acl_text
@@ -30,6 +30,7 @@ from .. import bgp as bgp_text
 from .. import fhrp
 from .. import hosts as hosts_text
 from .. import iosxrpolicy as policy
+from .. import iosxrrouting as xrrouting
 from .. import iosxrservices as services
 from .. import mgmt as mgmt_text
 from .. import mpls as mpls_text
@@ -40,6 +41,7 @@ from .. import routemap as routemap_text
 from .. import snmp as snmp_text
 from .. import stp as stp_text
 from .. import tracking as tracking_text
+from .. import vpn as vpn_text
 from ..model import (Bgp, BgpNeighbor, BgpVrf, Device, FhrpGroup, Interface, InterfaceKind, LacpMode, Ospf,
                      StaticRoute, SwitchportMode)
 from ..names import PortMapper
@@ -54,7 +56,52 @@ HASHES = ("md5-crypt", "sha512-crypt", "iosxr-sha256", "iosxr-scrypt")
 _HASH_NUMBER = {"md5-crypt": "5", "iosxr-sha256": "8", "iosxr-scrypt": "9", "sha512-crypt": "10"}
 BRIDGE_GROUP = "VLANS"
 WRITTEN = {"acl", "policy", "dhcp-relay", "fhrp", "speed", "mpls", "isis", "bfd", "aaa", "multicast", "qos",
-           "monitor", "track"}
+           "monitor", "track",
+           # reported by the writer itself, as IOS-XR has another shape or none
+           "storm", "l2sec", "dot1x", "mlag", "poe", "pbr", "voice", "stp-guards", "vxlan", "nat", "vpn",
+           # written by iosxrrouting
+           "rip", "dhcp"}
+# what IOS-XR has instead of a port feature it does not write
+_PORT_NOTES: List[Tuple[Callable[[Interface], bool], str, str]] = [
+    (lambda i: bool(i.storm_control), "storm-control",
+     "the storm control is not written: IOS-XR limits storms per bridge-domain port (storm-control under the "
+     "interface in the l2vpn bridge domain), in pps or kbps rather than percent; set it by hand"),
+    (lambda i: i.dhcp_trust or i.arp_trust or i.source_guard or i.port_security, "l2sec",
+     "DHCP snooping trust, ARP inspection, source guard and port security have no IOS-XR form on a router port; "
+     "left out"),
+    (lambda i: i.dot1x or i.mab or i.dot1x_fail_vlan is not None, "dot1x",
+     "802.1X and MAC authentication are not written: an IOS-XR router authenticates no hosts on its ports"),
+    (lambda i: i.mlag_id is not None, "mlag",
+     "the multi-chassis LAG is not written: IOS-XR pairs routers with EVPN multihoming (an ethernet segment on the "
+     "bundle) or MC-LAG over ICCP; set it up by hand"),
+    (lambda i: bool(i.nat), "nat",
+     "the NAT inside/outside role is not written: IOS-XR translates only on a CGN service card; left out"),
+    (lambda i: bool(i.crypto_map), "vpn",
+     "the crypto map is not written: IOS-XR routers terminate no IPsec; move the VPN to a router or firewall"),
+    (hosts_text.poe_stated, "poe", "IOS-XR ports supply no PoE; left out"),
+    (lambda i: bool(i.pbr), "pbr",
+     "policy-based routing is not written: IOS-XR forwards by ACL entries with a nexthop (ABF) applied ingress; set "
+     "it up by hand"),
+    (lambda i: i.voice_vlan is not None, "voice", "IOS-XR has no voice VLAN; left out"),
+    (lambda i: i.stp_guard == "loop" or i.stp_bpdufilter, "stp-guards",
+     "loop guard and BPDU filter have no IOS-XR form; left out"),
+    (lambda i: bool(i.trunk_groups), "trunk-groups",
+     "the trunk groups have no IOS-XR form; the port carries its VLANs by its subinterfaces"),
+    (lambda i: bool(i.qos_profile or i.queues), "queuing",
+     "the queuing profile and queue settings are not written: IOS-XR queues by an output policy-map (priority "
+     "level, bandwidth remaining, shape average); build it by hand"),
+    (lambda i: bool(i.mac_acl_in or i.mac_acl_out), "mac-acl",
+     "the MAC access groups are not written: IOS-XR filters l2transport ports with ethernet-services access-groups; "
+     "set them by hand"),
+    (lambda i: bool(i.macsec_profile), "macsec",
+     "MACsec is not written: IOS-XR takes 'macsec psk-keychain KC policy P' on the port, with a macsec key chain "
+     "and a macsec-policy; set it up by hand"),
+    (lambda i: i.ptp is not None or i.ptp_announce_interval is not None, "ptp",
+     "PTP on the port is not written: IOS-XR sets 'ptp' with a profile on the interface; set it up by hand"),
+    (lambda i: bool(i.evpn_esi or i.lacp_system_id), "evpn-es",
+     "the EVPN ethernet segment and LACP system ID are not written: IOS-XR sets the segment under 'evpn interface "
+     "Bundle-EtherN ethernet-segment identifier type 0'; set it up by hand"),
+]
 _LEVEL_WORDS = mgmt_text.LEVELS
 _MAX_TRUNK_VLANS = 512  # a trunk of "all VLANs" is written for the VLANs the device defines, and no more than this
 
@@ -97,6 +144,7 @@ class Writer:
         self.routes()
         self.ospf()
         self.isis()
+        self.out += xrrouting.rip_lines(self.device, self.report, self.port, self.redistribute)
         self.ldp()
         self.bgp()
         self.fhrp_lines()
@@ -496,8 +544,8 @@ class Writer:
         for rm in d.route_maps.values():
             if rm.name in pbr:
                 self.report.skip("policy", routemap_text.label(rm.name, "route-map"), "pbr",
-                                 "used for policy-based routing only, which is not written for IOS-XR yet (ABF: an "
-                                 "ACL with nexthop); set it up by hand")
+                                 "used for policy-based routing only: IOS-XR forwards by ACL entries with a nexthop "
+                                 "(ABF) instead; set it up by hand")
             elif rm.entries:
                 out += policy.route_policy_lines(rm, self.halves, self.report)
         for lines in self.prefix_policies.values():
@@ -569,6 +617,9 @@ class Writer:
         if (iface.bfd_interval or iface.bfd_multiplier) and not in_ospf and iface.kind != InterfaceKind.LAG:
             add(Severity.REVIEW, "bfd", "the BFD timers are not written: IOS-XR sets them per protocol (router ospf, "
                                         "router bgp neighbor), and the interface runs no OSPF")
+        for stated, code, message in _PORT_NOTES:
+            if stated(iface):
+                add(Severity.REVIEW, code, message)
         if layer2:
             self.layer2(iface, name, common, add)
         else:
@@ -1239,12 +1290,14 @@ class Writer:
                 self.report.add("interface", self.label(iface), Severity.APPROX, "relay-source",
                                 "the relay's source interface is not written: IOS-XR relays from the receiving "
                                 "interface")
-        if not profiles:
+        servers, bound = xrrouting.server_lines(self.device, self.report, self.port)
+        if not profiles and not servers:
             return
+        self.out += xrrouting.pool_lines(self.device, self.report)
         body: List[str] = []
         for (vrf, addresses), name in profiles.items():
             body += [f"profile {name} relay"] + [f"{IND}helper-address vrf {vrf} {a}" for a in addresses] + ["!"]
-        self.out += ["dhcp ipv4"] + [IND + b for b in body + interfaces] + ["!"]
+        self.out += ["dhcp ipv4"] + [IND + b for b in body + servers + interfaces + bound] + ["!"]
 
     def multicast(self) -> None:
         d = self.device
@@ -1283,11 +1336,13 @@ class Writer:
             for iface in igmp:
                 lines += [f"interface {self.port(iface.name)}", f"{IND}version {iface.igmp_version}", "!"]
             self.out += ["router igmp"] + [IND + line for line in lines] + ["!"]
-        for what, stated in (("anycast RP", d.pim_anycast), ("MSDP peers", d.msdp_peers),
-                             ("multicast routing in VRFs", d.multicast_vrfs)):
+        for what, stated in (("anycast RP (IOS-XR shares an RP through 'router msdp' peers)", d.pim_anycast),
+                             ("MSDP peers ('router msdp' / 'peer')", d.msdp_peers),
+                             ("multicast routing in VRFs ('multicast-routing vrf' and 'router pim vrf')",
+                              d.multicast_vrfs)):
             if stated:
                 self.report.add("system", "multicast routing", Severity.REVIEW, "pim-options",
-                                f"{what} not written for IOS-XR yet; set it up by hand")
+                                f"{what} is not written; set it up by hand")
 
     # management ------------------------------------------------------------------------------------------------------
 
@@ -1358,7 +1413,8 @@ class Writer:
             rep.add("system", "BFD", Severity.APPROX, "bfd-global",
                     "the BFD multihop and slow timers are not written; IOS-XR sets BFD timers per protocol")
         if d.twamp_port is not None:
-            rep.skip("monitor", "TWAMP reflector", "twamp", "the TWAMP reflector is not written for IOS-XR yet")
+            rep.skip("monitor", "TWAMP reflector", "twamp",
+                     "the TWAMP reflector is not written: IOS-XR answers with 'ipsla responder twamp'; set it by hand")
         if d.control_plane is not None:
             rep.skip("security", "control plane", "copp",
                      "IOS-XR protects its control plane with LPTS; the CoPP policy is not converted")
@@ -1366,6 +1422,46 @@ class Writer:
             rep.add("system", "router ID", Severity.REVIEW, "router-id",
                     f"IOS-XR sets the router ID per protocol and the device runs no OSPF or BGP: "
                     f"{d.system.router_id} is not written")
+        if d.vxlan is not None:
+            rep.skip("interface", "VXLAN", "vxlan",
+                     "VXLAN and its EVPN instances are not written: IOS-XR carries EVPN over MPLS or SRv6 on most "
+                     "platforms (VXLAN only with 'interface nve' on some); set it up by hand")
+        if d.mlag is not None:
+            rep.skip("interface", "multi-chassis LAG", "mlag",
+                     "the switch pair is not written: IOS-XR pairs routers with EVPN multihoming or MC-LAG over "
+                     "ICCP ('redundancy iccp group'); set it up by hand")
+        if d.dhcp_snooping:
+            rep.skip("vlan", "DHCP snooping", "l2sec", "IOS-XR routers do no DHCP snooping; left out")
+        if d.ptp is not None:
+            rep.skip("system", "PTP", "ptp",
+                     "PTP is not written: IOS-XR takes a 'ptp' block with a clock profile; set it up by hand")
+        if d.macsec_profiles:
+            rep.skip("security", "MACsec", "macsec",
+                     "the MACsec profiles are not written: IOS-XR takes a 'macsec-policy' and a macsec key chain; set "
+                     "them up by hand")
+        for name in d.mac_acls:
+            rep.skip("acl", f"mac access-list {name}", "mac-acl",
+                     "MAC access lists are not written: IOS-XR has ethernet-services access lists; translate it by "
+                     "hand")
+        for vlan in d.vlans.values():
+            if vlan.trunk_groups:
+                rep.add("vlan", str(vlan.vlan_id), Severity.APPROX, "trunk-groups",
+                        "trunk groups have no IOS-XR form; the trunks carry the VLAN by their subinterfaces")
+        if d.igmp_querier_address or d.igmp_querier_version or any(
+                v.igmp_querier_address or v.igmp_querier_version for v in d.vlans.values()):
+            rep.add("vlan", multicast_text.LABEL, Severity.APPROX, "igmp-querier",
+                    "IOS-XR bridge domains have no IGMP snooping querier; the querier settings are left out")
+        if d.qos_profiles or d.qos_dscp_tc or d.qos_tc_dscp:
+            rep.skip("qos", "DSCP to traffic-class map", "queuing",
+                     "the DSCP map and the queuing profiles are not written: IOS-XR classifies by an input policy-map "
+                     "(set traffic-class) and queues by an output policy-map; build them by hand")
+        for n, rule in enumerate(d.nat_rules, 1):
+            rep.skip("nat", f"rule {n} ({rule.kind})", "nat",
+                     "NAT is not written: IOS-XR translates addresses only on a CGN service card (service cgn); "
+                     "keep NAT on a firewall or router that does it")
+        for p in d.ipsec_peers:
+            rep.skip("vpn", vpn_text.peer_label(p), "vpn",
+                     "IOS-XR routers terminate no IPsec; move the VPN to a router or firewall that does")
         if d.dhcp_option82 is not None:
             rep.add("system", "DHCP snooping", Severity.APPROX, "option82", "the DHCP option 82 setting is not written")
 

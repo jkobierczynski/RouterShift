@@ -61,7 +61,9 @@ WRITES: Dict[str, Set[str]] = {
               "local-logging", "syslog-transport", "trap-types", "console-login", "snmp-views", "ssh-keys", "roles",
               "apis", "password-length", "lldp-options", "anycast-gateway", "leaks", "evpn-vrf", "evpn-domain",
               "pim-rp", "msdp", "multicast-vrf", "option82", "coa", "event-handlers", "ecmp-hash", "bfd-global",
-              "twamp", "copp", "qos-burst", "mirror-acl", "sflow-options", "netflow-sampling"},
+              "twamp", "copp", "qos-burst", "mirror-acl", "sflow-options", "netflow-sampling", "trunk-groups", "ptp",
+              "macsec", "mac-acl", "queuing", "igmp-querier", "evpn-instances", "vxlan-mcast", "evpn-domain",
+              "mlag-options", "stackwise", "evpn-es", "dot1x-fail-vlan"},
 }
 
 Option = Tuple[str, str, object]  # (key, what the report calls it, whether the device has it)

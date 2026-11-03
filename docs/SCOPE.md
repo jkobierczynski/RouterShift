@@ -195,9 +195,15 @@ platform converts to and from all the others.
   tracks are `track NAME` (`type rtr N reachability` or `type line-protocol state`), used by static routes and
   `track object` in HSRP and VRRP groups.
 * The router ID is set per protocol (OSPF `router-id`, BGP `bgp router-id`).
+* RIP runs on the interfaces listed under `router rip`: the interfaces with an address in the source's networks are
+  listed (passive ones with `passive-interface`), and read back as their networks. The DHCP server is a
+  `pool vrf V ipv4 NAME` with `network` and `address-range`, and a `dhcp ipv4` server profile with the options,
+  bound to the interfaces in the pool's network.
 * What IOS-XR does not have is reported instead of written: spanning tree, port security, DHCP snooping, 802.1X,
-  PoE, the voice VLAN, storm control, sFlow, the DHCP server, NAT, IPsec, CoPP (LPTS), port trust and the DSCP map,
-  NetFlow on layer 2 ports, ACLs on layer 2 ports.
+  PoE, the voice VLAN, storm control, sFlow, NAT (only on a CGN service card), IPsec, VXLAN (EVPN runs over MPLS or
+  SRv6), the switch pair (EVPN multihoming or MC-LAG over ICCP instead), MACsec, MAC ACLs, PTP, trunk groups, the
+  IGMP querier, queuing profiles, CoPP (LPTS), port trust and the DSCP map, NetFlow on layer 2 ports, ACLs on layer
+  2 ports. Each report says what IOS-XR uses instead, so nothing is left as "not written for IOS-XR yet".
 
 ## Access lists
 

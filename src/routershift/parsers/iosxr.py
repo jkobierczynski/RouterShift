@@ -30,6 +30,7 @@ from .. import bgp as bgp_text
 from .. import confparse
 from .. import iosxrpolicy as policy
 from .. import iosxrservices as services
+from .. import iosxrrouting as xrrouting
 from .. import mgmt as mgmt_text
 from .. import multicast as multicast_text
 from ..acl import read_block
@@ -70,6 +71,7 @@ class _Reader:
         self._l2: Dict[str, Tuple[Node, str]] = {}  # l2transport interface (XR name) -> its node, encapsulation
         self._bundles: Dict[str, Tuple[str, LacpMode]] = {}  # canonical member -> (canonical bundle, mode)
         self._reason: Optional[Tuple[str, str]] = None
+        self._rip: List[str] = []  # the interfaces under router rip
         self.flows = services.FlowReader(self.device, self.name, self.unparsed)
 
     # names -----------------------------------------------------------------------------------------------------------
@@ -180,6 +182,7 @@ class _Reader:
             "grpc": self.grpc,
             "multicast-routing": self.multicast_routing,
             "dhcp": self.dhcp,
+            "pool": lambda n: xrrouting.read_pool(self.device, n, self.children),
             "class-map": lambda n: services.read_class_map(self.device, n, self.unparsed),
             "policy-map": lambda n: services.read_policy_map(self.device, n, self.unparsed),
             "flow": self.flows.node,
@@ -923,6 +926,8 @@ class _Reader:
         if w[1:] == ["igmp"]:
             self._igmp(node)
             return True
+        if w[1:] == ["rip"]:
+            return xrrouting.read_rip(self.device, node, self.name, self.children, self._rip)
         return False
 
     def _static(self, c: List[str], n: Node, vrf: str) -> bool:
@@ -1464,6 +1469,11 @@ class _Reader:
             return False
 
         def line(c: List[str], n: Node) -> bool:
+            if c[0] == "profile" and len(c) == 3 and c[2] == "server":
+                xrrouting.read_server_profile(self.device, c[1], n, self.children)
+                return True
+            if c[0] == "interface" and len(c) == 5 and c[2:4] == ["server", "profile"]:
+                return True
             if c[0] == "profile" and len(c) == 3 and c[2] == "relay":
                 profiles[c[1]] = []
                 self.children(n, lambda cc, nn: profile_line(c[1], cc), node.text)
@@ -1553,6 +1563,7 @@ class _Reader:
 
     def _finish(self) -> None:
         d = self.device
+        xrrouting.finish_rip(d, self._rip)
         for name, (node, _) in self._l2.items():
             if node.text:
                 self.unparsed(node)
