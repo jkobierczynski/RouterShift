@@ -10,6 +10,7 @@ import ipaddress
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from .. import aaa as aaa_text
+from .. import comwarefabric
 from .. import comwarerouting
 from .. import acl as acl_text
 from .. import dhcp as dhcp_text
@@ -92,7 +93,11 @@ class Writer:
         self.nat()
         self.vpn()
         self.monitor()
-        vxlan_text.unsupported(self.device, self.report, "Comware")
+        self.out += comwarefabric.vxlan_lines(self.device, self.report, self.port,
+                                              comwarefabric.tunnel_base(self.device))
+        self.out += comwarefabric.mlag_lines(self.device, self.report, self.port, lambda v: v)
+        comwarefabric.trunk_groups(self.device, self.report)
+        comwarefabric.evpn_domain(self.device, self.report)
         self.tracking()
         order = {InterfaceKind.LAG: 0}
         for iface in sorted(self.device.interfaces.values(), key=lambda i: order.get(i.kind, 1)):
@@ -100,8 +105,6 @@ class Writer:
         self.routes()
         if self.device.bgp is not None:
             self.bgp()
-        vrfs_text.mlag_unsupported(self.device, self.report, "Comware",
-                                   "Comware pairs switches with IRF or DRNI; configure it by hand")
         self.out.append("return")
         self.report.unparsed(self.device.unparsed)
         return "\n".join(self.out) + "\n"
@@ -597,8 +600,7 @@ class Writer:
             if info and info.rd:
                 self.out.append(f"{_IND}route-distinguisher {info.rd}")
             if info:
-                kinds = {"import": "import-extcommunity", "export": "export-extcommunity", "both": "both"}
-                self.out += [f"{_IND}vpn-target {v} {kinds[d]}" for d, v in vrfs_text.targets(info)]
+                self.out += [_IND + line for line in comwarefabric.vrf_lines(self.device, name, info, self.report)]
             self.block_end()
             self.report.item("system", f"vrf {name}")
 
@@ -816,6 +818,9 @@ class Writer:
 
     def interface(self, iface: Interface) -> None:
         name = self.port(iface.name)
+        gateway = comwarefabric.gateway_vlan(self.device, iface)
+        if gateway is not None:
+            name = f"Vsi-interface{gateway}"
         label = f"{iface.source_name or iface.name} -> {name}"
         self.report.item("interface", label)
 
@@ -858,6 +863,13 @@ class Writer:
             lines.append(f"ip address {net.ip} {net.netmask}" + (" sub" if n else ""))
         for cidr in iface.ipv6:
             lines.append(f"ipv6 address {cidr}")
+        if gateway is not None:
+            lines += comwarefabric.gateway_lines(self.device, iface, add)
+        else:
+            comwarefabric.anycast_without_vxlan(iface, add)
+        if iface.kind == InterfaceKind.LAG:
+            lines += comwarefabric.lag_lines(self.device, iface, add)
+        lines += comwarefabric.service_instances(self.device, iface)
         for direction, policy in (("inbound", iface.qos_policy_in), ("outbound", iface.qos_policy_out)):
             if policy and policy in self.device.qos_policies:
                 lines.append(f"qos apply policy {policy} {direction}")
@@ -1309,6 +1321,18 @@ class Writer:
         if bgp.keepalive is not None or bgp.hold is not None:
             keepalive = bgp.keepalive if bgp.keepalive is not None else 60
             lines.append(f"timer keepalive {keepalive} hold {bgp.hold if bgp.hold is not None else 3 * keepalive}")
+        if bgp.med_missing_as_worst or any(v.med_missing_as_worst for v in bgp.vrfs.values()):
+            lines.append("bestroute med-none-as-maximum")
+            if any(v.med_missing_as_worst for v in bgp.vrfs.values()) and not bgp.med_missing_as_worst:
+                self.report.add("bgp", f"bgp {bgp.local_as}", Severity.APPROX, "bgp-med",
+                                "Comware sets the missing MED rule for the whole process; it is written globally")
+        if bgp.asdot:
+            self.report.add("bgp", f"bgp {bgp.local_as}", Severity.APPROX, "bgp-asdot",
+                            "Comware shows 4-byte AS numbers as plain numbers; asdot notation is left out")
+        if bgp.ospf_match or any(v.ospf_match for v in bgp.vrfs.values()):
+            self.report.add("bgp", f"bgp {bgp.local_as}", Severity.REVIEW, "bgp-ospf-match",
+                            "Comware redistributes every OSPF route type; filter the types with a route policy "
+                            "(if-match route-type) by hand")
         if bgp.graceful_restart:
             lines.append("graceful-restart")
             if bgp.graceful_restart_time is not None:
@@ -1353,6 +1377,17 @@ class Writer:
             if body:
                 lines.append(f"address-family {af} unicast")
                 lines += [_IND + line for line in body]
+        evpn = [p for p in list(bgp.peer_groups.values()) + bgp.neighbors if "evpn" in p.families]
+        if evpn and self.device.vxlan is not None:
+            lines.append("address-family l2vpn evpn")
+            for peer in evpn:
+                lines.append(f"{_IND}peer {peer.address} enable")
+                if peer.route_reflector_client:
+                    lines.append(f"{_IND}peer {peer.address} reflect-client")
+        elif evpn:
+            self.report.add("bgp", f"bgp {bgp.local_as}", Severity.REVIEW, "evpn-unsupported",
+                            "the EVPN address family of " + ", ".join(p.address for p in evpn) +
+                            " is not written: the device carries no VXLAN")
         for name, v in bgp.vrfs.items():
             self.report.item("bgp", f"bgp vrf {name}")
             lines.append(f"ip vpn-instance {name}")

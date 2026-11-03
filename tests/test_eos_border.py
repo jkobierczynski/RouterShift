@@ -318,7 +318,7 @@ def test_other_targets_report_what_they_leave_out(target: str) -> None:
                "  fabric forwarding mode anycast-gateway\n" in out
     elif target == "comware":
         assert "ip community-list basic CL-BLACKHOLE permit 65535:666\n" in out
-        assert "anycast gateway 10.1.100.1/24" in text
+        assert "only on a VLAN carried in VXLAN; the shared addresses 10.1.100.1/24" in text
     else:
         assert "anycast gateway 10.1.100.1/24" in text
         assert "community-list CL-BLACKHOLE: skipped" in text

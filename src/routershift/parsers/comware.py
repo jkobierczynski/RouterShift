@@ -41,6 +41,7 @@ from ..errors import ParseError
 from ..model import (BgpAggregate, BgpVrf, IpSla, Netflow, Sflow, AaaGroup, AaaMethod, AaaServer, Acl, AclAction, AclEntry, Device, DhcpPool, FhrpGroup, IkePolicy, IpsecPeer, IpsecTransform,
                      NtpKey, PreSharedKey, SnmpCommunity, SnmpGroup, SnmpHost, SnmpUser, Interface, InterfaceKind, LacpMode, LocalUser,
                      NatPool, NatRule, Origin, QosAction, QosClass, QosPolicy, Ospf, Rip, Isis, Wlan, OspfNetwork, StaticRoute, StpMode, SwitchportMode, Unparsed, Vlan)
+from .. import comwarefabric
 from .. import comwarerouting
 from .ioslike import _cidr, _is_address
 
@@ -54,6 +55,7 @@ _PREFIXES: List[Tuple[str, InterfaceKind, str]] = [
     ("Bridge-Aggregation", InterfaceKind.LAG, ""),
     ("Route-Aggregation", InterfaceKind.LAG, ""),
     ("Vlan-interface", InterfaceKind.VLAN, ""),
+    ("Vsi-interface", InterfaceKind.VLAN, ""),  # the routed interface of a VLAN carried in VXLAN
     ("LoopBack", InterfaceKind.LOOPBACK, ""),
     ("Tunnel", InterfaceKind.TUNNEL, ""),
     ("NULL", InterfaceKind.OTHER, ""),
@@ -146,6 +148,7 @@ class _Reader:
         self._port_based: Set[str] = set()
         self._behaviors: Dict[str, QosAction] = {}
         self._policy_pairs: List[Tuple[QosPolicy, str, str, Node]] = []  # policy, classifier, behavior, line
+        self.fabric = comwarefabric.FabricReader(self.device)
 
     def unparsed(self, node: Node, section: str = "") -> None:
         self.device.unparsed.append(Unparsed(node.line, node.text, section))
@@ -211,6 +214,10 @@ class _Reader:
             "sflow": self.sflow,
             "nqa": self.nqa,
             "track": self.track,
+            "vsi": self.vsi,
+            "l2vpn": lambda n: not n.children and self.fabric.global_line(n.words),
+            "tunnel": lambda n: not n.children and self.fabric.global_line(n.words),
+            "m-lag": lambda n: not n.children and self.fabric.mlag(n.words),
             "router": lambda n: not n.children and comwarerouting.read_global(self.device, n.words),
             "bfd": lambda n: not n.children and comwarerouting.read_global(self.device, n.words),
         }
@@ -868,6 +875,19 @@ class _Reader:
                     values = c[1:-1] if direction else c[1:]
                     for value in values:
                         vrfs_text.route_target(info, direction or "both", value)
+                elif c == ["address-family", "evpn"]:
+                    info.rt_evpn = True
+                    for line in child.children:
+                        x = line.words
+                        if x[0] == "vpn-target" and len(x) >= 2:
+                            kinds = {"import-extcommunity": "import", "export-extcommunity": "export", "both": "both"}
+                            direction = kinds.get(x[-1], "")
+                            for value in (x[1:-1] if direction else x[1:]):
+                                vrfs_text.route_target(info, direction or "both", value)
+                        else:
+                            self.unparsed(line, node.text)
+                elif c[:2] == ["export", "route-policy"] and len(c) == 3:
+                    info.export_map = c[2]
                 elif c[0] != "description":
                     self.unparsed(child, node.text)
             return True
@@ -1384,6 +1404,16 @@ class _Reader:
                 continue
             if w[0] == "address-family" and w[1:] in (["ipv4"], ["ipv4", "unicast"], ["ipv6"], ["ipv6", "unicast"]):
                 af = w[1]
+            elif w[0] == "address-family" and w[1:] == ["l2vpn", "evpn"] and vrfs is not None:
+                for line in child.children:
+                    x = line.words
+                    if x[0] == "peer" and len(x) == 3 and x[2] == "enable":
+                        b.activate(x[1], "evpn")
+                    elif x[0] == "peer" and len(x) == 3 and x[2] == "reflect-client":
+                        b.peer(x[1]).route_reflector_client = True
+                    else:
+                        self.unparsed(line, f"{section} / {child.text}")
+                continue
             elif w[0] == "address-family":
                 self.unparsed(child, section)
                 continue
@@ -1403,6 +1433,8 @@ class _Reader:
             bgp.router_id = str(ipaddress.IPv4Address(w[1]))
         elif w[:2] == ["timer", "keepalive"] and n == 5 and w[3] == "hold" and not af:
             bgp.keepalive, bgp.hold = int(w[2]), int(w[4])
+        elif w == ["bestroute", "med-none-as-maximum"] and not af:
+            bgp.med_missing_as_worst = True
         elif w == ["graceful-restart"] and not af:
             bgp.graceful_restart = True
         elif w[:3] == ["graceful-restart", "timer", "restart"] and n == 4 and not af:
@@ -1598,12 +1630,17 @@ class _Reader:
             iface.parent = canon.rsplit(".", 1)[0]
         if kind == InterfaceKind.ETHERNET or source.startswith("Bridge-Aggregation"):
             iface.mode = SwitchportMode.ACCESS  # bridge mode is the default on a switch
+        if tunnel_mode == "vxlan":
+            return self.vxlan_tunnel(canon, node)
         self.device.interfaces[canon] = iface
         if tunnel_mode in ("gre", "ipsec"):
             iface.tunnel_mode = tunnel_mode
         elif tunnel_mode:
             self.unparsed(node)
         for child in node.children:
+            if child.words[0] == "service-instance":
+                self.service_instance(child, node.text)
+                continue
             try:
                 understood = self.interface_line(iface, child.words)
             except (ValueError, IndexError):
@@ -1612,9 +1649,43 @@ class _Reader:
                 self.unparsed(child, node.text)
         return True
 
+    def vxlan_tunnel(self, name: str, node: Node) -> bool:
+        """interface TunnelN mode vxlan: a static VXLAN flood peer."""
+        for child in node.children:
+            c = child.words
+            if c[0] == "destination" and len(c) == 2:
+                self.fabric.tunnels[name] = c[1]
+            elif c[0] != "source" or len(c) != 2:
+                self.unparsed(child, node.text)
+        return True
+
+    def service_instance(self, node: Node, section: str) -> None:
+        """A port joins a VXLAN VLAN's VSI; the port's own VLAN settings say which VLANs it carries."""
+        for child in node.children:
+            c = child.words
+            if not (c[:1] == ["encapsulation"] and (c[1:] == ["untagged"] or c[1:2] == ["s-vid"] and len(c) == 3)
+                    or c[:2] == ["xconnect", "vsi"] and len(c) == 3):
+                self.unparsed(child, section)
+
+    def vsi(self, node: Node) -> bool:
+        flat: List[Node] = []
+
+        def walk(n: Node) -> None:
+            for child in n.children:
+                flat.append(child)
+                walk(child)
+        walk(node)
+        return self.fabric.vsi(node.words, [n.words for n in flat], lambda i: self.unparsed(flat[i], node.text))
+
     def interface_line(self, iface: Interface, w: List[str]) -> bool:
         n = len(w)
         name = iface.name
+        if self.fabric.interface_line(iface, w):
+            return True
+        if w[0] == "mac-address" and n == 2 and re.match(r"^[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}$", w[1]):
+            digits = w[1].replace("-", "").lower()
+            iface.mac_address = ":".join(digits[i:i + 2] for i in range(0, 12, 2))
+            return True
         if w[0] in ("mirroring-group", "sflow") or w[:2] == ["ip", "netstream"]:
             return self.monitor_line(iface, w)
         if w[0] == "poe" or w == ["undo", "poe", "enable"]:
@@ -1963,6 +2034,7 @@ class _Reader:
         return True
 
     def _finish(self) -> None:
+        self.fabric.finish()
         ospf_text.attach(self.device, self._ospf_areas, {})
         monitor_text.finish(self.device)
         self._finish_aaa()
