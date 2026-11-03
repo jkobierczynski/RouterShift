@@ -33,6 +33,17 @@ Add a line under "Unreleased" in every pull request that changes what RouterShif
   summer-time rule), PTP, EEM applets, OSPF authentication and options, BFD, ECMP hashing, RIP, IS-IS, MPLS/LDP, GRE
   tunnels and PBR. EOS (the bl1-dc1 border leaf) converts to NX-OS with nothing left as not written yet, and every
   sample converts to NX-OS and back with no line left unread; what NX-OS lacks is flagged instead of labelled exact.
+* Cisco IOS-XR is a new platform (`iosxr`), read and written: AAA, SNMPv3, ACLs, RPL prefix-sets, community-sets,
+  AS-path-sets and route policies, bundles, subinterfaces, VLANs as bridge domains with BVIs, VRFs, static routes,
+  OSPF, IS-IS, RIP, MPLS/LDP, BGP with neighbor groups and VRFs, HSRP and VRRP, DHCP relay and server, PIM and IGMP,
+  QoS, NetFlow, SPAN, IP SLA and tracking, and the management servers. Every sample converts to IOS-XR and back with
+  no line left unread, and the round-trip check includes it. Nothing is left as "not written for IOS-XR yet": what
+  IOS-XR has no form for (VXLAN, the switch pair, NAT, IPsec, switch port features) is reported with what to do.
+* Every conversion flags a route map entry without a match that is not the last: it takes every route, so the
+  entries after it never apply. The writers still copy it as the source has it.
+* IOS-XR writes the BFD timers of the interface towards a BGP neighbor under that neighbor (`bfd minimum-interval`,
+  `bfd multiplier`), and flags a neighbor that has no remote AS.
+* The IOS, EOS and NX-OS readers read `no logging console` and `no logging monitor`, which their writers write.
 * The EOS reader reads `ip address unnumbered`.
 * The text report shows the device security section (CoPP, MACsec).
 * The report names the RouterShift version that wrote it: in the first line of the text report and as `version` in

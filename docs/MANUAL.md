@@ -44,13 +44,14 @@ pip install .
 |---|---|---|
 | `ios` | Cisco IOS and IOS XE | `show running-config` |
 | `nxos` | Cisco NX-OS (Nexus 9000/3000) | `show running-config` |
+| `iosxr` | Cisco IOS-XR (ASR 9000, NCS 5500/540, 8000) | `show running-config` |
 | `eos` | Arista EOS | `show running-config` |
 | `junos` | Juniper Junos (EX, QFX, MX, SRX) | `show configuration`, or `show configuration \| display set` |
 | `aoscx` | HPE Aruba AOS-CX (10.x) | `show running-config` |
 | `aoss` | HPE Aruba AOS-S / ProCurve (16.x) | `show running-config` |
 | `comware` | HPE Comware 7 | `display current-configuration` |
 
-Every platform converts to every other one. IOS, EOS, Junos, NX-OS and AOS-CX write every area the model holds,
+Every platform converts to every other one. IOS, EOS, Junos, NX-OS, IOS-XR and AOS-CX write every area the model holds,
 using the nearest construct where the target has another shape; AOS-S and Comware write everything the model holds
 that the platform can express (see [What converts](#what-converts)).
 

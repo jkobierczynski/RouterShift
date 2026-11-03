@@ -32,8 +32,8 @@ SAMPLES = {"ios": "ios_access.cfg", "eos": "eos_leaf.cfg", "aoscx": "aoscx_acces
 
 
 def test_every_platform_has_a_sample() -> None:
-    # Junos and NX-OS are written for the core features only; tests/test_junos.py and test_nxos.py cover them
-    assert set(SAMPLES) | {"junos", "nxos"} == set(PLATFORMS)
+    # Junos, NX-OS and IOS-XR have tests of their own: tests/test_junos.py, test_nxos.py and test_iosxr.py
+    assert set(SAMPLES) | {"junos", "nxos", "iosxr"} == set(PLATFORMS)
 
 
 @pytest.mark.parametrize("source", sorted(SAMPLES))

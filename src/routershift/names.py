@@ -48,6 +48,10 @@ _COMWARE_PREFIX = {"100g": "HundredGigE", "40g": "FortyGigE", "25g": "Twenty-Fiv
 _JUNOS_PREFIX = {"100g": "et", "40g": "et", "25g": "et", "10g": "xe", "5g": "mge", "2.5g": "mge", "1g": "ge",
                  "100m": "ge"}
 
+# How IOS-XR names a port of each speed class.
+_IOSXR_PREFIX = {"400g": "FourHundredGigE", "100g": "HundredGigE", "50g": "FiftyGigE", "40g": "FortyGigE",
+                 "25g": "TwentyFiveGigE", "10g": "TenGigE", "1g": "GigabitEthernet", "100m": "GigabitEthernet"}
+
 # How IOS names a port of each speed class.
 _IOS_PREFIX = {"100g": "HundredGigE", "40g": "FortyGigabitEthernet", "25g": "TwentyFiveGigE",
                "10g": "TenGigabitEthernet", "5g": "FiveGigabitEthernet", "2.5g": "TwoGigabitEthernet",
@@ -170,6 +174,8 @@ class PortMapper:
             return f"{_COMWARE_PREFIX.get(iface.media, 'GigabitEthernet')}{kept or f'1/0/{index}'}"
         if self.target == "nxos":
             return f"Ethernet1/{index}"
+        if self.target == "iosxr":
+            return f"{_IOSXR_PREFIX.get(iface.media, 'GigabitEthernet')}0/0/0/{index - 1}"
         if self.target == "junos":
             return f"{_JUNOS_PREFIX.get(iface.media, 'ge')}-0/0/{index - 1}"
         # eos: front-panel ports are numbered 1..n
@@ -187,6 +193,8 @@ class PortMapper:
             return self._junos_logical(iface)
         if self.target == "nxos":
             return self._nxos_logical(iface)
+        if self.target == "iosxr":
+            return self._iosxr_logical(iface)
         if iface.kind == InterfaceKind.LAG:
             number = name[len("Port-channel"):]
             return f"Port-Channel{number}" if self.target == "eos" else f"Port-channel{number}"
@@ -248,6 +256,22 @@ class PortMapper:
             return "me0"
         if iface.kind == InterfaceKind.TUNNEL and name[len("Tunnel"):].isdigit():
             return f"{'st0' if iface.tunnel_mode == 'ipsec' or iface.tunnel_profile else 'gr-0/0/0'}.{name[len('Tunnel'):]}"
+        if iface.kind == InterfaceKind.SUBINTERFACE and iface.parent:
+            return f"{self(iface.parent)}.{name.rsplit('.', 1)[1]}"
+        return name
+
+    def _iosxr_logical(self, iface: Interface) -> str:
+        """IOS-XR names: Bundle-EtherN, BVIN, LoopbackN, MgmtEth0/RP0/CPU0/N, tunnel-ipN."""
+        name = iface.name
+        if iface.kind == InterfaceKind.LAG:
+            return f"Bundle-Ether{name[len('Port-channel'):]}"
+        if iface.kind == InterfaceKind.VLAN:
+            return f"BVI{name[len('Vlan'):]}"
+        if iface.kind == InterfaceKind.MANAGEMENT:
+            managed = [i.name for i in self.device.interfaces.values() if i.kind == InterfaceKind.MANAGEMENT]
+            return f"MgmtEth0/RP0/CPU0/{managed.index(name) if name in managed else 0}"
+        if iface.kind == InterfaceKind.TUNNEL and name[len("Tunnel"):].isdigit():
+            return f"tunnel-ip{name[len('Tunnel'):]}"
         if iface.kind == InterfaceKind.SUBINTERFACE and iface.parent:
             return f"{self(iface.parent)}.{name.rsplit('.', 1)[1]}"
         return name

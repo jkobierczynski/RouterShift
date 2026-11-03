@@ -24,6 +24,7 @@ PLATFORMS = {
     "comware": "HPE Comware 7",
     "junos": "Juniper Junos",
     "nxos": "Cisco NX-OS",
+    "iosxr": "Cisco IOS-XR",
 }
 
 
@@ -43,4 +44,5 @@ def convert(text: str, source: str, target: str,
     output = EMITTERS[target](device, ports, report)
     gaps.unwritten(device, report, target, ports)
     gaps.partly_converted(device.unparsed, report)
+    gaps.shadowed(device, report)
     return output, report

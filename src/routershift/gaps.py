@@ -14,18 +14,20 @@
 from __future__ import annotations
 
 import re
+from dataclasses import fields
 from typing import AbstractSet, Callable, Dict, List, Optional, Set, Tuple
 
 from . import known
 from . import ospf as ospf_text
 from . import routemap as routemap_text
-from .model import Device, Interface, Unparsed
+from .model import Device, Interface, RouteMapEntry, Unparsed
 from .report import Report, Severity, redact
 
 # Writers that write every setting below
 _FULL = ("ios", "eos")
 
-_NAMES = {"aoscx": "AOS-CX", "aoss": "AOS-S", "comware": "Comware", "junos": "Junos", "nxos": "NX-OS"}
+_NAMES = {"aoscx": "AOS-CX", "aoss": "AOS-S", "comware": "Comware", "junos": "Junos", "nxos": "NX-OS",
+          "iosxr": "IOS-XR"}
 
 # The settings below each other writer writes (or reports itself, where the target has no equivalent), by key
 WRITES: Dict[str, Set[str]] = {
@@ -54,6 +56,15 @@ WRITES: Dict[str, Set[str]] = {
              "sflow-options", "netflow-sampling", "banners", "local-logging", "roles", "ssh-keys", "apis",
              "password-length", "syslog-transport", "ptp", "event-handlers", "ospf-auth",
              "ospf-options", "bfd-global", "ecmp-hash"},
+    # IOS-XR: the writer writes these, or reports them itself where IOS-XR has no place for them
+    "iosxr": {"policy-lists", "relay-vrf", "hardening", "svi-mac", "autostate", "unnumbered", "route-tag", "router-id",
+              "bgp-options", "bgp-vrf-ipv6", "bgp-vrf-groups", "bgp-misc", "ospf-auth", "ospf-options", "banners",
+              "local-logging", "syslog-transport", "trap-types", "console-login", "snmp-views", "ssh-keys", "roles",
+              "apis", "password-length", "lldp-options", "anycast-gateway", "leaks", "evpn-vrf", "evpn-domain",
+              "pim-rp", "msdp", "multicast-vrf", "option82", "coa", "event-handlers", "ecmp-hash", "bfd-global",
+              "twamp", "copp", "qos-burst", "mirror-acl", "sflow-options", "netflow-sampling", "trunk-groups", "ptp",
+              "macsec", "mac-acl", "queuing", "igmp-querier", "evpn-instances", "vxlan-mcast", "evpn-domain",
+              "mlag-options", "stackwise", "evpn-es", "dot1x-fail-vlan"},
 }
 
 Option = Tuple[str, str, object]  # (key, what the report calls it, whether the device has it)
@@ -349,3 +360,25 @@ def partly_converted(entries: List[Unparsed], report: Report) -> None:
         where = f" (see {', '.join(sorted(set(groups)))} below)" if all(groups) else " (listed below)"
         report.add(kind, name, Severity.REVIEW, "partly-converted",
                    f"not every line of it is converted: line {'; line '.join(shown)}{more}{where}")
+
+
+def _matches_all(entry: RouteMapEntry) -> bool:
+    return not entry.unconverted and not any(getattr(entry, f.name) for f in fields(entry)
+                                             if f.name.startswith("match_"))
+
+
+def shadowed(device: Device, report: Report) -> None:
+    """A route map entry without a match applies to every route, so the entries after it never do. The writers copy
+    that faithfully; the report says so, as it is usually a mistake in the source (or a match a converter lost)."""
+    for rm in device.route_maps.values():
+        item = routemap_text.label(rm.name, "route-map")
+        if ("policy", item) not in report.items:
+            continue
+        for n, entry in enumerate(rm.entries[:-1]):
+            if _matches_all(entry):
+                rest = [str(e.seq) for e in rm.entries[n + 1:]]
+                later = ("entry " if len(rest) == 1 else "entries ") + ", ".join(rest)
+                report.add("policy", item, Severity.REVIEW, "rm-shadowed",
+                           f"entry {entry.seq} ({entry.action.value}) has no match, so it takes every route and "
+                           f"{later} never {'applies' if len(rest) == 1 else 'apply'}; check the source")
+                break

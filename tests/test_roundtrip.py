@@ -67,6 +67,6 @@ def test_command_line(tmp_path, capsys) -> None:  # type: ignore[no-untyped-def]
     capsys.readouterr()
     assert main(["roundtrip", str(path), "--from", "eos", "--via", "all", "--report-format", "json"]) == 0
     trips = json.loads(capsys.readouterr().out)
-    assert sorted(t["via"] for t in trips) == ["aoscx", "aoss", "comware", "ios", "junos", "nxos"]
+    assert sorted(t["via"] for t in trips) == ["aoscx", "aoss", "comware", "ios", "iosxr", "junos", "nxos"]
     assert main(["roundtrip", str(path), "--from", "eos", "--via", "all"]) == 0
     assert capsys.readouterr().out.startswith("Round trips:\n  eos -> ios -> eos:")

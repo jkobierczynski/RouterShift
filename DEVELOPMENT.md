@@ -71,7 +71,7 @@ src/routershift/
   gaps.py           the checks that run after every writer
   known.py          lines recognised but not converted, with the reason
   partial.py        "not written for <platform> yet" reports for writers that cover part of the model
-  confparse.py      the indented-block parser the Cisco-style readers share (IOS, EOS, NX-OS, AOS-CX)
+  confparse.py      the indented-block parser the Cisco-style readers share (IOS, EOS, NX-OS, IOS-XR, AOS-CX)
   junostext.py      Junos braces and set lines, read and written
   parsers/          one reader per platform: text -> model.Device
                     (ioslike.py serves IOS, EOS and NX-OS)
@@ -81,7 +81,7 @@ src/routershift/
                     vxlan.py, qos.py, ... including the "not supported on <platform>" reports
   <platform><area>.py
                     the larger platform-specific parts of a reader and writer, kept out of the main files:
-                    junosrouting.py, aoscxsec.py, nxosfabric.py, ...
+                    junosrouting.py, aoscxsec.py, nxosfabric.py, iosxrpolicy.py, ...
 tests/
   data/             sample configurations, at least one per platform
   helpers.py        sample() loads a file from data/

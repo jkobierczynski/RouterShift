@@ -22,6 +22,7 @@ SUPPORTED: Dict[str, Set[str]] = {
     "aoss": {"vrrp"},
     "comware": {"vrrp"},
     "nxos": {"hsrp", "vrrp"},
+    "iosxr": {"hsrp", "vrrp"},
     "junos": {"vrrp", "anycast"},
 }
 

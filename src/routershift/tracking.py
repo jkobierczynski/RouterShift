@@ -13,9 +13,9 @@ from .model import Device, IpSla, Track
 from .report import Report, Severity
 
 KIND = "track"
-SLA_PLATFORMS = ("ios", "comware", "nxos")  # IP SLA / NQA
-TRACK_PLATFORMS = ("ios", "eos", "comware", "aoscx", "nxos")
-ROUTE_TRACK_PLATFORMS = ("ios", "comware", "nxos")
+SLA_PLATFORMS = ("ios", "comware", "nxos", "iosxr")  # IP SLA / NQA
+TRACK_PLATFORMS = ("ios", "eos", "comware", "aoscx", "nxos", "iosxr")
+ROUTE_TRACK_PLATFORMS = ("ios", "comware", "nxos", "iosxr")
 NUMBERED = ("ios", "comware", "aoscx", "nxos")  # the others name their tracked objects
 DEFAULT_DECREMENT = 10
 
@@ -61,13 +61,13 @@ def plan(device: Device, report: Report, platform: str, label: str) -> Plan:
     the target in the messages. Static routes and gateway groups that lose their tracking are reported here too."""
     out = Plan()
     numbered = platform in NUMBERED
-    sla_numbers = _numbers(device.ip_slas, 2147483647)
+    sla_numbers = _numbers(device.ip_slas, 2147483647 if platform != "iosxr" else 2048)
     for sla in device.ip_slas.values():
         report.item(KIND, sla_label(sla))
         if platform not in SLA_PLATFORMS:
             report.skip(KIND, sla_label(sla), "sla-unsupported", f"{label} has no IP SLA probes; left out")
             continue
-        out.slas[sla.name] = sla_numbers[sla.name] if platform in ("ios", "nxos") else sla.name
+        out.slas[sla.name] = sla_numbers[sla.name] if platform in ("ios", "nxos", "iosxr") else sla.name
         if out.slas[sla.name] != sla.name:
             report.add(KIND, sla_label(sla), Severity.APPROX, "sla-number", f"written as {out.slas[sla.name]}")
     track_numbers = _numbers(device.tracks, 1000)
