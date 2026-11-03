@@ -39,6 +39,7 @@ from .. import stp as stp_text
 from .. import qos as qos_text
 from .. import snmp as snmp_text
 from .. import aaa as aaa_text
+from .. import aossextra as extra
 from ..model import Device, FhrpGroup, Interface, InterfaceKind, LacpMode, StaticRoute, StpMode, SwitchportMode, Vlan
 from ..names import PortMapper
 from ..parsers.ioslike import _vlan_ids
@@ -138,6 +139,7 @@ class Writer:
         if self.device.bgp is not None:
             self.report.skip("bgp", f"bgp {self.device.bgp.local_as}", "bgp",
                              "not written: BGP on AOS-S depends on the model and release; configure it by hand")
+        extra.unwritable(self.device, self.report, self.port)
         self.report.unparsed(self.device.unparsed)
         return "\n".join(self.out) + "\n"
 
@@ -258,7 +260,7 @@ class Writer:
             rep.item("system", "name servers")
         hosts_text.dns_unsupported(self.device, rep, "AOS-S")
         for host in s.syslog_servers:
-            self.out.append(f"logging {host}")
+            self.out.append(f"logging {host}{extra.syslog_suffix(self.device, host)}")
         if s.syslog_servers:
             rep.item("system", "syslog servers")
         if s.logging_level is not None:
@@ -279,9 +281,12 @@ class Writer:
             rep.add("system", "service vrf", Severity.APPROX, "oobm",
                     "the source reaches its servers through the management VRF; AOS-S picks the out-of-band port "
                     "by route, so check that the servers are reachable from oobm")
-        if s.banner_motd:
-            self.out.append(f"banner motd {_quote(s.banner_motd)}")
+        if s.banner_motd or s.banner_login:
+            self.out.append(f"banner motd {_quote(s.banner_motd or s.banner_login)}")
             rep.item("system", "banner motd")
+        if s.banner_exec:
+            self.out.append(f"banner exec {_quote(s.banner_exec)}")
+            rep.item("system", "banner exec")
         for vrf in self.device.vrfs:
             if vrf not in self.mgmt_vrfs:
                 rep.add("system", f"vrf {vrf}", Severity.REVIEW, "vrf",
@@ -405,6 +410,7 @@ class Writer:
                     f"AOS-S has no VRFs; the servers listen on every interface (the source used VRF {m.vrf})")
         if m.lldp is not None:
             self.out.append("lldp run" if m.lldp else "no lldp run")
+        self.out += extra.lldp_lines(d, rep)
         if m.cdp is not None:
             self.out.append("cdp run" if m.cdp else "no cdp run")
         for status, tx, rx in (("txonly", True, False), ("rxonly", False, True), ("disable", False, False)):
@@ -451,6 +457,8 @@ class Writer:
                 self.out.append(f"aaa port-access authenticator {name} client-limit {limit}")
             if i.dot1x_reauth:
                 self.out.append(f"aaa port-access authenticator {name} reauth-period {i.dot1x_reauth_period or 3600}")
+            if i.dot1x_fail_vlan is not None:
+                self.out.append(f"aaa port-access authenticator {name} unauth-vid {i.dot1x_fail_vlan}")
         if a.dot1x:
             self.out.append("aaa port-access authenticator active")
             rep.item("management", "802.1X")
@@ -536,6 +544,8 @@ class Writer:
         if any(self.groups.values()):
             self.out += ["router vrrp", f"{_IND}ipv4 enable", f"{_IND}exit"]
         self.ospf()
+        if not self.device.ospf:
+            self.out += extra.router_id(self.device, "")
 
     def trunks(self) -> None:
         lags: Dict[str, List[Interface]] = {}
@@ -788,8 +798,7 @@ class Writer:
             if iface is not None and iface.kind == InterfaceKind.LOOPBACK:
                 add(Severity.REVIEW, "ospf-loopback",
                     f"{name} is in area {dotted} on the source; check that AOS-S advertises the loopback address")
-        if p.router_id:
-            self.out.append(f"ip router-id {p.router_id}")
+        self.out += extra.router_id(self.device, p.router_id)
         lines: List[str] = []
         for dotted in sorted(set(self.ospf_areas.values()) | set(p.area_types), key=ospf_text.area_number):
             kind = p.area_types.get(dotted, "")

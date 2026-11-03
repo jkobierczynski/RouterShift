@@ -206,7 +206,6 @@
  },
  "aoss_edge.cfg via junos": {
   "lost": [
-   "system.banner_motd",
    "system.timezone",
    "system.transfer_source.tftp",
    "vlans.10.igmp_querier",
@@ -1026,7 +1025,6 @@
    "system.ntp_prefer",
    "system.ntp_source",
    "system.logging_source",
-   "system.syslog_transport.10.100.1.50",
    "system.banner_login",
    "system.logging_buffer",
    "system.logging_buffer_level",
@@ -1096,7 +1094,6 @@
    "interfaces.Port-channel30.storm_control.multicast",
    "interfaces.Port-channel30.storm_control.unknown-unicast",
    "interfaces.Port-channel30.mlag_id",
-   "interfaces.Ethernet12/1.dot1x_fail_vlan",
    "interfaces.Ethernet12/1.mac_acl_in",
    "interfaces.Ethernet13/1.ptp",
    "interfaces.Ethernet13/1.ptp_announce_interval",
@@ -1228,8 +1225,6 @@
    "as_path_lists.AS-LONG",
    "management.vrf",
    "management.vty_acl",
-   "management.lldp_timer",
-   "management.lldp_holdtime",
    "management.lldp_mgmt_interface",
    "management.lldp_mgmt_vrf",
    "management.apis.http",
@@ -1344,11 +1339,7 @@
    "snmp.users[0].auth",
    "snmp.users[0].priv"
   ],
-  "unread": [
-   "no untagged Trk1000",
-   "no untagged Trk10",
-   "no untagged Trk20"
-  ]
+  "unread": []
  },
  "eos_border_leaf.cfg via comware": {
   "lost": [
@@ -2227,11 +2218,7 @@
    "mirror_sessions[0].name",
    "qos_policies.SERVERS-QOS.actions[0].burst_bytes"
   ],
-  "unread": [
-   "no untagged 2",
-   "no untagged Trk10",
-   "no untagged Trk20"
-  ]
+  "unread": []
  },
  "eos_leaf.cfg via comware": {
   "lost": [
@@ -3338,7 +3325,6 @@
    "system.dns_hosts.nms-01",
    "system.ntp_prefer",
    "system.ntp_source",
-   "system.banner_login",
    "vrf_info.PROD",
    "interfaces.Port-channel1.description",
    "interfaces.Ethernet0/1/2.mtu",
@@ -3620,9 +3606,7 @@
    "interfaces.Vlan20.fhrp[0].protocol",
    "interfaces.Ethernet1/51.mode"
   ],
-  "unread": [
-   "no untagged 2"
-  ]
+  "unread": []
  },
  "nxos_core.cfg via comware": {
   "lost": [

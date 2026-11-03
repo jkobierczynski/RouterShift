@@ -106,4 +106,4 @@ def test_security_is_reported_on_other_targets() -> None:
     assert "mka policy MACSEC-DCI\n" in out and " mka apply policy MACSEC-DCI\n" in out
     assert "Comware protects its CPU with built-in limits" in text
     out, report = convert(EOS, "eos", "aoss")
-    assert "not written for" in report.to_text()
+    assert "AOS-S has no MAC access lists" in report.to_text() and "not written for AOS-S yet" not in report.to_text()
