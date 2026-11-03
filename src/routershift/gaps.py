@@ -56,6 +56,8 @@ WRITES: Dict[str, Set[str]] = {
              "sflow-options", "netflow-sampling", "banners", "local-logging", "roles", "ssh-keys", "apis",
              "password-length", "syslog-transport", "ptp", "event-handlers", "ospf-auth",
              "ospf-options", "bfd-global", "ecmp-hash"},
+    "comware": {"policy-lists", "bgp-options", "bgp-vrf-ipv6", "bgp-vrf-groups", "ospf-auth", "ospf-options",
+                "route-tag", "router-id", "bfd-global", "ecmp-hash"},
     # IOS-XR: the writer writes these, or reports them itself where IOS-XR has no place for them
     "iosxr": {"policy-lists", "relay-vrf", "hardening", "svi-mac", "autostate", "unnumbered", "route-tag", "router-id",
               "bgp-options", "bgp-vrf-ipv6", "bgp-vrf-groups", "bgp-misc", "ospf-auth", "ospf-options", "banners",

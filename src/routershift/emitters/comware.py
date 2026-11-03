@@ -10,6 +10,7 @@ import ipaddress
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from .. import aaa as aaa_text
+from .. import comwarerouting
 from .. import acl as acl_text
 from .. import dhcp as dhcp_text
 from .. import fhrp
@@ -33,7 +34,7 @@ from .. import routemap as routemap_text
 from .. import mpls as mpls_text
 from .. import qos as qos_text
 from .. import wlan as wlan_text
-from ..model import (AaaMethod, AaaServer, AclAction, AclEntry, BgpNeighbor, Device, FhrpGroup, IpsecPeer, SnmpGroup, Interface, InterfaceKind, LacpMode, NatRule,
+from ..model import (AaaMethod, AaaServer, AclAction, AclEntry, BgpAggregate, BgpNeighbor, Device, FhrpGroup, IpsecPeer, SnmpGroup, Interface, InterfaceKind, LacpMode, NatRule,
                      Ospf, StaticRoute, StpMode, SwitchportMode)
 from ..names import PortMapper
 from ..parsers.comware import COMWARE_ROLES, ranges
@@ -70,6 +71,10 @@ class Writer:
         self.port_access()
         if self.vrrp_v2:
             self.out.append(f"{_IND}vrrp version 2")  # Comware 7 runs VRRPv3 unless told otherwise
+            self.block_end()
+        routing = comwarerouting.global_lines(self.device, self.report)
+        if routing:
+            self.out += [_IND + line for line in routing]
             self.block_end()
         self.vrfs()
         self.vlans()
@@ -923,6 +928,7 @@ class Writer:
                     lines.append(f"poe max-power {limit}")
         if iface.name in bfd_text.ospf_interfaces(self.device):
             lines.append("ospf bfd enable")
+        lines += comwarerouting.ospf_interface(iface, add)
         lines += bfd_text.separate_lines(iface)
         if iface.pbr:
             lines.append(f"ip policy-based-route {iface.pbr}")
@@ -1033,6 +1039,7 @@ class Writer:
             lines.append("default-route-advertise" + (" always" if p.default_originate == "always" else ""))
         if p.reference_bandwidth is not None:
             lines.append(f"bandwidth-reference {p.reference_bandwidth}")
+        lines += comwarerouting.ospf_lines(p, self.report, ospf_text.label(p))
         areas = {n.area for n in p.networks} | set(p.area_types)
         for dotted in sorted(areas, key=ospf_text.area_number):
             lines.append(f"area {dotted}")
@@ -1271,6 +1278,7 @@ class Writer:
     def policies(self) -> None:
         """Prefix lists, then the route policies that match them."""
         routemap_text.items(self.device, self.report)
+        self.out += routemap_text.comware_list_lines(self.device, self.report)
         for pl in self.device.prefix_lists.values():
             self.out += routemap_text.comware_prefix_lines(pl)
         if self.device.prefix_lists:
@@ -1298,6 +1306,13 @@ class Writer:
         lines: List[str] = []
         if bgp.router_id:
             lines.append(f"router-id {bgp.router_id}")
+        if bgp.keepalive is not None or bgp.hold is not None:
+            keepalive = bgp.keepalive if bgp.keepalive is not None else 60
+            lines.append(f"timer keepalive {keepalive} hold {bgp.hold if bgp.hold is not None else 3 * keepalive}")
+        if bgp.graceful_restart:
+            lines.append("graceful-restart")
+            if bgp.graceful_restart_time is not None:
+                lines.append(f"graceful-restart timer restart {bgp.graceful_restart_time}")
         for group in bgp.peer_groups.values():
             kind = "internal" if group.remote_as == bgp.local_as else "external"
             lines.append(f"group {group.address} {kind}")
@@ -1329,9 +1344,12 @@ class Writer:
                 if af in peer.families:
                     body.append(f"peer {peer.address} enable")
                     body += self._bgp_af_options(peer)
+            body += self._aggregates(bgp.aggregates, af)
             if af == "ipv4":
                 body += [f"balance {bgp.maximum_paths}"] if bgp.maximum_paths else []
                 body += [f"balance ibgp {bgp.maximum_paths_ibgp}"] if bgp.maximum_paths_ibgp else []
+                body += ["balance as-path-relax"] if bgp.multipath_relax else []
+                body += ["preference " + " ".join(str(x) for x in bgp.distance)] if bgp.distance else []
             if body:
                 lines.append(f"address-family {af} unicast")
                 lines += [_IND + line for line in body]
@@ -1339,26 +1357,60 @@ class Writer:
             self.report.item("bgp", f"bgp vrf {name}")
             lines.append(f"ip vpn-instance {name}")
             body = []
+            body6: List[str] = []
+            for group in v.peer_groups.values():
+                kind = "internal" if group.remote_as == bgp.local_as else "external"
+                lines += [f"{_IND}group {group.address} {kind}"] + [_IND + line for line in self._bgp_peer(group)]
+                members = [p for p in v.neighbors if p.peer_group == group.address]
+                if any("ipv4" in p.families for p in members):
+                    body += self._bgp_af_options(group)
+                if any("ipv6" in p.families for p in members):
+                    body6 += self._bgp_af_options(group)
             for peer in v.neighbors:
+                if peer.peer_group and peer.peer_group not in v.peer_groups:
+                    peer = bgp_text.effective(bgp, peer, v)  # a Comware VRF refers only to its own groups
+                    peer.peer_group = ""
                 label = f"neighbor {peer.address} (vrf {name})"
                 self.report.item("bgp", label)
                 bgp_text.unwritten(peer, set(bgp_text.OPTIONS), self.report, label, "Comware")
+                if peer.peer_group:
+                    lines.append(f"{_IND}peer {peer.address} group {peer.peer_group}")
                 lines += [_IND + line for line in self._bgp_peer(peer)]
-                body += [f"peer {peer.address} enable"] + self._bgp_af_options(peer)
+                target = body6 if "ipv6" in peer.families and "ipv4" not in peer.families else body
+                target += [f"peer {peer.address} enable"] + self._bgp_af_options(peer)
             for prefix in v.networks:
                 net = ipaddress.ip_network(prefix)
-                body.append(f"network {net.network_address} {net.netmask}")
+                if net.version == 6:
+                    body6.append(f"network {net.network_address} {net.prefixlen}")
+                else:
+                    body.append(f"network {net.network_address} {net.netmask}")
             for source in v.redistribute:
                 rm = v.redistribute_maps.get(source)
                 body.append(f"import-route {'direct' if source == 'connected' else source}" +
                             (f" route-policy {rm}" if rm else ""))
+            body6 += [f"import-route {'direct' if source == 'connected' else source}" for source in v.redistribute6]
+            body += self._aggregates(v.aggregates, "ipv4")
+            body6 += self._aggregates(v.aggregates, "ipv6")
             body += [f"balance {v.maximum_paths}"] if v.maximum_paths else []
-            if body:
-                lines.append(f"{_IND}address-family ipv4 unicast")
-                lines += [_IND * 2 + line for line in body]
+            for af, af_body in (("ipv4", body), ("ipv6", body6)):
+                if af_body:
+                    lines.append(f"{_IND}address-family {af} unicast")
+                    lines += [_IND * 2 + line for line in af_body]
         self.out.append(f"bgp {bgp.local_as}")
         self.out += [_IND + line for line in lines]
         self.block_end()
+
+    @staticmethod
+    def _aggregates(aggregates: List[BgpAggregate], af: str) -> List[str]:
+        lines = []
+        for a in aggregates:
+            net = ipaddress.ip_network(a.prefix)
+            if (net.version == 6) != (af == "ipv6"):
+                continue
+            mask = str(net.netmask) if net.version == 4 else str(net.prefixlen)
+            lines.append(" ".join(["aggregate", str(net.network_address), mask] +
+                                  (["as-set"] if a.as_set else []) + (["detail-suppressed"] if a.summary_only else [])))
+        return lines
 
     def _bgp_peer(self, peer: BgpNeighbor) -> List[str]:
         pre = f"peer {peer.address}"
@@ -1478,6 +1530,8 @@ class Writer:
             words += ["track", self.track_plan.route_track(route.track)]
         if route.distance is not None:
             words += ["preference", str(route.distance)]
+        if route.tag is not None:
+            words += ["tag", str(route.tag)]
         if route.name:
             words += ["description", route.name]
         return " ".join(words)

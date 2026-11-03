@@ -38,9 +38,10 @@ from .. import qos as qos_text
 from .. import vpn as vpn_text
 from ..confparse import Node
 from ..errors import ParseError
-from ..model import (BgpVrf, IpSla, Netflow, Sflow, AaaGroup, AaaMethod, AaaServer, Acl, AclAction, AclEntry, Device, DhcpPool, FhrpGroup, IkePolicy, IpsecPeer, IpsecTransform,
+from ..model import (BgpAggregate, BgpVrf, IpSla, Netflow, Sflow, AaaGroup, AaaMethod, AaaServer, Acl, AclAction, AclEntry, Device, DhcpPool, FhrpGroup, IkePolicy, IpsecPeer, IpsecTransform,
                      NtpKey, PreSharedKey, SnmpCommunity, SnmpGroup, SnmpHost, SnmpUser, Interface, InterfaceKind, LacpMode, LocalUser,
                      NatPool, NatRule, Origin, QosAction, QosClass, QosPolicy, Ospf, Rip, Isis, Wlan, OspfNetwork, StaticRoute, StpMode, SwitchportMode, Unparsed, Vlan)
+from .. import comwarerouting
 from .ioslike import _cidr, _is_address
 
 _PREFIXES: List[Tuple[str, InterfaceKind, str]] = [
@@ -210,6 +211,8 @@ class _Reader:
             "sflow": self.sflow,
             "nqa": self.nqa,
             "track": self.track,
+            "router": lambda n: not n.children and comwarerouting.read_global(self.device, n.words),
+            "bfd": lambda n: not n.children and comwarerouting.read_global(self.device, n.words),
         }
         for node in roots:
             if node.text.startswith(_NOISE):
@@ -844,6 +847,10 @@ class _Reader:
             return self.netstream_export(node, w[3:])
         if w[1:2] == ["prefix-list"]:
             return routemap_text.comware_prefix_entry(self.device, w)
+        if w[1:2] == ["load-sharing"]:
+            return comwarerouting.read_global(self.device, w)
+        if w[1:2] in (["community-list"], ["as-path"]):
+            return routemap_text.comware_list(self.device, w)
         if w[1:] in (["http", "enable"], ["https", "enable"]):
             setattr(self.device.management, w[1], True)
             return True
@@ -892,6 +899,8 @@ class _Reader:
                 route.distance = int(rest.pop(0))
             elif word == "track" and rest:
                 route.track = rest.pop(0)
+            elif word == "tag" and rest:
+                route.tag = int(rest.pop(0))
             elif word == "description" and rest:
                 route.name = " ".join(rest)
                 rest = []
@@ -1359,7 +1368,8 @@ class _Reader:
         for name, vb in vrfs.items():
             vrf_bgp = vb.finish()
             self.device.bgp.vrfs[name] = BgpVrf(vrf_bgp.neighbors, vrf_bgp.networks, vrf_bgp.redistribute,
-                                                vrf_bgp.redistribute_maps, vrf_bgp.maximum_paths)
+                                                vrf_bgp.redistribute_maps, vrf_bgp.maximum_paths,
+                                                vrf_bgp.peer_groups, vrf_bgp.aggregates, vrf_bgp.redistribute6)
         return True
 
     def _bgp_block(self, b: bgp_text.Builder, children: List[Node], section: str,
@@ -1391,6 +1401,22 @@ class _Reader:
         bgp = b.bgp
         if w[0] == "router-id" and n == 2:
             bgp.router_id = str(ipaddress.IPv4Address(w[1]))
+        elif w[:2] == ["timer", "keepalive"] and n == 5 and w[3] == "hold" and not af:
+            bgp.keepalive, bgp.hold = int(w[2]), int(w[4])
+        elif w == ["graceful-restart"] and not af:
+            bgp.graceful_restart = True
+        elif w[:3] == ["graceful-restart", "timer", "restart"] and n == 4 and not af:
+            bgp.graceful_restart_time = int(w[3])
+        elif w[0] == "preference" and n == 4 and af and all(x.isdigit() for x in w[1:]):
+            bgp.distance = (int(w[1]), int(w[2]), int(w[3]))
+        elif w == ["balance", "as-path-relax"] and af:
+            bgp.multipath_relax = True
+        elif w[0] == "aggregate" and n >= 3 and af:
+            options = w[3:]
+            if any(o not in ("detail-suppressed", "as-set") for o in options):
+                return False
+            bgp.aggregates.append(BgpAggregate(str(ipaddress.ip_network(f"{w[1]}/{w[2]}")),
+                                               "detail-suppressed" in options, "as-set" in options))
         elif w[0] == "group" and n in (2, 3) and w[2:] in ([], ["external"], ["internal"]):
             group = b.peer(w[1], group=True)
             if w[2:] == ["internal"]:
@@ -1512,6 +1538,8 @@ class _Reader:
             p.default_originate = "always" if n == 2 else "on"
         elif w[0] == "bandwidth-reference" and n == 2:
             p.reference_bandwidth = int(w[1])
+        elif comwarerouting.read_ospf_line(p, w):
+            pass
         else:
             return False
         return True
@@ -1700,6 +1728,8 @@ class _Reader:
             iface.igmp_version = int(w[2])
         elif w == ["ospf", "bfd", "enable"]:
             iface.ospf_bfd = True
+        elif comwarerouting.read_ospf_interface(iface, w):
+            pass
         elif w[:2] == ["isis", "enable"] and n in (2, 3):
             iface.isis = True
         elif w == ["isis", "silent"]:
