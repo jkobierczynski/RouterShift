@@ -267,7 +267,7 @@ def test_converts_and_reads_back(source: str, target: str) -> None:
         assert back.bgp is not None
         assert (back.bgp.local_as, back.bgp.router_id) == (first.bgp.local_as, first.bgp.router_id)
         expected = bgp_text.flat(first.bgp)
-        if target == "comware":  # EVPN is reported, not written
+        if target == "comware" and first.vxlan is None:  # EVPN without VXLAN is reported, not written
             for n in expected:
                 n.families = [f for f in n.families if f != "evpn"]
         assert bgp_text.flat(back.bgp) == expected
@@ -284,11 +284,12 @@ def test_converts_and_reads_back(source: str, target: str) -> None:
     else:
         assert leaking(back) == leaking(first)
     # a multi-chassis LAG pair (EOS MLAG, AOS-CX VSX) keeps its peer link and shared LAGs on EOS and AOS-CX
-    if (first.mlag is not None or vrfs_text.mlag_members(first)) and target in ("eos", "aoscx"):
+    if (first.mlag is not None or vrfs_text.mlag_members(first)) and target in ("eos", "aoscx", "comware") \
+            and not (first.mlag is not None and first.mlag.stack):
         assert back.mlag is not None and first.mlag is not None
         assert back.interfaces[back.mlag.peer_link].kind == InterfaceKind.LAG
         assert len(vrfs_text.mlag_members(back)) == len(vrfs_text.mlag_members(first))
-        if back.mlag.peer_address:
+        if back.mlag.peer_address:  # Comware keeps the pair alive by its keepalive (the heartbeat)
             assert back.mlag.peer_address == first.mlag.peer_address
     elif first.mlag is not None and target == "ios":  # StackWise Virtual, the nearest it has
         assert back.mlag is not None and back.mlag.stack and "StackWise Virtual" in report.to_text()
@@ -446,8 +447,8 @@ def test_converts_and_reads_back(source: str, target: str) -> None:
     assert sorted(i.poe_max_mw for i in on(back) if i.poe_max_mw) == \
         (sorted(i.poe_max_mw for i in on(first) if i.poe_max_mw) if target in ("ios", "eos", "comware") else [])
     # VXLAN keeps its source, the VNIs of VLANs and VRFs (IOS: VLANs only), the static flood list and the VLANs EVPN
-    # advertises (IOS, EOS, AOS-CX)
-    if first.vxlan is None or target in ("aoss", "comware"):
+    # advertises (IOS, EOS, AOS-CX, Comware)
+    if first.vxlan is None or target == "aoss":
         assert back.vxlan is None
     else:
         fx, bx = first.vxlan, back.vxlan

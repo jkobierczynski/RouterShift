@@ -40,9 +40,9 @@ def test_writers() -> None:
 
 
 def test_reports() -> None:
-    _, report = convert(sample("eos_leaf.cfg"), "eos", "comware")
+    _, report = convert(sample("eos_leaf.cfg"), "eos", "aoss")
     text = report.to_text()
-    assert "Comware: VXLAN (VNIs 10100, 10200, 50001) is not written" in text
-    assert "Comware: the EVPN address family of 10.255.255.9 is not written" in text
+    assert "AOS-S: VXLAN (VNIs 10100, 10200, 50001) is not written" in text
+    assert "AOS-S: the EVPN address family of 10.255.255.9 is not written" in text
     _, report = convert(sample("eos_leaf.cfg"), "eos", "ios")
     assert "VNI 50001 (PROD) in VLAN 3900" in report.to_text()

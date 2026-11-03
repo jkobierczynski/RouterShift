@@ -80,6 +80,17 @@ platform converts to and from all the others.
 * The out-of-band port is the `oobm` block; a layer 2 switch with a single default route gets `ip default-gateway`.
 * Time zones are a fixed offset in minutes (`time timezone 60`), read as `UTC+01:00`; IOS takes the same offset,
   a tz database zone (EOS, AOS-CX) does not convert to it and is reported.
+* The router ID is the global `ip router-id` (OSPF uses it). Syslog servers keep their transport (`logging A tls
+  6514`), LLDP its timers (`lldp refresh-interval`, `lldp holdtime-multiplier`, the hold time as a multiple of the
+  interval), 802.1X its fail VLAN (`aaa port-access authenticator P unauth-vid N`) and the exec banner is `banner
+  exec`. A login banner becomes the motd when there is none.
+* A trunk that does not allow its native VLAN is `no untagged` in VLAN 1, read back as such.
+* What AOS-S has no form for is reported with what it has instead, so nothing is left as "not written for AOS-S yet":
+  EVPN and its instances, the anycast gateway (VRRP), the switch pair options (distributed trunking or VSF), the
+  DSCP map and queuing profiles (`qos dscp-map`, `qos queue-config`), CoPP, MACsec, MAC ACLs, option 82, RADIUS CoA,
+  the IGMP querier settings, TWAMP, mirror ACLs, local logging, the console login list, notification types, roles,
+  SSH keys, SNMP views, the APIs, the password length, PTP, event handlers, OSPF authentication and options, route
+  tags, ECMP hashing and the BFD timers. BGP is not converted to AOS-S, and its options and lists go with it.
 
 ### Comware specifics
 
@@ -92,6 +103,22 @@ platform converts to and from all the others.
   `link-aggregation mode dynamic` means LACP.
 * BPDU protection is global (`stp bpdu-protection`) and guards every edge port.
 * VRFs are VPN instances, the management VRF included: `M-GigabitEthernet0/0/0` is bound to one like any port.
+* VXLAN: a VLAN carried in a VNI becomes `vsi VLANn` with `vxlan VNI` and `evpn encapsulation vxlan` (route
+  distinguisher, `vpn-target`), its SVI `interface Vsi-interfaceN` (`gateway vsi-interface N`, read back as VlanN),
+  and the ports join it with `service-instance` / `encapsulation s-vid` / `xconnect vsi`. The source address is
+  `tunnel global source-address`, static flood peers are VXLAN tunnels, the anycast gateway is
+  `distributed-gateway local` with the shared MAC, and a layer 3 VNI is a `Vsi-interface` (3900 downwards) with
+  `l3-vni` in the VPN instance. BGP EVPN is `address-family l2vpn evpn`.
+* The switch pair is M-LAG: `m-lag system-number`, `m-lag keepalive ip destination A vpn-instance V`, `m-lag
+  restore-delay`, `m-lag mad default-action`, `port m-lag peer-link 1` and `port m-lag group N`; an EVPN ethernet
+  segment is `esi`.
+* Also written and read back: MACsec (`mka policy`, `mka apply policy`), MAC ACLs (`acl mac name`), the DSCP map
+  (`qos map-table dscp-lp`) and queuing profiles (`qos qmprofile`), rendezvous points with group ACLs, anycast RP,
+  MSDP and multicast in VPN instances, the IGMP querier, community and AS-path lists (`ip community-list`, `ip
+  as-path`), BGP options and VRF peer groups (flattened when the group is not in the VPN instance), OSPF
+  authentication and options, the global router ID, BFD multihop, ECMP hashing, route tags, banners (`header`),
+  local logging (`info-center`), syslog ports, LLDP timers, the password length (`password-control`), the APIs,
+  SNMP views and engine ID, and RADIUS CoA. Nothing is left as "not written for Comware yet" except IKEv2.
 
 ### Junos specifics
 
@@ -450,7 +477,8 @@ platform converts to and from all the others.
   `vlan N` in `router bgp` (`rd auto`, `route-target both auto`, `redistribute learned`), AOS-CX `evpn` / `vlan N`,
   IOS `l2vpn evpn instance N vlan-based` and `member evpn-instance N vni V`. Explicit route targets are listed under
   "Not understood".
-* AOS-S and Comware VXLAN and EVPN are reported, not written.
+* Comware VXLAN and EVPN are written as VSIs (see "Comware specifics"). AOS-S VXLAN and EVPN are reported, not
+  written.
 
 ## RIP and IS-IS
 
@@ -501,8 +529,8 @@ platform converts to and from all the others.
   `interface lag N multi-chassis`.
 * Reported limits: VSX has no domain name and EOS no role (primary is written to AOS-CX, to be swapped on the peer);
   the EOS peer address on the peer-link SVI becomes the VSX keepalive, which VSX prefers outside the inter-switch
-  link. IOS (StackWise Virtual), AOS-S (distributed trunking) and Comware (IRF, DRNI) pair switches in other ways,
-  left to a person.
+  link. Comware writes the pair as M-LAG (see "Comware specifics"). IOS (StackWise Virtual) and AOS-S (distributed
+  trunking) pair switches in other ways, left to a person.
 
 ## Management access, logging, LLDP and CDP
 

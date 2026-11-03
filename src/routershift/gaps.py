@@ -56,6 +56,23 @@ WRITES: Dict[str, Set[str]] = {
              "sflow-options", "netflow-sampling", "banners", "local-logging", "roles", "ssh-keys", "apis",
              "password-length", "syslog-transport", "ptp", "event-handlers", "ospf-auth",
              "ospf-options", "bfd-global", "ecmp-hash"},
+    "comware": {"policy-lists", "bgp-options", "bgp-vrf-ipv6", "bgp-vrf-groups", "ospf-auth", "ospf-options",
+                "route-tag", "router-id", "bfd-global", "ecmp-hash", "anycast-gateway", "evpn-instances", "evpn-domain",
+                "mlag-options", "stackwise", "trunk-groups", "leaks", "evpn-vrf", "evpn-es", "vxlan-mcast", "bgp-misc",
+                "banners", "local-logging", "syslog-transport", "lldp-options", "password-length", "apis",
+                "snmp-views", "trap-types", "roles", "ssh-keys", "console-login", "ptp", "event-handlers", "twamp",
+                "mirror-acl", "sflow-options", "netflow-sampling", "qos-burst", "queuing", "copp", "macsec", "mac-acl",
+                "hardening", "svi-mac", "autostate", "unnumbered", "dot1x-fail-vlan", "relay-vrf", "option82", "coa",
+                "pim-rp", "msdp", "multicast-vrf", "igmp-querier"},
+    # AOS-S: the writer writes these or reports them (aossextra); BGP is not converted, so its options go with it
+    "aoss": {"policy-lists", "anycast-gateway", "relay-vrf", "hardening", "svi-mac", "autostate", "unnumbered",
+             "dot1x-fail-vlan", "option82", "evpn-instances", "vxlan-mcast", "evpn-domain", "mlag-options",
+             "stackwise", "trunk-groups", "leaks", "evpn-vrf", "evpn-es", "bgp-options", "bgp-vrf-ipv6",
+             "bgp-vrf-groups", "bgp-misc", "router-id", "pim-rp", "msdp", "multicast-vrf", "igmp-querier", "queuing",
+             "copp", "macsec", "mac-acl", "coa", "lldp-options", "twamp", "mirror-acl", "sflow-options",
+             "netflow-sampling", "banners", "local-logging", "roles", "ssh-keys", "snmp-views", "apis",
+             "password-length", "syslog-transport", "trap-types", "console-login", "ptp", "event-handlers",
+             "ospf-auth", "route-tag", "ospf-options", "bfd-global", "ecmp-hash"},
     # IOS-XR: the writer writes these, or reports them itself where IOS-XR has no place for them
     "iosxr": {"policy-lists", "relay-vrf", "hardening", "svi-mac", "autostate", "unnumbered", "route-tag", "router-id",
               "bgp-options", "bgp-vrf-ipv6", "bgp-vrf-groups", "bgp-misc", "ospf-auth", "ospf-options", "banners",
@@ -70,7 +87,7 @@ WRITES: Dict[str, Set[str]] = {
 Option = Tuple[str, str, object]  # (key, what the report calls it, whether the device has it)
 
 
-def _interface_item(report: Report, iface: Interface, port: Callable[[str], str]) -> str:
+def interface_item(report: Report, iface: Interface, port: Callable[[str], str]) -> str:
     source = iface.source_name or iface.name
     for kind, name in report.items:
         if kind == "interface" and name.startswith(f"{source} -> "):
@@ -93,7 +110,7 @@ def unwritten(device: Device, report: Report, target: str, port: Callable[[str],
         return [what for key, what, stated in options if stated and key not in written]
 
     for iface in device.interfaces.values():
-        label = _interface_item(report, iface, port)
+        label = interface_item(report, iface, port)
         if (iface.virtual_ipv4 or iface.virtual_ipv6) and "anycast-gateway" not in written:
             add("interface", label, "anycast gateway " + ", ".join(iface.virtual_ipv4 + iface.virtual_ipv6) +
                 (f" (shared MAC {device.anycast_mac})" if device.anycast_mac else "") + ":")
@@ -283,7 +300,7 @@ def later_features(device: Device, report: Report, port: Callable[[str], str],
             found.append(("bgp", f"bgp {bgp.local_as}", ", ".join(options) + ":", Severity.APPROX))
     # (new device-level settings go above this line)
     for iface in device.interfaces.values():
-        label = _interface_item(report, iface, port)
+        label = interface_item(report, iface, port)
         options = missing([("evpn-es", "the EVPN ethernet segment", iface.evpn_esi),
                            ("evpn-es", "the LACP system ID", iface.lacp_system_id),
                            ("svi-mac", "the SVI MAC address", iface.mac_address),

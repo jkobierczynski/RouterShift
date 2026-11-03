@@ -31,6 +31,7 @@ from .. import mgmt as mgmt_text
 from .. import vrfs as vrfs_text
 from .. import igp as igp_text
 from .. import monitor as monitor_text
+from .. import multicast as multicast_text
 from .. import tracking as tracking_text
 from .. import bfd as bfd_text
 from .. import routemap as routemap_text
@@ -38,9 +39,13 @@ from .. import qos as qos_text
 from .. import vpn as vpn_text
 from ..confparse import Node
 from ..errors import ParseError
-from ..model import (BgpVrf, IpSla, Netflow, Sflow, AaaGroup, AaaMethod, AaaServer, Acl, AclAction, AclEntry, Device, DhcpPool, FhrpGroup, IkePolicy, IpsecPeer, IpsecTransform,
+from ..model import (BgpAggregate, BgpVrf, IpSla, Netflow, Sflow, AaaGroup, AaaMethod, AaaServer, Acl, AclAction, AclEntry, Device, DhcpPool, FhrpGroup, IkePolicy, IpsecPeer, IpsecTransform,
                      NtpKey, PreSharedKey, SnmpCommunity, SnmpGroup, SnmpHost, SnmpUser, Interface, InterfaceKind, LacpMode, LocalUser,
                      NatPool, NatRule, Origin, QosAction, QosClass, QosPolicy, Ospf, Rip, Isis, Wlan, OspfNetwork, StaticRoute, StpMode, SwitchportMode, Unparsed, Vlan)
+from .. import comwarefabric
+from .. import comwaremgmt
+from .. import comwaresec
+from .. import comwarerouting
 from .ioslike import _cidr, _is_address
 
 _PREFIXES: List[Tuple[str, InterfaceKind, str]] = [
@@ -53,6 +58,7 @@ _PREFIXES: List[Tuple[str, InterfaceKind, str]] = [
     ("Bridge-Aggregation", InterfaceKind.LAG, ""),
     ("Route-Aggregation", InterfaceKind.LAG, ""),
     ("Vlan-interface", InterfaceKind.VLAN, ""),
+    ("Vsi-interface", InterfaceKind.VLAN, ""),  # the routed interface of a VLAN carried in VXLAN
     ("LoopBack", InterfaceKind.LOOPBACK, ""),
     ("Tunnel", InterfaceKind.TUNNEL, ""),
     ("NULL", InterfaceKind.OTHER, ""),
@@ -145,6 +151,10 @@ class _Reader:
         self._port_based: Set[str] = set()
         self._behaviors: Dict[str, QosAction] = {}
         self._policy_pairs: List[Tuple[QosPolicy, str, str, Node]] = []  # policy, classifier, behavior, line
+        self.fabric = comwarefabric.FabricReader(self.device)
+        self.queuing = comwaresec.QueuingReader(self.device)
+        self.mcast = comwaresec.MulticastReader(self.device)
+        self._psk: Dict[str, Tuple[str, str, int]] = {}
 
     def unparsed(self, node: Node, section: str = "") -> None:
         self.device.unparsed.append(Unparsed(node.line, node.text, section))
@@ -158,6 +168,10 @@ class _Reader:
         for banner in banners:
             if banner.kind == "motd":
                 self.device.system.banner_motd = banner.text
+            elif banner.kind == "login":
+                self.device.system.banner_login = banner.text
+            elif banner.kind == "shell":
+                self.device.system.banner_exec = banner.text
             else:
                 self.device.unparsed.append(Unparsed(banner.line, f"header {banner.kind}", "banner"))
         handlers: Dict[str, Callable[[Node], bool]] = {
@@ -210,6 +224,18 @@ class _Reader:
             "sflow": self.sflow,
             "nqa": self.nqa,
             "track": self.track,
+            "vsi": self.vsi,
+            "mka": self.mka,
+            "msdp": self.msdp,
+            "password-control": lambda n: not n.children and comwaremgmt.read_global(self.device, n.words),
+            "netconf": lambda n: not n.children and comwaremgmt.read_global(self.device, n.words),
+            "grpc": lambda n: not n.children and comwaremgmt.read_global(self.device, n.words),
+            "restful": lambda n: not n.children and comwaremgmt.read_global(self.device, n.words),
+            "l2vpn": lambda n: not n.children and self.fabric.global_line(n.words),
+            "tunnel": lambda n: not n.children and self.fabric.global_line(n.words),
+            "m-lag": lambda n: not n.children and self.fabric.mlag(n.words),
+            "router": lambda n: not n.children and comwarerouting.read_global(self.device, n.words),
+            "bfd": lambda n: not n.children and comwarerouting.read_global(self.device, n.words),
         }
         for node in roots:
             if node.text.startswith(_NOISE):
@@ -325,6 +351,8 @@ class _Reader:
             return True
         if w[1:3] == ["sys-info", "version"]:
             return True
+        if comwaremgmt.read_snmp(self.device, w):
+            return True
         if w[1:3] == ["trap", "enable"]:
             s.traps = True
             return True
@@ -433,6 +461,12 @@ class _Reader:
         protocol = "radius" if w[0] == "radius" else "tacacs"
         if w[1] == "nas-ip" and len(w) == 3:
             self._nas_ip[protocol] = (w[2], node.line)
+            return True
+        if w == ["radius", "dynamic-author", "server"]:
+            self.device.aaa.coa = True
+            for child in node.children:
+                if child.words[0] != "client":
+                    self.unparsed(child, node.text)
             return True
         if w[1] != "scheme" or len(w) != 3:
             return False
@@ -579,6 +613,8 @@ class _Reader:
         red = "discard"
         while args:
             if args[0] in ("cbs", "ebs") and len(args) >= 2:
+                if args[0] == "cbs":
+                    action.burst_bytes = int(args[1])
                 args = args[2:]
             elif args[0] in ("green", "yellow", "red") and len(args) >= 2:
                 if args[0] == "red":
@@ -593,6 +629,12 @@ class _Reader:
     def qos_policy(self, node: Node) -> bool:
         """qos policy NAME: classifier C behavior B"""
         w = node.words
+        for read in (self.queuing.map_table, self.queuing.qmprofile):
+            left = read(w, [c.words for c in node.children])
+            if left is not None:
+                for n in left:
+                    self.unparsed(node.children[n], node.text)
+                return True
         if w[1] != "policy" or len(w) != 3:
             return False
         policy = QosPolicy(w[2], origin=Origin(node.line, node.text))
@@ -669,7 +711,7 @@ class _Reader:
         if w in (["ssh", "server", "enable"], ["telnet", "server", "enable"], ["lldp", "global", "enable"]):
             setattr(self.device.management, w[0], True)
             return True
-        return False
+        return comwaremgmt.read_global(self.device, w)
 
     def undo(self, node: Node) -> bool:
         w = node.words[1:]
@@ -741,10 +783,13 @@ class _Reader:
             return True
         if w[1:2] == ["loghost"]:
             args = self._vpn(w[2:])
+            if len(args) == 3 and args[1] == "port" and _is_address(args[0]):
+                self.device.system.syslog_transport[args[0]] = ("udp", int(args[2]))
+                args = args[:1]
             if len(args) == 1 and _is_address(args[0]):
                 self.device.system.syslog_servers.append(args[0])
                 return True
-        return w[1:] == ["enable"]
+        return w[1:] == ["enable"] or comwaremgmt.read_info_center(self.device, w)
 
     def route_policy(self, node: Node) -> bool:
         """route-policy NAME permit|deny node N, with if-match and apply lines."""
@@ -769,7 +814,27 @@ class _Reader:
             self.unparsed(child, node.text)
         return True
 
+    def mka(self, node: Node) -> bool:
+        if node.words[:2] != ["mka", "policy"] or len(node.words) != 3:
+            return False
+        for n in comwaresec.read_mka_policy(self.device, node.words[2], [c.words for c in node.children]):
+            self.unparsed(node.children[n], node.text)
+        return True
+
+    def msdp(self, node: Node) -> bool:
+        if node.words != ["msdp"]:
+            return False
+        for child in node.children:
+            if not self.mcast.msdp_line(child.words, lambda x: canonical(x)[0]):
+                self.unparsed(child, node.text)
+        return True
+
     def multicast(self, node: Node) -> bool:
+        if node.words[:3] == ["multicast", "routing", "vpn-instance"] and len(node.words) == 4:
+            multicast_text.vrf(self.device, node.words[3]).routing = True
+            for child in node.children:
+                self.unparsed(child, node.text)
+            return True
         if node.words != ["multicast", "routing"]:
             return False
         self.device.multicast_routing = True
@@ -778,14 +843,14 @@ class _Reader:
         return True
 
     def pim(self, node: Node) -> bool:
-        """pim with static-rp A."""
-        if node.words != ["pim"]:
+        """pim [vpn-instance V] with static-rp A [ACL] and anycast-rp."""
+        vrf = ""
+        if node.words[1:2] == ["vpn-instance"] and len(node.words) == 3:
+            vrf = node.words[2]
+        elif node.words != ["pim"]:
             return False
         for child in node.children:
-            c = child.words
-            if c[0] == "static-rp" and len(c) == 2:
-                self.device.pim_rps.append(str(ipaddress.IPv4Address(c[1])))
-            else:
+            if not self.mcast.pim_line(vrf, child.words):
                 self.unparsed(child, node.text)
         return True
 
@@ -844,6 +909,10 @@ class _Reader:
             return self.netstream_export(node, w[3:])
         if w[1:2] == ["prefix-list"]:
             return routemap_text.comware_prefix_entry(self.device, w)
+        if w[1:2] == ["load-sharing"]:
+            return comwarerouting.read_global(self.device, w)
+        if w[1:2] in (["community-list"], ["as-path"]):
+            return routemap_text.comware_list(self.device, w)
         if w[1:] in (["http", "enable"], ["https", "enable"]):
             setattr(self.device.management, w[1], True)
             return True
@@ -861,6 +930,19 @@ class _Reader:
                     values = c[1:-1] if direction else c[1:]
                     for value in values:
                         vrfs_text.route_target(info, direction or "both", value)
+                elif c == ["address-family", "evpn"]:
+                    info.rt_evpn = True
+                    for line in child.children:
+                        x = line.words
+                        if x[0] == "vpn-target" and len(x) >= 2:
+                            kinds = {"import-extcommunity": "import", "export-extcommunity": "export", "both": "both"}
+                            direction = kinds.get(x[-1], "")
+                            for value in (x[1:-1] if direction else x[1:]):
+                                vrfs_text.route_target(info, direction or "both", value)
+                        else:
+                            self.unparsed(line, node.text)
+                elif c[:2] == ["export", "route-policy"] and len(c) == 3:
+                    info.export_map = c[2]
                 elif c[0] != "description":
                     self.unparsed(child, node.text)
             return True
@@ -892,6 +974,8 @@ class _Reader:
                 route.distance = int(rest.pop(0))
             elif word == "track" and rest:
                 route.track = rest.pop(0)
+            elif word == "tag" and rest:
+                route.tag = int(rest.pop(0))
             elif word == "description" and rest:
                 route.name = " ".join(rest)
                 rest = []
@@ -924,6 +1008,8 @@ class _Reader:
                     vlan.igmp_snooping = True
                 elif child.text == "igmp-snooping querier":
                     vlan.igmp_querier = True
+                elif self.mcast.querier_line(vid, child.words):
+                    pass
                 elif vid == ids[0]:
                     self.unparsed(child, node.text)
         return True
@@ -1020,6 +1106,10 @@ class _Reader:
     def acl(self, node: Node) -> bool:
         """acl [ipv6] advanced|basic name NAME, acl [ipv6] advanced 3000, acl number 3000 [name NAME]."""
         w = node.words[1:]
+        if w[:2] == ["mac", "name"] and len(w) == 3:
+            for n in comwaresec.read_mac_acl(self.device, w[2], [c.words for c in node.children]):
+                self.unparsed(node.children[n], node.text)
+            return True
         family = 4
         if w[:1] == ["ipv6"]:
             family, w = 6, w[1:]
@@ -1359,7 +1449,8 @@ class _Reader:
         for name, vb in vrfs.items():
             vrf_bgp = vb.finish()
             self.device.bgp.vrfs[name] = BgpVrf(vrf_bgp.neighbors, vrf_bgp.networks, vrf_bgp.redistribute,
-                                                vrf_bgp.redistribute_maps, vrf_bgp.maximum_paths)
+                                                vrf_bgp.redistribute_maps, vrf_bgp.maximum_paths,
+                                                vrf_bgp.peer_groups, vrf_bgp.aggregates, vrf_bgp.redistribute6)
         return True
 
     def _bgp_block(self, b: bgp_text.Builder, children: List[Node], section: str,
@@ -1374,6 +1465,16 @@ class _Reader:
                 continue
             if w[0] == "address-family" and w[1:] in (["ipv4"], ["ipv4", "unicast"], ["ipv6"], ["ipv6", "unicast"]):
                 af = w[1]
+            elif w[0] == "address-family" and w[1:] == ["l2vpn", "evpn"] and vrfs is not None:
+                for line in child.children:
+                    x = line.words
+                    if x[0] == "peer" and len(x) == 3 and x[2] == "enable":
+                        b.activate(x[1], "evpn")
+                    elif x[0] == "peer" and len(x) == 3 and x[2] == "reflect-client":
+                        b.peer(x[1]).route_reflector_client = True
+                    else:
+                        self.unparsed(line, f"{section} / {child.text}")
+                continue
             elif w[0] == "address-family":
                 self.unparsed(child, section)
                 continue
@@ -1391,6 +1492,24 @@ class _Reader:
         bgp = b.bgp
         if w[0] == "router-id" and n == 2:
             bgp.router_id = str(ipaddress.IPv4Address(w[1]))
+        elif w[:2] == ["timer", "keepalive"] and n == 5 and w[3] == "hold" and not af:
+            bgp.keepalive, bgp.hold = int(w[2]), int(w[4])
+        elif w == ["bestroute", "med-none-as-maximum"] and not af:
+            bgp.med_missing_as_worst = True
+        elif w == ["graceful-restart"] and not af:
+            bgp.graceful_restart = True
+        elif w[:3] == ["graceful-restart", "timer", "restart"] and n == 4 and not af:
+            bgp.graceful_restart_time = int(w[3])
+        elif w[0] == "preference" and n == 4 and af and all(x.isdigit() for x in w[1:]):
+            bgp.distance = (int(w[1]), int(w[2]), int(w[3]))
+        elif w == ["balance", "as-path-relax"] and af:
+            bgp.multipath_relax = True
+        elif w[0] == "aggregate" and n >= 3 and af:
+            options = w[3:]
+            if any(o not in ("detail-suppressed", "as-set") for o in options):
+                return False
+            bgp.aggregates.append(BgpAggregate(str(ipaddress.ip_network(f"{w[1]}/{w[2]}")),
+                                               "detail-suppressed" in options, "as-set" in options))
         elif w[0] == "group" and n in (2, 3) and w[2:] in ([], ["external"], ["internal"]):
             group = b.peer(w[1], group=True)
             if w[2:] == ["internal"]:
@@ -1512,6 +1631,8 @@ class _Reader:
             p.default_originate = "always" if n == 2 else "on"
         elif w[0] == "bandwidth-reference" and n == 2:
             p.reference_bandwidth = int(w[1])
+        elif comwarerouting.read_ospf_line(p, w):
+            pass
         else:
             return False
         return True
@@ -1570,12 +1691,17 @@ class _Reader:
             iface.parent = canon.rsplit(".", 1)[0]
         if kind == InterfaceKind.ETHERNET or source.startswith("Bridge-Aggregation"):
             iface.mode = SwitchportMode.ACCESS  # bridge mode is the default on a switch
+        if tunnel_mode == "vxlan":
+            return self.vxlan_tunnel(canon, node)
         self.device.interfaces[canon] = iface
         if tunnel_mode in ("gre", "ipsec"):
             iface.tunnel_mode = tunnel_mode
         elif tunnel_mode:
             self.unparsed(node)
         for child in node.children:
+            if child.words[0] == "service-instance":
+                self.service_instance(child, node.text)
+                continue
             try:
                 understood = self.interface_line(iface, child.words)
             except (ValueError, IndexError):
@@ -1584,9 +1710,46 @@ class _Reader:
                 self.unparsed(child, node.text)
         return True
 
+    def vxlan_tunnel(self, name: str, node: Node) -> bool:
+        """interface TunnelN mode vxlan: a static VXLAN flood peer."""
+        for child in node.children:
+            c = child.words
+            if c[0] == "destination" and len(c) == 2:
+                self.fabric.tunnels[name] = c[1]
+            elif c[0] != "source" or len(c) != 2:
+                self.unparsed(child, node.text)
+        return True
+
+    def service_instance(self, node: Node, section: str) -> None:
+        """A port joins a VXLAN VLAN's VSI; the port's own VLAN settings say which VLANs it carries."""
+        for child in node.children:
+            c = child.words
+            if not (c[:1] == ["encapsulation"] and (c[1:] == ["untagged"] or c[1:2] == ["s-vid"] and len(c) == 3)
+                    or c[:2] == ["xconnect", "vsi"] and len(c) == 3):
+                self.unparsed(child, section)
+
+    def vsi(self, node: Node) -> bool:
+        flat: List[Node] = []
+
+        def walk(n: Node) -> None:
+            for child in n.children:
+                flat.append(child)
+                walk(child)
+        walk(node)
+        return self.fabric.vsi(node.words, [n.words for n in flat], lambda i: self.unparsed(flat[i], node.text))
+
     def interface_line(self, iface: Interface, w: List[str]) -> bool:
         n = len(w)
         name = iface.name
+        if self.fabric.interface_line(iface, w):
+            return True
+        if comwaresec.read_interface(iface, w, lambda x: canonical(x)[0]) or self.queuing.interface(iface, w) or \
+                comwaresec.read_mka_interface(self.device, iface, w, self._psk):
+            return True
+        if w[0] == "mac-address" and n == 2 and re.match(r"^[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}$", w[1]):
+            digits = w[1].replace("-", "").lower()
+            iface.mac_address = ":".join(digits[i:i + 2] for i in range(0, 12, 2))
+            return True
         if w[0] in ("mirroring-group", "sflow") or w[:2] == ["ip", "netstream"]:
             return self.monitor_line(iface, w)
         if w[0] == "poe" or w == ["undo", "poe", "enable"]:
@@ -1700,6 +1863,8 @@ class _Reader:
             iface.igmp_version = int(w[2])
         elif w == ["ospf", "bfd", "enable"]:
             iface.ospf_bfd = True
+        elif comwarerouting.read_ospf_interface(iface, w):
+            pass
         elif w[:2] == ["isis", "enable"] and n in (2, 3):
             iface.isis = True
         elif w == ["isis", "silent"]:
@@ -1933,6 +2098,10 @@ class _Reader:
         return True
 
     def _finish(self) -> None:
+        self.fabric.finish()
+        self.mcast.finish()
+        self.queuing.finish()
+        comwaresec.finish_mka(self.device, self._psk)
         ospf_text.attach(self.device, self._ospf_areas, {})
         monitor_text.finish(self.device)
         self._finish_aaa()

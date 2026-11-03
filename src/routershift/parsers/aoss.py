@@ -28,6 +28,7 @@ from .. import dhcp as dhcp_text
 from .. import ospf as ospf_text
 from .. import mgmt as mgmt_text
 from .. import qos as qos_text
+from .. import aossextra as extra
 from ..confparse import Node
 from ..errors import ParseError
 from ..model import (Sflow, AaaGroup, AaaMethod, AaaServer, Acl, Device, LocalUser, DhcpPool, FhrpGroup, NtpKey, SnmpCommunity, SnmpGroup, SnmpHost, SnmpUser, Interface, InterfaceKind, LacpMode, Origin, QosAction, QosClass, QosPolicy,
@@ -115,6 +116,8 @@ class _Reader:
         for banner in banners:
             if banner.kind == "motd":
                 self.device.system.banner_motd = banner.text
+            elif banner.kind == "exec":
+                self.device.system.banner_exec = banner.text
             else:
                 self.device.unparsed.append(Unparsed(banner.line, f"banner {banner.kind}", "banner"))
         handlers: Dict[str, Callable[[Node], bool]] = {
@@ -319,6 +322,8 @@ class _Reader:
                         iface.mab = True
                 elif w[4] in ("client-limit", "addr-limit") and len(w) == 6:
                     self._client_limit[(iface.name, w[2])] = int(w[5])
+                elif w[4] == "unauth-vid" and len(w) == 6 and w[2] == "authenticator":
+                    iface.dot1x_fail_vlan = int(w[5])
                 elif w[4] == "reauth-period" and len(w) == 6 and w[2] == "authenticator":
                     iface.dot1x_reauth = int(w[5]) > 0
                     iface.dot1x_reauth_period = int(w[5]) or None
@@ -443,6 +448,8 @@ class _Reader:
         w = node.words
         if w == ["lldp", "run"]:
             return self._set("lldp", True)
+        if extra.read_lldp(self.device, w):
+            return True
         if w[1:2] == ["admin-status"] and len(w) == 4 and w[3] in ("txonly", "rxonly", "disable", "tx_rx"):
             for name in ports(w[2]):
                 iface = self.port(name)
@@ -467,7 +474,7 @@ class _Reader:
         if len(node.words) == 2 and _is_address(node.words[1]):
             self.device.system.syslog_servers.append(node.words[1])
             return True
-        return False
+        return _is_address(w[1]) and extra.read_logging(self.device, w)
 
     def ip(self, node: Node) -> bool:
         w = node.words
@@ -993,8 +1000,8 @@ class _Reader:
         ospf_text.attach(self.device, self.ospf_areas, self.ospf_passive)
         if self.router_id and self.device.ospf:
             self.device.ospf[0].router_id = self.router_id
-        elif self.router_id_line is not None:
-            self.unparsed(self.router_id_line)  # only routing protocols use it
+        elif self.router_id:
+            self.device.system.router_id = self.router_id
         for iface in self.device.interfaces.values():
             if iface.kind not in (InterfaceKind.ETHERNET, InterfaceKind.LAG):
                 continue
@@ -1017,7 +1024,7 @@ class _Reader:
                 iface.native_vlan = untagged
                 allowed = sorted(set(tagged) | ({untagged} if untagged is not None else set()))
                 iface.allowed_vlans = ",".join(str(v) for v in allowed)
-                if untagged is None:
+                if untagged is None and 1 in tagged:  # native VLAN 1 is tagged: no Cisco-style form
                     self.device.unparsed.append(Unparsed(iface.origin.line, f"no untagged {iface.source_name}",
                                                          "a trunk without an untagged VLAN (native VLAN 1 on the "
                                                          "Cisco-style platforms): tag the native VLAN by hand"))

@@ -31,13 +31,12 @@ the one installed. Every platform reads and writes, so each converts to and from
 | Juniper Junos | `junos` | Full, in curly braces or `display set` lines |
 | HPE Aruba AOS-CX | `aoscx` | Full, plus VSX, VSF and the REST API |
 | Cisco IOS-XR | `iosxr` | Full for what a router carries; switch features are reported |
-| HPE Comware 7 | `comware` | The common areas below; deeper features not written yet ([#42](https://github.com/jkobierczynski/RouterShift/pull/42) pending) |
-| HPE Aruba AOS-S (ProCurve) | `aoss` | The common areas below; deeper features not written yet ([#42](https://github.com/jkobierczynski/RouterShift/pull/42) pending) |
+| HPE Comware 7 | `comware` | Full, plus VXLAN/EVPN as VSIs, M-LAG and NetStream; IKEv2 not written yet |
+| HPE Aruba AOS-S (ProCurve) | `aoss` | Everything AOS-S can express; the rest is reported with what AOS-S offers instead |
 
 "Full" means the platform reads and writes the whole list below, plus the deeper settings: community and AS-path
-lists, BGP options, CoPP, MACsec, MAC ACLs, PTP, SSH keys, syslog over TLS and OSPF authentication. On Comware and
-AOS-S those deeper settings are reported as "not written yet" for now. [docs/SCOPE.md](docs/SCOPE.md) has the
-per-platform details.
+lists, BGP options, CoPP, MACsec, MAC ACLs, PTP, SSH keys, syslog over TLS and OSPF authentication.
+[docs/SCOPE.md](docs/SCOPE.md) has the per-platform details.
 
 ### What converts
 
@@ -54,7 +53,7 @@ per-platform details.
   templates, VRFs, passwords, timers, route reflectors, prefix limits, allowas-in, remove-private-as,
   maximum-paths), RIP and IS-IS, prefix lists and route maps, policy-based routing, BFD.
 * **Data centre:** VXLAN (VTEP source, VLAN and VRF VNIs, flood lists), BGP EVPN, MLAG pairs (EOS MLAG, AOS-CX
-  VSX, NX-OS vPC), MPLS with LDP.
+  VSX, NX-OS vPC, Comware M-LAG), MPLS with LDP.
 * **Multicast:** multicast routing, PIM mode, IGMP version, static RPs.
 * **Security and services:** IPv4/IPv6 access lists with their bindings, NAT, site-to-site IPsec VPNs, QoS
   (classes, DSCP marking, policing, port trust).
@@ -70,10 +69,8 @@ per-platform details.
 When the target has no form for a setting, RouterShift writes the nearest construct and flags it as
 approximated, or leaves it out and reports it. The main gaps:
 
-* **AOS-S:** no VRFs, routed ports, BGP, PIM, MPLS, NAT or IPsec.
+* **AOS-S:** no VRFs, routed ports, BGP, PIM, RIP, IS-IS, MPLS, VXLAN, EVPN, NAT or IPsec.
 * **AOS-CX:** no RIP, IS-IS, MPLS, NAT or IPsec.
-* **Comware and AOS-S:** no VXLAN or EVPN yet; RIP and IS-IS only between IOS, EOS, NX-OS, Junos, IOS-XR and
-  Comware.
 * **NX-OS:** no DHCP server, PoE or IPsec.
 * **Junos:** no NAT or IPsec on a switch, no RD per EVPN instance, no BFD slow timer.
 * **IOS-XR:** no switch features (spanning tree, port security, 802.1X, PoE, sFlow), VXLAN, MLAG, NAT or IPsec.

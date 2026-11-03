@@ -33,6 +33,16 @@ Add a line under "Unreleased" in every pull request that changes what RouterShif
   summer-time rule), PTP, EEM applets, OSPF authentication and options, BFD, ECMP hashing, RIP, IS-IS, MPLS/LDP, GRE
   tunnels and PBR. EOS (the bl1-dc1 border leaf) converts to NX-OS with nothing left as not written yet, and every
   sample converts to NX-OS and back with no line left unread; what NX-OS lacks is flagged instead of labelled exact.
+* Comware is written and read to the same depth as IOS and EOS: VXLAN/EVPN as VSIs with the distributed gateway and
+  layer 3 VNIs, M-LAG and ethernet segments, VPN instance EVPN targets and leaking, BGP options and VRF peer groups,
+  community and AS-path lists, rendezvous points, anycast RP, MSDP and multicast VPN instances, the IGMP querier,
+  the DSCP map and queuing profiles, MACsec, MAC ACLs, OSPF authentication and options, the router ID, BFD
+  multihop, ECMP hashing, banners, local logging, LLDP timers, the password length, the APIs, SNMP views and RADIUS
+  CoA. EOS (the bl1-dc1 border leaf) converts to Comware with nothing left as not written yet except IKEv2, and back
+  with no line left unread.
+* AOS-S writes the router ID, the syslog transport, the LLDP timers, the exec banner and the 802.1X fail VLAN, and
+  reports everything else it has no form for with what it has instead; nothing is left as "not written for AOS-S
+  yet". A trunk without its native VLAN (`no untagged`) is read back.
 * Cisco IOS-XR is a new platform (`iosxr`), read and written: AAA, SNMPv3, ACLs, RPL prefix-sets, community-sets,
   AS-path-sets and route policies, bundles, subinterfaces, VLANs as bridge domains with BVIs, VRFs, static routes,
   OSPF, IS-IS, RIP, MPLS/LDP, BGP with neighbor groups and VRFs, HSRP and VRRP, DHCP relay and server, PIM and IGMP,
