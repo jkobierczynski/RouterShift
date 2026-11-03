@@ -39,6 +39,10 @@ Add a line under "Unreleased" in every pull request that changes what RouterShif
   QoS, NetFlow, SPAN, IP SLA and tracking, and the management servers. Every sample converts to IOS-XR and back with
   no line left unread, and the round-trip check includes it. Nothing is left as "not written for IOS-XR yet": what
   IOS-XR has no form for (VXLAN, the switch pair, NAT, IPsec, switch port features) is reported with what to do.
+* Every conversion flags a route map entry without a match that is not the last: it takes every route, so the
+  entries after it never apply. The writers still copy it as the source has it.
+* IOS-XR writes the BFD timers of the interface towards a BGP neighbor under that neighbor (`bfd minimum-interval`,
+  `bfd multiplier`), and flags a neighbor that has no remote AS.
 * The IOS, EOS and NX-OS readers read `no logging console` and `no logging monitor`, which their writers write.
 * The EOS reader reads `ip address unnumbered`.
 * The text report shows the device security section (CoPP, MACsec).

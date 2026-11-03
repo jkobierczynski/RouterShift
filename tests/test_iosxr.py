@@ -338,3 +338,24 @@ def test_sflow_and_queuing_are_reported() -> None:
     assert "queuing profile" in text
     out, report = convert(sample("eos_leaf.cfg"), "eos", "iosxr")
     assert "IOS-XR has no sFlow" in report.to_text()
+
+
+def test_shadowed_entry_and_neighbor_without_remote_as() -> None:
+    text = ("ip prefix-list PL-A seq 5 permit 10.0.0.0/8\n"
+            "route-map RM-IN deny 5\n!\nroute-map RM-IN permit 10\n match ip address prefix-list PL-A\n!\n"
+            "router bgp 65001\n neighbor 192.0.2.1 description no-as\n address-family ipv4\n"
+            "  neighbor 192.0.2.1 activate\n  neighbor 192.0.2.1 route-map RM-IN in\n")
+    out, report = convert(text, "ios", "iosxr")
+    text_report = report.to_text()
+    assert "route-policy RM-IN\n  drop\nend-policy\n" in out  # written as the source has it
+    assert "entry 5 (deny) has no match, so it takes every route and entry 10 never applies" in text_report
+    assert "the source gives this neighbor no remote AS" in text_report
+
+
+def test_bfd_timers_go_on_the_bgp_neighbor() -> None:
+    text = ("interface GigabitEthernet0/1\n no switchport\n ip address 10.0.1.1 255.255.255.254\n"
+            " bfd interval 100 min_rx 100 multiplier 3\n"
+            "router bgp 65001\n neighbor 10.0.1.0 remote-as 65000\n neighbor 10.0.1.0 fall-over bfd\n")
+    out, report = convert(text, "ios", "iosxr")
+    assert "  bfd fast-detect\n  bfd minimum-interval 100\n  bfd multiplier 3\n" in out
+    assert "the BFD timers are not written" not in report.to_text()

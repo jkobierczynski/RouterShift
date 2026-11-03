@@ -614,7 +614,8 @@ class Writer:
         if iface.sflow:
             add(Severity.REVIEW, "sflow", "IOS-XR has no sFlow; sample the port with NetFlow instead")
         in_ospf = any(iface.name in ospf_text.interfaces(self.device, p) for p in self.device.ospf)
-        if (iface.bfd_interval or iface.bfd_multiplier) and not in_ospf and iface.kind != InterfaceKind.LAG:
+        if (iface.bfd_interval or iface.bfd_multiplier) and not in_ospf and iface.kind != InterfaceKind.LAG \
+                and not self.bgp_bfd_on(iface):
             add(Severity.REVIEW, "bfd", "the BFD timers are not written: IOS-XR sets them per protocol (router ospf, "
                                         "router bgp neighbor), and the interface runs no OSPF")
         for stated, code, message in _PORT_NOTES:
@@ -1051,6 +1052,35 @@ class Writer:
             families.add(bgp_text.family(peer.address))
         return sorted(families)
 
+    def bfd_link(self, address: str) -> Optional[Interface]:
+        """The interface whose subnet holds a BGP neighbor's address, when it sets BFD timers."""
+        ip = ipaddress.ip_address(address)
+        for iface in self.device.interfaces.values():
+            if not (iface.bfd_interval or iface.bfd_multiplier):
+                continue
+            for a in iface.ipv4 + iface.ipv6:
+                net = ipaddress.ip_interface(a).network
+                if net.version == ip.version and ip in net:
+                    return iface
+        return None
+
+    def bfd_timers(self, address: str) -> List[str]:
+        """IOS-XR sets the BFD timers on the BGP neighbor: the timers of the interface towards it."""
+        iface = self.bfd_link(address)
+        if iface is None:
+            return []
+        lines = [f"bfd minimum-interval {iface.bfd_interval}"] if iface.bfd_interval else []
+        return lines + ([f"bfd multiplier {iface.bfd_multiplier}"] if iface.bfd_multiplier else [])
+
+    def bgp_bfd_on(self, iface: Interface) -> bool:
+        """Whether a BGP neighbor with BFD on this interface's subnet carries its timers."""
+        bgp = self.device.bgp
+        if bgp is None:
+            return False
+        peers = [(p, None) for p in bgp.neighbors] + [(p, v) for v in bgp.vrfs.values() for p in v.neighbors]
+        return any(bgp_text.family(p.address) and bgp_text.effective(bgp, p, v).bfd
+                   and self.bfd_link(p.address) is iface for p, v in peers)
+
     def ebgp(self, bgp: Bgp, peer: BgpNeighbor, vrf: Optional[BgpVrf]) -> bool:
         if not bgp_text.family(peer.address):  # a group: eBGP when its remote AS is another
             return bool(peer.remote_as) and peer.remote_as != bgp.local_as
@@ -1090,6 +1120,12 @@ class Writer:
             body.append(f"timers {keepalive} {p.hold if p.hold is not None else 3 * keepalive}")
         if p.bfd:
             body.append("bfd fast-detect")
+        if bgp_text.family(p.address) and bgp_text.effective(bgp, p, vrf).bfd:
+            body += self.bfd_timers(p.address)
+        if not p.remote_as and bgp_text.family(p.address) and not bgp_text.effective(bgp, p, vrf).remote_as:
+            self.report.add("bgp", label, Severity.REVIEW, "no-remote-as",
+                            "the source gives this neighbor no remote AS (nor does its group); IOS-XR needs "
+                            "'remote-as' before the neighbor comes up")
         group = (vrf.peer_groups if vrf is not None else {}).get(p.peer_group) or bgp.peer_groups.get(p.peer_group)
         inherited = set(group.families) if group is not None else set()
         # a neighbor whose source names no family is active in its own address's, unless its group decides; a group
