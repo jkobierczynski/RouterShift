@@ -101,4 +101,4 @@ def test_ios_to_eos() -> None:
 
 def test_other_targets() -> None:
     _, report = convert(EOS, "eos", "comware")
-    assert "event handlers and EEM applets" in report.to_text()
+    assert "Comware runs EAA monitor policies" in report.to_text()

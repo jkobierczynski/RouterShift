@@ -42,6 +42,7 @@ from ..model import (BgpAggregate, BgpVrf, IpSla, Netflow, Sflow, AaaGroup, AaaM
                      NtpKey, PreSharedKey, SnmpCommunity, SnmpGroup, SnmpHost, SnmpUser, Interface, InterfaceKind, LacpMode, LocalUser,
                      NatPool, NatRule, Origin, QosAction, QosClass, QosPolicy, Ospf, Rip, Isis, Wlan, OspfNetwork, StaticRoute, StpMode, SwitchportMode, Unparsed, Vlan)
 from .. import comwarefabric
+from .. import comwaremgmt
 from .. import comwarerouting
 from .ioslike import _cidr, _is_address
 
@@ -162,6 +163,10 @@ class _Reader:
         for banner in banners:
             if banner.kind == "motd":
                 self.device.system.banner_motd = banner.text
+            elif banner.kind == "login":
+                self.device.system.banner_login = banner.text
+            elif banner.kind == "shell":
+                self.device.system.banner_exec = banner.text
             else:
                 self.device.unparsed.append(Unparsed(banner.line, f"header {banner.kind}", "banner"))
         handlers: Dict[str, Callable[[Node], bool]] = {
@@ -215,6 +220,10 @@ class _Reader:
             "nqa": self.nqa,
             "track": self.track,
             "vsi": self.vsi,
+            "password-control": lambda n: not n.children and comwaremgmt.read_global(self.device, n.words),
+            "netconf": lambda n: not n.children and comwaremgmt.read_global(self.device, n.words),
+            "grpc": lambda n: not n.children and comwaremgmt.read_global(self.device, n.words),
+            "restful": lambda n: not n.children and comwaremgmt.read_global(self.device, n.words),
             "l2vpn": lambda n: not n.children and self.fabric.global_line(n.words),
             "tunnel": lambda n: not n.children and self.fabric.global_line(n.words),
             "m-lag": lambda n: not n.children and self.fabric.mlag(n.words),
@@ -334,6 +343,8 @@ class _Reader:
             setattr(s, w[2], node.text.split(None, 3)[3])
             return True
         if w[1:3] == ["sys-info", "version"]:
+            return True
+        if comwaremgmt.read_snmp(self.device, w):
             return True
         if w[1:3] == ["trap", "enable"]:
             s.traps = True
@@ -679,7 +690,7 @@ class _Reader:
         if w in (["ssh", "server", "enable"], ["telnet", "server", "enable"], ["lldp", "global", "enable"]):
             setattr(self.device.management, w[0], True)
             return True
-        return False
+        return comwaremgmt.read_global(self.device, w)
 
     def undo(self, node: Node) -> bool:
         w = node.words[1:]
@@ -751,10 +762,13 @@ class _Reader:
             return True
         if w[1:2] == ["loghost"]:
             args = self._vpn(w[2:])
+            if len(args) == 3 and args[1] == "port" and _is_address(args[0]):
+                self.device.system.syslog_transport[args[0]] = ("udp", int(args[2]))
+                args = args[:1]
             if len(args) == 1 and _is_address(args[0]):
                 self.device.system.syslog_servers.append(args[0])
                 return True
-        return w[1:] == ["enable"]
+        return w[1:] == ["enable"] or comwaremgmt.read_info_center(self.device, w)
 
     def route_policy(self, node: Node) -> bool:
         """route-policy NAME permit|deny node N, with if-match and apply lines."""

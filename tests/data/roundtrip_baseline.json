@@ -1353,11 +1353,6 @@
  "eos_border_leaf.cfg via comware": {
   "lost": [
    "system.timezone",
-   "system.syslog_transport.10.100.1.50",
-   "system.banner_login",
-   "system.logging_buffer",
-   "system.logging_buffer_level",
-   "system.logging_console_level",
    "system.logging_timestamp",
    "system.logging_hostname",
    "system.logging_facility_levels.BGP",
@@ -1433,8 +1428,6 @@
    "management.vrf",
    "management.vty_acl",
    "management.console_login",
-   "management.lldp_timer",
-   "management.lldp_holdtime",
    "management.lldp_mgmt_interface",
    "management.lldp_mgmt_vrf",
    "management.apis.http",
@@ -1442,7 +1435,6 @@
    "management.apis.netconf",
    "management.api_acls.http",
    "management.api_acls.gnmi",
-   "management.password_min_length",
    "anycast_mac",
    "pim_rp_groups.10.255.0.1",
    "pim_anycast.10.255.0.1",
@@ -1487,9 +1479,6 @@
    "qos_dscp_tc.56",
    "qos_tc_dscp.5",
    "snmp.trap_types",
-   "snmp.views.ALL-VIEW",
-   "snmp.views.RESTRICTED",
-   "snmp.engine_id",
    "users[0]",
    "users[1]",
    "users[2]",
@@ -1503,6 +1492,8 @@
    "aaa.coa"
   ],
   "changed": [
+   "system.syslog_transport.10.100.1.50",
+   "system.logging_buffer",
    "vrf_info.PROD.rt_import",
    "acls.ACL-MGMT-IN.entries[1].dst_ports",
    "acls.ACL-MGMT-IN.entries[2].sequence",
@@ -3267,9 +3258,6 @@
  "iosxr_core.cfg via comware": {
   "lost": [
    "system.timezone",
-   "system.logging_buffer",
-   "system.logging_buffer_level",
-   "system.logging_console_level",
    "interfaces.Ethernet0/0/0/5.100.fhrp[0].preempt",
    "interfaces.Ethernet0/0/0/5.100.fhrp[0].version",
    "management.vrf",
@@ -3278,6 +3266,7 @@
    "users[1]"
   ],
   "changed": [
+   "system.logging_buffer",
    "interfaces.Ethernet0/0/0/5.100.fhrp[0].protocol"
   ],
   "unread": []
@@ -3409,7 +3398,6 @@
  "junos_core.cfg via comware": {
   "lost": [
    "system.timezone",
-   "system.banner_login",
    "bgp.peer_groups.RR.families",
    "users[0]",
    "users[1]"
@@ -3522,7 +3510,6 @@
    "management.console_login",
    "dhcp_option82",
    "snmp.communities[0].acl",
-   "snmp.trap_types",
    "aaa.methods[1]",
    "aaa.source.radius",
    "aaa.source.tacacs"

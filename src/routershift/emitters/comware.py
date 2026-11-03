@@ -11,6 +11,7 @@ from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from .. import aaa as aaa_text
 from .. import comwarefabric
+from .. import comwaremgmt
 from .. import comwarerouting
 from .. import acl as acl_text
 from .. import dhcp as dhcp_text
@@ -105,6 +106,7 @@ class Writer:
         self.routes()
         if self.device.bgp is not None:
             self.bgp()
+        comwaremgmt.unwritable(self.device, self.report)
         self.out.append("return")
         self.report.unparsed(self.device.unparsed)
         return "\n".join(self.out) + "\n"
@@ -267,7 +269,8 @@ class Writer:
                 self.out.append(" ".join(words))
             rep.item("system", "ntp servers")
         for host in s.syslog_servers:
-            self.out.append(f"{_IND}info-center loghost{vpn} {host}")
+            self.out.append(f"{_IND}info-center loghost{vpn} {host}"
+                            f"{comwaremgmt.loghost_suffix(self.device, host, rep)}")
         if s.syslog_servers:
             rep.item("system", "syslog servers")
         if s.logging_source:
@@ -276,12 +279,15 @@ class Writer:
         if s.logging_level is not None:
             self.out.append(f"{_IND}info-center source default loghost level {mgmt_text.COMWARE[s.logging_level]}")
             rep.item("system", "syslog level")
+        self.out += [_IND + line for line in comwaremgmt.logging_lines(self.device, rep)]
         self.management()
         self.snmp()
         if s.banner_motd:
             delim = "%" if "%" not in s.banner_motd else "^"
             self.out += [f"{_IND}header motd {delim}", s.banner_motd, delim]
             rep.item("system", "banner motd")
+        banners = comwaremgmt.banner_lines(self.device, rep)
+        self.out += [_IND + line if n % 3 == 0 else line for n, line in enumerate(banners)]
         self.block_end()
 
     # users and AAA -----------------------------------------------------------------------------------------------------
@@ -325,6 +331,7 @@ class Writer:
                             ("ip http enable", m.http), ("ip https enable", m.https), ("lldp global enable", m.lldp)):
             if value is not None:
                 self.out.append(f"{_IND}{'' if value else 'undo '}{word}")
+        self.out += [_IND + line for line in comwaremgmt.lldp_lines(d, rep) + comwaremgmt.access_lines(d, rep)]
         if m.vty_acl:
             rep.add("management", "remote login ACL", Severity.REVIEW, "mgmt-acl",
                     f"apply ACL {m.vty_acl} with 'ssh server acl' / 'telnet server acl' (by ACL number) by hand")
@@ -559,9 +566,10 @@ class Writer:
         for g in groups.values():
             views = (f" read-view {g.read_view}" if g.read_view else "") + \
                 (f" write-view {g.write_view}" if g.write_view else "")
-            if views:
-                rep.add("management", f"SNMPv3 group {g.name}", Severity.REVIEW, "snmp-view",
-                        "MIB views are not converted; define them by hand")
+            for view in (g.read_view, g.write_view):
+                if view and view not in s.views:
+                    rep.add("management", f"SNMPv3 group {g.name}", Severity.REVIEW, "snmp-view",
+                            f"MIB view {view} is not defined in the source; define it by hand")
             rep.item("management", f"SNMPv3 group {g.name}")
             self.out.append(f"{_IND}snmp-agent group v3 {g.name}{levels[g.level]}{views}")
         for u in s.users:
@@ -575,8 +583,9 @@ class Writer:
                 priv = snmp_text.pick(u.priv, self._SNMP_PRIV, rep, label)
                 words.append(f"privacy-mode {'des56' if priv == 'des' else priv} {keys[1]}")
             self.out.append(" ".join(words))
+        self.out += [_IND + line for line in comwaremgmt.snmp_lines(self.device, rep)]
         if s.traps or s.hosts:
-            self.out.append(f"{_IND}snmp-agent trap enable")
+            self.out += [_IND + line for line in comwaremgmt.trap_lines(self.device, rep)]
         for h in s.hosts:
             label = snmp_text.host_label(h)
             rep.item("management", label)
