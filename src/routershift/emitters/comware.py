@@ -10,6 +10,10 @@ import ipaddress
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from .. import aaa as aaa_text
+from .. import comwarefabric
+from .. import comwaremgmt
+from .. import comwaresec
+from .. import comwarerouting
 from .. import acl as acl_text
 from .. import dhcp as dhcp_text
 from .. import fhrp
@@ -33,7 +37,7 @@ from .. import routemap as routemap_text
 from .. import mpls as mpls_text
 from .. import qos as qos_text
 from .. import wlan as wlan_text
-from ..model import (AaaMethod, AaaServer, AclAction, AclEntry, BgpNeighbor, Device, FhrpGroup, IpsecPeer, SnmpGroup, Interface, InterfaceKind, LacpMode, NatRule,
+from ..model import (AaaMethod, AaaServer, AclAction, AclEntry, BgpAggregate, BgpNeighbor, Device, FhrpGroup, IpsecPeer, SnmpGroup, Interface, InterfaceKind, LacpMode, NatRule,
                      Ospf, StaticRoute, StpMode, SwitchportMode)
 from ..names import PortMapper
 from ..parsers.comware import COMWARE_ROLES, ranges
@@ -71,12 +75,20 @@ class Writer:
         if self.vrrp_v2:
             self.out.append(f"{_IND}vrrp version 2")  # Comware 7 runs VRRPv3 unless told otherwise
             self.block_end()
+        routing = comwarerouting.global_lines(self.device, self.report)
+        if routing:
+            self.out += [_IND + line for line in routing]
+            self.block_end()
         self.vrfs()
         self.vlans()
         self.spanning_tree()
         self.acls()
+        self.out += comwaresec.mac_acl_lines(self.device, self.report)
         self.policies()
         self.qos()
+        self.out += comwaresec.queuing_lines(self.device, self.report)
+        self.out += comwaresec.macsec_lines(self.device, self.report)
+        self.out += comwaresec.device_lines(self.device, self.report)
         self.mpls()
         self.wlans()
         for p in self.device.ospf:
@@ -87,7 +99,11 @@ class Writer:
         self.nat()
         self.vpn()
         self.monitor()
-        vxlan_text.unsupported(self.device, self.report, "Comware")
+        self.out += comwarefabric.vxlan_lines(self.device, self.report, self.port,
+                                              comwarefabric.tunnel_base(self.device))
+        self.out += comwarefabric.mlag_lines(self.device, self.report, self.port, lambda v: v)
+        comwarefabric.trunk_groups(self.device, self.report)
+        comwarefabric.evpn_domain(self.device, self.report)
         self.tracking()
         order = {InterfaceKind.LAG: 0}
         for iface in sorted(self.device.interfaces.values(), key=lambda i: order.get(i.kind, 1)):
@@ -95,8 +111,7 @@ class Writer:
         self.routes()
         if self.device.bgp is not None:
             self.bgp()
-        vrfs_text.mlag_unsupported(self.device, self.report, "Comware",
-                                   "Comware pairs switches with IRF or DRNI; configure it by hand")
+        comwaremgmt.unwritable(self.device, self.report)
         self.out.append("return")
         self.report.unparsed(self.device.unparsed)
         return "\n".join(self.out) + "\n"
@@ -259,7 +274,8 @@ class Writer:
                 self.out.append(" ".join(words))
             rep.item("system", "ntp servers")
         for host in s.syslog_servers:
-            self.out.append(f"{_IND}info-center loghost{vpn} {host}")
+            self.out.append(f"{_IND}info-center loghost{vpn} {host}"
+                            f"{comwaremgmt.loghost_suffix(self.device, host, rep)}")
         if s.syslog_servers:
             rep.item("system", "syslog servers")
         if s.logging_source:
@@ -268,12 +284,15 @@ class Writer:
         if s.logging_level is not None:
             self.out.append(f"{_IND}info-center source default loghost level {mgmt_text.COMWARE[s.logging_level]}")
             rep.item("system", "syslog level")
+        self.out += [_IND + line for line in comwaremgmt.logging_lines(self.device, rep)]
         self.management()
         self.snmp()
         if s.banner_motd:
             delim = "%" if "%" not in s.banner_motd else "^"
             self.out += [f"{_IND}header motd {delim}", s.banner_motd, delim]
             rep.item("system", "banner motd")
+        banners = comwaremgmt.banner_lines(self.device, rep)
+        self.out += [_IND + line if n % 3 == 0 else line for n, line in enumerate(banners)]
         self.block_end()
 
     # users and AAA -----------------------------------------------------------------------------------------------------
@@ -317,6 +336,7 @@ class Writer:
                             ("ip http enable", m.http), ("ip https enable", m.https), ("lldp global enable", m.lldp)):
             if value is not None:
                 self.out.append(f"{_IND}{'' if value else 'undo '}{word}")
+        self.out += [_IND + line for line in comwaremgmt.lldp_lines(d, rep) + comwaremgmt.access_lines(d, rep)]
         if m.vty_acl:
             rep.add("management", "remote login ACL", Severity.REVIEW, "mgmt-acl",
                     f"apply ACL {m.vty_acl} with 'ssh server acl' / 'telnet server acl' (by ACL number) by hand")
@@ -551,9 +571,10 @@ class Writer:
         for g in groups.values():
             views = (f" read-view {g.read_view}" if g.read_view else "") + \
                 (f" write-view {g.write_view}" if g.write_view else "")
-            if views:
-                rep.add("management", f"SNMPv3 group {g.name}", Severity.REVIEW, "snmp-view",
-                        "MIB views are not converted; define them by hand")
+            for view in (g.read_view, g.write_view):
+                if view and view not in s.views:
+                    rep.add("management", f"SNMPv3 group {g.name}", Severity.REVIEW, "snmp-view",
+                            f"MIB view {view} is not defined in the source; define it by hand")
             rep.item("management", f"SNMPv3 group {g.name}")
             self.out.append(f"{_IND}snmp-agent group v3 {g.name}{levels[g.level]}{views}")
         for u in s.users:
@@ -567,8 +588,9 @@ class Writer:
                 priv = snmp_text.pick(u.priv, self._SNMP_PRIV, rep, label)
                 words.append(f"privacy-mode {'des56' if priv == 'des' else priv} {keys[1]}")
             self.out.append(" ".join(words))
+        self.out += [_IND + line for line in comwaremgmt.snmp_lines(self.device, rep)]
         if s.traps or s.hosts:
-            self.out.append(f"{_IND}snmp-agent trap enable")
+            self.out += [_IND + line for line in comwaremgmt.trap_lines(self.device, rep)]
         for h in s.hosts:
             label = snmp_text.host_label(h)
             rep.item("management", label)
@@ -592,8 +614,7 @@ class Writer:
             if info and info.rd:
                 self.out.append(f"{_IND}route-distinguisher {info.rd}")
             if info:
-                kinds = {"import": "import-extcommunity", "export": "export-extcommunity", "both": "both"}
-                self.out += [f"{_IND}vpn-target {v} {kinds[d]}" for d, v in vrfs_text.targets(info)]
+                self.out += [_IND + line for line in comwarefabric.vrf_lines(self.device, name, info, self.report)]
             self.block_end()
             self.report.item("system", f"vrf {name}")
 
@@ -625,8 +646,11 @@ class Writer:
             rep.item("system", "multicast routing")
             self.out.append("multicast routing")
             self.block_end()
-        if d.pim_rps:
-            self.out += ["pim"] + [f"{_IND}static-rp {rp}" for rp in d.pim_rps]
+        self.out += comwaresec.multicast_lines(d, rep, self.port)
+        if d.pim_rps or d.pim_anycast:
+            acls = comwaresec.rp_acls(d)
+            self.out += ["pim"] + [_IND + comwaresec.static_rp(d, "", rp, acls) for rp in d.pim_rps] + \
+                [_IND + line for line in comwaresec.anycast_lines(d)]
             self.block_end()
         for vlan in sorted(self.device.vlans.values(), key=lambda v: v.vlan_id):
             self.out.append(f"vlan {vlan.vlan_id}")
@@ -640,6 +664,7 @@ class Writer:
                 self.out.append(f"{_IND}igmp-snooping enable")
             if vlan.vlan_id in queriers:
                 self.out.append(f"{_IND}igmp-snooping querier")
+                self.out += [_IND + line for line in comwaresec.querier_lines(d, vlan.vlan_id)]
             self.block_end()
             self.report.item("vlan", str(vlan.vlan_id))
 
@@ -755,7 +780,8 @@ class Writer:
                 if a.set_dscp is not None:
                     self.out.append(f"{_IND}remark dscp {qos_text.dscp_name(a.set_dscp)}")
                 if a.police_kbps is not None:
-                    self.out.append(f"{_IND}car cir {a.police_kbps} red discard")
+                    self.out.append(f"{_IND}car cir {a.police_kbps}" + (f" cbs {a.burst_bytes}" if a.burst_bytes else "")
+                                    + " red discard")
                 self.block_end()
                 classifier = "default-class" if a.qos_class == qos_text.DEFAULT_CLASS else a.qos_class
                 pairs.append(f"{_IND}classifier {classifier} behavior {behavior}")
@@ -811,6 +837,9 @@ class Writer:
 
     def interface(self, iface: Interface) -> None:
         name = self.port(iface.name)
+        gateway = comwarefabric.gateway_vlan(self.device, iface)
+        if gateway is not None:
+            name = f"Vsi-interface{gateway}"
         label = f"{iface.source_name or iface.name} -> {name}"
         self.report.item("interface", label)
 
@@ -853,6 +882,13 @@ class Writer:
             lines.append(f"ip address {net.ip} {net.netmask}" + (" sub" if n else ""))
         for cidr in iface.ipv6:
             lines.append(f"ipv6 address {cidr}")
+        if gateway is not None:
+            lines += comwarefabric.gateway_lines(self.device, iface, add)
+        else:
+            comwarefabric.anycast_without_vxlan(iface, add)
+        if iface.kind == InterfaceKind.LAG:
+            lines += comwarefabric.lag_lines(self.device, iface, add)
+        lines += comwarefabric.service_instances(self.device, iface)
         for direction, policy in (("inbound", iface.qos_policy_in), ("outbound", iface.qos_policy_out)):
             if policy and policy in self.device.qos_policies:
                 lines.append(f"qos apply policy {policy} {direction}")
@@ -860,6 +896,8 @@ class Writer:
                 add(Severity.REVIEW, "qos-policy", f"policy {policy} is applied but not defined; left out")
         if iface.qos_trust in ("dscp", "cos"):
             lines.append(f"qos trust {'dot1p' if iface.qos_trust == 'cos' else 'dscp'}")
+        lines += comwaresec.queuing_interface(self.device, iface, add)
+        lines += comwaresec.interface_lines(self.device, iface, add, self.port, gateway is not None)
         if iface.mpls:
             lines += ["mpls enable", "mpls ldp enable"]
         if iface.dhcp_trust:
@@ -923,6 +961,7 @@ class Writer:
                     lines.append(f"poe max-power {limit}")
         if iface.name in bfd_text.ospf_interfaces(self.device):
             lines.append("ospf bfd enable")
+        lines += comwarerouting.ospf_interface(iface, add)
         lines += bfd_text.separate_lines(iface)
         if iface.pbr:
             lines.append(f"ip policy-based-route {iface.pbr}")
@@ -1033,6 +1072,7 @@ class Writer:
             lines.append("default-route-advertise" + (" always" if p.default_originate == "always" else ""))
         if p.reference_bandwidth is not None:
             lines.append(f"bandwidth-reference {p.reference_bandwidth}")
+        lines += comwarerouting.ospf_lines(p, self.report, ospf_text.label(p))
         areas = {n.area for n in p.networks} | set(p.area_types)
         for dotted in sorted(areas, key=ospf_text.area_number):
             lines.append(f"area {dotted}")
@@ -1271,6 +1311,7 @@ class Writer:
     def policies(self) -> None:
         """Prefix lists, then the route policies that match them."""
         routemap_text.items(self.device, self.report)
+        self.out += routemap_text.comware_list_lines(self.device, self.report)
         for pl in self.device.prefix_lists.values():
             self.out += routemap_text.comware_prefix_lines(pl)
         if self.device.prefix_lists:
@@ -1298,6 +1339,25 @@ class Writer:
         lines: List[str] = []
         if bgp.router_id:
             lines.append(f"router-id {bgp.router_id}")
+        if bgp.keepalive is not None or bgp.hold is not None:
+            keepalive = bgp.keepalive if bgp.keepalive is not None else 60
+            lines.append(f"timer keepalive {keepalive} hold {bgp.hold if bgp.hold is not None else 3 * keepalive}")
+        if bgp.med_missing_as_worst or any(v.med_missing_as_worst for v in bgp.vrfs.values()):
+            lines.append("bestroute med-none-as-maximum")
+            if any(v.med_missing_as_worst for v in bgp.vrfs.values()) and not bgp.med_missing_as_worst:
+                self.report.add("bgp", f"bgp {bgp.local_as}", Severity.APPROX, "bgp-med",
+                                "Comware sets the missing MED rule for the whole process; it is written globally")
+        if bgp.asdot:
+            self.report.add("bgp", f"bgp {bgp.local_as}", Severity.APPROX, "bgp-asdot",
+                            "Comware shows 4-byte AS numbers as plain numbers; asdot notation is left out")
+        if bgp.ospf_match or any(v.ospf_match for v in bgp.vrfs.values()):
+            self.report.add("bgp", f"bgp {bgp.local_as}", Severity.REVIEW, "bgp-ospf-match",
+                            "Comware redistributes every OSPF route type; filter the types with a route policy "
+                            "(if-match route-type) by hand")
+        if bgp.graceful_restart:
+            lines.append("graceful-restart")
+            if bgp.graceful_restart_time is not None:
+                lines.append(f"graceful-restart timer restart {bgp.graceful_restart_time}")
         for group in bgp.peer_groups.values():
             kind = "internal" if group.remote_as == bgp.local_as else "external"
             lines.append(f"group {group.address} {kind}")
@@ -1329,36 +1389,84 @@ class Writer:
                 if af in peer.families:
                     body.append(f"peer {peer.address} enable")
                     body += self._bgp_af_options(peer)
+            body += self._aggregates(bgp.aggregates, af)
             if af == "ipv4":
                 body += [f"balance {bgp.maximum_paths}"] if bgp.maximum_paths else []
                 body += [f"balance ibgp {bgp.maximum_paths_ibgp}"] if bgp.maximum_paths_ibgp else []
+                body += ["balance as-path-relax"] if bgp.multipath_relax else []
+                body += ["preference " + " ".join(str(x) for x in bgp.distance)] if bgp.distance else []
             if body:
                 lines.append(f"address-family {af} unicast")
                 lines += [_IND + line for line in body]
+        evpn = [p for p in list(bgp.peer_groups.values()) + bgp.neighbors if "evpn" in p.families]
+        if evpn and self.device.vxlan is not None:
+            lines.append("address-family l2vpn evpn")
+            for peer in evpn:
+                lines.append(f"{_IND}peer {peer.address} enable")
+                if peer.route_reflector_client:
+                    lines.append(f"{_IND}peer {peer.address} reflect-client")
+        elif evpn:
+            self.report.add("bgp", f"bgp {bgp.local_as}", Severity.REVIEW, "evpn-unsupported",
+                            "the EVPN address family of " + ", ".join(p.address for p in evpn) +
+                            " is not written: the device carries no VXLAN")
         for name, v in bgp.vrfs.items():
             self.report.item("bgp", f"bgp vrf {name}")
             lines.append(f"ip vpn-instance {name}")
             body = []
+            body6: List[str] = []
+            for group in v.peer_groups.values():
+                kind = "internal" if group.remote_as == bgp.local_as else "external"
+                lines += [f"{_IND}group {group.address} {kind}"] + [_IND + line for line in self._bgp_peer(group)]
+                members = [p for p in v.neighbors if p.peer_group == group.address]
+                if any("ipv4" in p.families for p in members):
+                    body += self._bgp_af_options(group)
+                if any("ipv6" in p.families for p in members):
+                    body6 += self._bgp_af_options(group)
             for peer in v.neighbors:
+                if peer.peer_group and peer.peer_group not in v.peer_groups:
+                    peer = bgp_text.effective(bgp, peer, v)  # a Comware VRF refers only to its own groups
+                    peer.peer_group = ""
                 label = f"neighbor {peer.address} (vrf {name})"
                 self.report.item("bgp", label)
                 bgp_text.unwritten(peer, set(bgp_text.OPTIONS), self.report, label, "Comware")
+                if peer.peer_group:
+                    lines.append(f"{_IND}peer {peer.address} group {peer.peer_group}")
                 lines += [_IND + line for line in self._bgp_peer(peer)]
-                body += [f"peer {peer.address} enable"] + self._bgp_af_options(peer)
+                target = body6 if "ipv6" in peer.families and "ipv4" not in peer.families else body
+                target += [f"peer {peer.address} enable"] + self._bgp_af_options(peer)
             for prefix in v.networks:
                 net = ipaddress.ip_network(prefix)
-                body.append(f"network {net.network_address} {net.netmask}")
+                if net.version == 6:
+                    body6.append(f"network {net.network_address} {net.prefixlen}")
+                else:
+                    body.append(f"network {net.network_address} {net.netmask}")
             for source in v.redistribute:
                 rm = v.redistribute_maps.get(source)
                 body.append(f"import-route {'direct' if source == 'connected' else source}" +
                             (f" route-policy {rm}" if rm else ""))
+            body6 += [f"import-route {'direct' if source == 'connected' else source}" for source in v.redistribute6]
+            body += self._aggregates(v.aggregates, "ipv4")
+            body6 += self._aggregates(v.aggregates, "ipv6")
             body += [f"balance {v.maximum_paths}"] if v.maximum_paths else []
-            if body:
-                lines.append(f"{_IND}address-family ipv4 unicast")
-                lines += [_IND * 2 + line for line in body]
+            for af, af_body in (("ipv4", body), ("ipv6", body6)):
+                if af_body:
+                    lines.append(f"{_IND}address-family {af} unicast")
+                    lines += [_IND * 2 + line for line in af_body]
         self.out.append(f"bgp {bgp.local_as}")
         self.out += [_IND + line for line in lines]
         self.block_end()
+
+    @staticmethod
+    def _aggregates(aggregates: List[BgpAggregate], af: str) -> List[str]:
+        lines = []
+        for a in aggregates:
+            net = ipaddress.ip_network(a.prefix)
+            if (net.version == 6) != (af == "ipv6"):
+                continue
+            mask = str(net.netmask) if net.version == 4 else str(net.prefixlen)
+            lines.append(" ".join(["aggregate", str(net.network_address), mask] +
+                                  (["as-set"] if a.as_set else []) + (["detail-suppressed"] if a.summary_only else [])))
+        return lines
 
     def _bgp_peer(self, peer: BgpNeighbor) -> List[str]:
         pre = f"peer {peer.address}"
@@ -1478,6 +1586,8 @@ class Writer:
             words += ["track", self.track_plan.route_track(route.track)]
         if route.distance is not None:
             words += ["preference", str(route.distance)]
+        if route.tag is not None:
+            words += ["tag", str(route.tag)]
         if route.name:
             words += ["description", route.name]
         return " ".join(words)

@@ -39,7 +39,7 @@ the syslog level and source, and LLDP and CDP (globally and per port).
 Layer 2 security converts as well: DHCP snooping, ARP inspection, IP source guard, port security and storm
 control.
 VRF route leaking (route distinguisher, import and export route targets) and multi-chassis LAG pairs
-(EOS MLAG and AOS-CX VSX, flagged on IOS, AOS-S and Comware) convert too.
+(EOS MLAG, AOS-CX VSX and Comware M-LAG, flagged on IOS and AOS-S) convert too.
 Prefix lists and route maps (Comware route policies) convert with the BGP neighbors and
 redistribution that apply them, and so do policy-based routing and BFD (timers, BGP neighbors, OSPF).
 RIP and IS-IS convert between IOS, EOS and Comware (flagged on the Aruba switches).

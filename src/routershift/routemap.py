@@ -175,7 +175,7 @@ def unwritable(e: RouteMapEntry, platform: str) -> Tuple[List[str], List[str]]:
     clauses the reader could not read count too."""
     matches = [c for c in e.unconverted if c.startswith("match")]
     sets = [c for c in e.unconverted if not c.startswith("match")]
-    full = platform in ("ios", "eos", "aoscx", "nxos", "iosxr")
+    full = platform in ("ios", "eos", "aoscx", "nxos", "iosxr", "comware")
     if not full:
         matches += [f"match as-path {x}" for x in e.match_as_paths]
         matches += [f"match community {x}" for x in e.match_communities]
@@ -338,6 +338,19 @@ def comware_route_policy_line(e: RouteMapEntry, w: List[str]) -> bool:
         e.sets["origin"] = w[2]
     elif w[:2] == ["apply", "as-path"] and n >= 4 and w[-1] == "additive" and all(x.isdigit() for x in w[2:-1]):
         e.sets["as-path-prepend"] = " ".join(w[2:-1])
+    elif w[:3] == ["if-match", "community", "name"] and n in (4, 5) and w[4:] in ([], ["whole-match"]):
+        e.match_communities.append(w[3])
+    elif w[:2] == ["if-match", "as-path"] and n == 3:
+        e.match_as_paths.append(w[2])
+    elif w[:3] == ["apply", "extcommunity", "rt"] and n >= 4:
+        values = w[3:]
+        if values[-1] == "additive":
+            e.extcommunity_additive, values = True, values[:-1]
+        if not values:
+            return False
+        e.sets["extcommunity-rt"] = " ".join(values)
+    elif w[:2] == ["apply", "cost-type"] and n == 3 and w[2] in ("type-1", "type-2"):
+        e.sets["metric-type"] = w[2]
     elif w[:2] == ["apply", "community"] and n >= 3:
         values = w[2:]
         if values[-1] == "additive":
@@ -398,11 +411,22 @@ def comware_route_policy_lines(rm: RouteMap, report: Report, ind: str) -> List[s
             if len(e.match_tags) > 1:
                 report.add("policy", lab, Severity.REVIEW, "rm-match-many",
                            f"node {e.seq} matches any of tags {e.match_tags}; one is written")
+        for kind, names in (("community", e.match_communities), ("as-path", e.match_as_paths)):
+            if names:
+                body.append(f"if-match {kind} name {names[0]}" if kind == "community" else
+                            f"if-match as-path {names[0]}")
+                if len(names) > 1:
+                    report.add("policy", lab, Severity.REVIEW, "rm-match-many",
+                               f"node {e.seq} matches any of {kind} lists {', '.join(names)}; one is written")
         for key in SET_KEYS:
             value = e.sets.get(key)
-            if value is None or key in ("extcommunity-rt", "metric-type"):
+            if value is None:
                 continue
-            if key == "next-hop":
+            if key == "extcommunity-rt":
+                body.append(f"apply extcommunity rt {value}" + (" additive" if e.extcommunity_additive else ""))
+            elif key == "metric-type":
+                body.append(f"apply cost-type {value}")
+            elif key == "next-hop":
                 body.append(f"apply ip-address next-hop {value}")
             elif key == "origin":
                 body.append(f"apply origin {value}")
@@ -415,6 +439,35 @@ def comware_route_policy_lines(rm: RouteMap, report: Report, ind: str) -> List[s
         out.append(f"route-policy {rm.name} {e.action.value} node {e.seq}")
         out += [ind + line for line in body]
         out.append("#")
+    return out
+
+
+def comware_list(device: Device, w: List[str]) -> bool:
+    """ip community-list basic|advanced NAME permit|deny VALUES, ip as-path NAME permit|deny REGEX (Comware)."""
+    if w[1] == "community-list" and len(w) >= 5 and w[2] in ("basic", "advanced") and w[4] in ("permit", "deny"):
+        cl = device.community_lists.setdefault(w[3], CommunityList(w[3], w[2] == "advanced"))
+        cl.entries.append((w[4], " ".join(w[5:])))
+        return True
+    if w[1] == "community-list" and len(w) >= 4 and w[2].isdigit() and w[3] in ("permit", "deny"):
+        cl = device.community_lists.setdefault(w[2], CommunityList(w[2], int(w[2]) > 99))
+        cl.entries.append((w[3], " ".join(w[4:])))
+        return True
+    if w[1] == "as-path" and len(w) >= 5 and w[3] in ("permit", "deny"):
+        apl = device.as_path_lists.setdefault(w[2], AsPathList(w[2]))
+        apl.entries.append((w[3], " ".join(w[4:])))
+        return True
+    return False
+
+
+def comware_list_lines(device: Device, report: Report) -> List[str]:
+    out: List[str] = []
+    for cl in device.community_lists.values():
+        report.item("policy", label(cl.name, "community-list"))
+        kind = "advanced" if cl.expanded else "basic"
+        out += [f"ip community-list {kind} {cl.name} {action} {value}".rstrip() for action, value in cl.entries]
+    for apl in device.as_path_lists.values():
+        report.item("policy", label(apl.name, "as-path list"))
+        out += [f"ip as-path {apl.name} {action} {regex}" for action, regex in apl.entries]
     return out
 
 
