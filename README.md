@@ -89,6 +89,7 @@ line numbers. Everything else is listed under "Not understood", grouped by the b
 ```
 pip install routershift      # or, from a checkout: pip install .
 routershift convert --from ios --to aoscx running-config.txt -o aoscx.cfg --report report.txt
+routershift roundtrip --from eos --via ios running-config.txt   # there and back: what did not survive
 routershift parse --from eos running-config.txt      # the vendor-neutral model as JSON
 routershift platforms
 ```

@@ -62,9 +62,10 @@ converters. It is the same design as [FWShift](https://github.com/jkobierczynski
 ```
 src/routershift/
   __init__.py       __version__, the one place the version is set
-  cli.py            the command line (convert, parse, platforms, --version)
+  cli.py            the command line (convert, roundtrip, parse, platforms, --version)
   convert.py        PLATFORMS and convert(): read, map, write, check
   model.py          the vendor-neutral model: one dataclass per feature, with meaning and defaults
+  roundtrip.py      round trips: convert there and back, compare the two models setting by setting
   report.py         the fidelity report: items, findings, severities, secret masking, text and JSON output
   names.py          canonical interface names and the port mapper
   gaps.py           the checks that run after every writer
@@ -85,6 +86,8 @@ tests/
   data/             sample configurations, at least one per platform
   helpers.py        sample() loads a file from data/
   test_all_pairs.py converts every sample to every platform and checks that the features survive
+  test_roundtrip_baseline.py
+                    every sample there and back through every platform, against data/roundtrip_baseline.json
   test_<feature>.py and test_<platform>[_<area>].py
                     the details per feature and per platform
 docs/
@@ -162,6 +165,11 @@ mypy                            # strict type check of src/routershift
 * `test_all_pairs.py` is the safety net: every sample to every platform, with checks that VLANs, addresses,
   routing and the other core features survive. A change that breaks a pair someone did not think of shows here.
 * Round trips (write a platform, read it back, compare the model) catch writers and readers that disagree.
+* `test_roundtrip_baseline.py` takes every sample to every other platform and back with `roundtrip.round_trip`
+  and compares what is lost, changed or not read back with `tests/data/roundtrip_baseline.json`. A setting that
+  starts to get lost fails the test; so does one that stops getting lost, until the baseline is written again with
+  `python tests/test_roundtrip_baseline.py`. Commit the new baseline with the change: its diff shows the reviewer
+  what now comes back, or what is now lost on purpose.
 * Feature and platform tests check exact output lines. When a vendor spelling is a guess, say so in the pull
   request under "Unverified syntax", not only in the test.
 * `test_version.py` checks that the version is valid and has a changelog entry.
