@@ -12,6 +12,7 @@ from typing import Callable, Dict, List, Optional, Set, Tuple
 from .. import aaa as aaa_text
 from .. import comwarefabric
 from .. import comwaremgmt
+from .. import comwaresec
 from .. import comwarerouting
 from .. import acl as acl_text
 from .. import dhcp as dhcp_text
@@ -82,8 +83,12 @@ class Writer:
         self.vlans()
         self.spanning_tree()
         self.acls()
+        self.out += comwaresec.mac_acl_lines(self.device, self.report)
         self.policies()
         self.qos()
+        self.out += comwaresec.queuing_lines(self.device, self.report)
+        self.out += comwaresec.macsec_lines(self.device, self.report)
+        self.out += comwaresec.device_lines(self.device, self.report)
         self.mpls()
         self.wlans()
         for p in self.device.ospf:
@@ -641,8 +646,11 @@ class Writer:
             rep.item("system", "multicast routing")
             self.out.append("multicast routing")
             self.block_end()
-        if d.pim_rps:
-            self.out += ["pim"] + [f"{_IND}static-rp {rp}" for rp in d.pim_rps]
+        self.out += comwaresec.multicast_lines(d, rep, self.port)
+        if d.pim_rps or d.pim_anycast:
+            acls = comwaresec.rp_acls(d)
+            self.out += ["pim"] + [_IND + comwaresec.static_rp(d, "", rp, acls) for rp in d.pim_rps] + \
+                [_IND + line for line in comwaresec.anycast_lines(d)]
             self.block_end()
         for vlan in sorted(self.device.vlans.values(), key=lambda v: v.vlan_id):
             self.out.append(f"vlan {vlan.vlan_id}")
@@ -656,6 +664,7 @@ class Writer:
                 self.out.append(f"{_IND}igmp-snooping enable")
             if vlan.vlan_id in queriers:
                 self.out.append(f"{_IND}igmp-snooping querier")
+                self.out += [_IND + line for line in comwaresec.querier_lines(d, vlan.vlan_id)]
             self.block_end()
             self.report.item("vlan", str(vlan.vlan_id))
 
@@ -771,7 +780,8 @@ class Writer:
                 if a.set_dscp is not None:
                     self.out.append(f"{_IND}remark dscp {qos_text.dscp_name(a.set_dscp)}")
                 if a.police_kbps is not None:
-                    self.out.append(f"{_IND}car cir {a.police_kbps} red discard")
+                    self.out.append(f"{_IND}car cir {a.police_kbps}" + (f" cbs {a.burst_bytes}" if a.burst_bytes else "")
+                                    + " red discard")
                 self.block_end()
                 classifier = "default-class" if a.qos_class == qos_text.DEFAULT_CLASS else a.qos_class
                 pairs.append(f"{_IND}classifier {classifier} behavior {behavior}")
@@ -886,6 +896,8 @@ class Writer:
                 add(Severity.REVIEW, "qos-policy", f"policy {policy} is applied but not defined; left out")
         if iface.qos_trust in ("dscp", "cos"):
             lines.append(f"qos trust {'dot1p' if iface.qos_trust == 'cos' else 'dscp'}")
+        lines += comwaresec.queuing_interface(self.device, iface, add)
+        lines += comwaresec.interface_lines(self.device, iface, add, self.port, gateway is not None)
         if iface.mpls:
             lines += ["mpls enable", "mpls ldp enable"]
         if iface.dhcp_trust:

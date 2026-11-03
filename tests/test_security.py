@@ -102,4 +102,8 @@ def test_ios_security_to_eos() -> None:
 
 def test_security_is_reported_on_other_targets() -> None:
     out, report = convert(EOS, "eos", "comware")
+    text = report.to_text()
+    assert "mka policy MACSEC-DCI\n" in out and " mka apply policy MACSEC-DCI\n" in out
+    assert "Comware protects its CPU with built-in limits" in text
+    out, report = convert(EOS, "eos", "aoss")
     assert "not written for" in report.to_text()
