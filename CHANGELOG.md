@@ -8,6 +8,11 @@ Add a line under "Unreleased" in every pull request that changes what RouterShif
 
 ## Unreleased
 
+## 0.2.0 (2026-11-03)
+
+Cisco IOS-XR joins as an eighth platform, Junos, AOS-CX, NX-OS and Comware convert to the same depth as IOS and
+EOS, and `routershift roundtrip` shows what a conversion there and back loses.
+
 * `routershift roundtrip` converts a configuration to another platform (or, with `--via all`, every other one) and
   back, and lists every setting of the model that was lost, changed or added on the way, and every line either
   reader did not read. `--report-format json` and `--strict` (exit status 3 when anything did not come back) make

@@ -10,7 +10,7 @@ requires-python = ">=3.9"
 license = "GPL-3.0-or-later"
 license-files = ["LICENSE"]
 authors = [{ name = "Jurgen Kobierczynski" }]
-keywords = ["network", "migration", "switch", "router", "cisco", "ios", "nx-os", "arista", "eos", "juniper", "junos", "hpe", "aruba", "aos-cx", "procurve", "comware"]
+keywords = ["network", "migration", "switch", "router", "cisco", "ios", "nx-os", "ios-xr", "arista", "eos", "juniper", "junos", "hpe", "aruba", "aos-cx", "procurve", "comware"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Environment :: Console",
