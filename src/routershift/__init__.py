@@ -6,4 +6,4 @@
 
 # The one place the version is set: pyproject.toml reads it, and so do --version, the report and the release
 # workflow, which refuses a tag that does not match it. See DEVELOPMENT.md, "Versions and releases".
-__version__ = "0.1.0"
+__version__ = "0.2.0"
