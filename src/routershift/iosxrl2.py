@@ -172,9 +172,10 @@ def mst_lines(device: Device, ports: List[Tuple[str, Interface]], report: Report
     if not runs_mst(d):
         return []
     report.item("system", "spanning-tree mode")
-    if d.stp_mode not in (None, StpMode.MSTP):
+    mode = d.stp_mode
+    if mode is not None and mode != StpMode.MSTP:
         report.add("system", "spanning-tree mode", Severity.APPROX, "stp-mode",
-                   f"IOS-XR bridge domains run MST (or PVRST on some platforms); {d.stp_mode.value} is written as MST "
+                   f"IOS-XR bridge domains run MST (or PVRST on some platforms); {mode.value} is written as MST "
                    "with every VLAN in instance 0")
     report.add("system", "spanning-tree mode", Severity.INFO, "stp-ports",
                "IOS-XR runs spanning tree only on the ports listed under 'spanning-tree mst'; every port of a bridge "
