@@ -28,6 +28,8 @@ from typing import Callable, Dict, List, Optional, Tuple
 from .. import aaa as aaa_text
 from .. import bgp as bgp_text
 from .. import confparse
+from .. import iosxrabf as abf
+from .. import iosxrl2 as l2
 from .. import iosxrpolicy as policy
 from .. import iosxrservices as services
 from .. import iosxrrouting as xrrouting
@@ -73,6 +75,8 @@ class _Reader:
         self._reason: Optional[Tuple[str, str]] = None
         self._rip: List[str] = []  # the interfaces under router rip
         self.flows = services.FlowReader(self.device, self.name, self.unparsed)
+        self._abf = abf.Reader(self.device)
+        self._l2s = l2.Reader(self.device)
 
     # names -----------------------------------------------------------------------------------------------------------
 
@@ -174,6 +178,9 @@ class _Reader:
             "router": self.router,
             "mpls": self.mpls,
             "l2vpn": self.l2vpn,
+            "spanning-tree": lambda n: l2.read_mst(self.device, n, self.iface, self.unparsed),
+            "igmp": lambda n: n.words[:3] == ["igmp", "snooping", "profile"] and len(n.words) == 4 and
+            self._l2s.profile(n.words[3], [c.words for c in n.children]),
             "lldp": self.lldp,
             "cdp": lambda n: n.words == ["cdp"] and self._set(self.device.management, "cdp", True),
             "ssh": self.ssh,
@@ -655,6 +662,8 @@ class _Reader:
                 return True
             return False
         acl = Acl(w[2], family=6 if w[0] == "ipv6" else 4)
+        if acl.family == 4:
+            self._abf.strip(acl.name, node.children)
         for child in node.children:
             parts = child.text.split()
             # the IOS reader takes "ip" for any protocol; IOS-XR writes ipv4 / ipv6
@@ -831,17 +840,22 @@ class _Reader:
         m = re.match(r"^VLAN(\d+)(?:[-_](.+))?$", name, re.IGNORECASE)
         members: List[str] = []
         bvi = ""
-        storm: Dict[str, float] = {}
+        storm: List[Node] = []  # storm control for every port of the bridge domain
+        profile = ""
         for child in node.children:
             c = child.words
             if c[0] == "interface" and len(c) == 2:
                 members.append(c[1])
+                base = self.name(c[1].split(".")[0])
                 for sub in child.children:
-                    self.unparsed(sub, f"bridge-domain {name}")
+                    if not self._l2s.storm(base, sub):
+                        self.unparsed(sub, f"bridge-domain {name}")
             elif c[:2] == ["routed", "interface"] and len(c) == 3:
                 bvi = c[2]
-            elif c[0] == "storm-control" and len(c) == 5 and c[2:4] == ["pps"]:
-                continue
+            elif c[0] == "storm-control" and len(c) == 4 and c[2] == "kbps":
+                storm.append(child)
+            elif c[:3] == ["igmp", "snooping", "profile"] and len(c) == 4:
+                profile = c[3]
             else:
                 self.unparsed(child, f"bridge-domain {name}")
         tags = {self._l2[x][1] for x in members if x in self._l2 and self._l2[x][1] not in ("", "untagged")}
@@ -857,7 +871,12 @@ class _Reader:
         vlan = self.device.vlans.setdefault(vid, Vlan(vid, origin=Origin(node.line, node.text)))
         if m and m.group(2):
             vlan.name = m.group(2)
-        del storm
+        self._l2s.domains.append(vid)
+        if profile:
+            self._l2s.vlan_profiles[vid] = profile
+        for line in storm:
+            if not members or not all(self._l2s.storm(self.name(x.split(".")[0]), line) for x in members):
+                self.unparsed(line, f"bridge-domain {name}")
         for member in members:
             l2 = self._l2.get(member)
             if l2 is None:
@@ -1590,6 +1609,12 @@ class _Reader:
                 server.vrf = group.vrf
         if d.netflow is None and self.flows.monitors:  # a flow monitor no interface uses
             self.flows.monitor(next(iter(self.flows.monitors)))
+        for node in self._l2s.finish():
+            self.unparsed(node, "l2vpn")
+        abf_maps = self._abf.finish()
+        for iface in d.interfaces.values():
+            if iface.acl_in in abf_maps:
+                iface.pbr, iface.acl_in = abf_maps[iface.acl_in], ""
         policy.finish(d)
         multicast_text.finish(d)
 

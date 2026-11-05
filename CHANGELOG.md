@@ -8,6 +8,12 @@ Add a line under "Unreleased" in every pull request that changes what RouterShif
 
 ## Unreleased
 
+* IOS-XR writes and reads policy-based routing as ACL-based forwarding: a PBR route map becomes the ACL
+  `RS-ABF-NAME` with a `nexthop1` on its permit entries, applied ingress on the interface.
+* IOS-XR bridge domains carry storm control (in kbps, from the port speed), IGMP snooping profiles (with
+  `internal-querier` for a querier VLAN) and MST (`spanning-tree mst RS-MST` with the region, instances and the
+  ports' edge, BPDU guard, root guard, cost and priority). All three are read back.
+
 ## 0.2.0 (2026-11-03)
 
 Cisco IOS-XR joins as an eighth platform, Junos, AOS-CX, NX-OS and Comware convert to the same depth as IOS and

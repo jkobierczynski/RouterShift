@@ -359,3 +359,93 @@ def test_bfd_timers_go_on_the_bgp_neighbor() -> None:
     out, report = convert(text, "ios", "iosxr")
     assert "  bfd fast-detect\n  bfd minimum-interval 100\n  bfd multiplier 3\n" in out
     assert "the BFD timers are not written" not in report.to_text()
+
+
+PBR = ("ip access-list extended ACL-WEB\n 10 deny ip any host 192.0.2.9\n 20 permit tcp any any eq 80\n"
+       "ip access-list extended ACL-ALL\n 10 permit ip 10.0.0.0 0.0.0.255 any\n"
+       "route-map PBR-WEB permit 10\n match ip address ACL-WEB\n set ip next-hop 10.0.9.1\n"
+       "route-map PBR-WEB permit 20\n match ip address ACL-ALL\n set ip next-hop 10.0.9.2\n"
+       "vrf definition DMZ\n address-family ipv4\n"
+       "interface Vlan300\n vrf forwarding DMZ\n ip address 10.0.3.1 255.255.255.0\n ip policy route-map PBR-WEB\n")
+
+
+def test_pbr_is_written_as_abf() -> None:
+    out, report = convert(PBR, "ios", "iosxr")
+    assert ("ipv4 access-list RS-ABF-PBR-WEB\n"
+            " 10 permit ipv4 any host 192.0.2.9\n"
+            " 20 permit tcp any any eq 80 nexthop1 vrf DMZ ipv4 10.0.9.1\n"
+            " 30 permit ipv4 10.0.0.0 0.0.0.255 any nexthop1 vrf DMZ ipv4 10.0.9.2\n"
+            " 40 permit ipv4 any any\n") in out
+    assert "interface BVI300\n vrf DMZ\n ipv4 address 10.0.3.1 255.255.255.0\n" \
+           " ipv4 access-group RS-ABF-PBR-WEB ingress\n" in out
+    text = report.to_text()
+    assert "route-map PBR-WEB: approximated" in text and "written as ACL-based forwarding" in text
+    assert "a deny in the ACL of an entry passes the packet on to the next route map entry" in text
+    assert "route-policy PBR-WEB" not in out
+
+
+def test_abf_reads_back_as_pbr() -> None:
+    out, _ = convert(PBR, "ios", "iosxr")
+    d = parse(out, "iosxr")
+    assert not d.unparsed
+    assert d.interfaces["Vlan300"].pbr == "PBR-WEB" and d.interfaces["Vlan300"].acl_in == ""
+    rm = d.route_maps["PBR-WEB"]
+    assert [(e.seq, e.match_acls, e.sets) for e in rm.entries] == [
+        (10, ["ACL-WEB"], {"next-hop": "10.0.9.1"}), (20, ["ACL-ALL"], {"next-hop": "10.0.9.2"})]
+    assert "RS-ABF-PBR-WEB" not in d.acls
+    back, _ = convert(out, "iosxr", "ios")
+    assert "route-map PBR-WEB permit 10\n match ip address ACL-WEB\n set ip next-hop 10.0.9.1\n" in back
+    assert " ip policy route-map PBR-WEB\n" in back
+
+
+def test_pbr_next_to_an_ingress_acl_is_reported() -> None:
+    text = PBR + " ip access-group ACL-ALL in\n"
+    out, report = convert(text, "ios", "iosxr")
+    assert "ipv4 access-group ACL-ALL ingress" in out and "access-group RS-ABF" not in out
+    assert "IOS-XR takes one ingress ACL" in report.to_text()
+
+
+BRIDGE = ("spanning-tree mode mst\nspanning-tree mst 0 priority 4096\nspanning-tree mst configuration\n"
+          " name REGION\n revision 3\n instance 1 vlan 100-199\n"
+          "ip igmp snooping querier\n"
+          "vlan 100\n name WEB\nvlan 200\n"
+          "interface TenGigabitEthernet1/0/1\n switchport mode trunk\n switchport trunk allowed vlan 100,200\n"
+          " storm-control broadcast level 1\n storm-control unicast level 0.5\n spanning-tree portfast trunk\n"
+          " spanning-tree bpduguard enable\n"
+          "interface GigabitEthernet1/0/2\n switchport mode access\n switchport access vlan 200\n"
+          " storm-control multicast level 5\n spanning-tree guard root\n spanning-tree cost 200\n")
+
+
+def test_bridge_domain_settings() -> None:
+    out, report = convert(BRIDGE, "ios", "iosxr")
+    assert "igmp snooping profile RS-IGMP-QUERIER\n internal-querier\n!\n" in out
+    assert ("  bridge-domain VLAN100-WEB\n   interface TenGigE0/0/0/0.100\n"
+            "    storm-control broadcast kbps 100000\n    storm-control unknown-unicast kbps 50000\n   !\n"
+            "   igmp snooping profile RS-IGMP-QUERIER\n") in out
+    assert "   interface GigabitEthernet0/0/0/1\n    storm-control multicast kbps 50000\n   !\n" in out
+    assert ("spanning-tree mst RS-MST\n name REGION\n revision 3\n instance 0\n  priority 4096\n !\n"
+            " instance 1\n  vlan-ids 100-199\n !\n interface TenGigE0/0/0/0\n  portfast\n  portfast bpduguard\n !\n"
+            " interface GigabitEthernet0/0/0/1\n  guard root\n  instance 0 cost 200\n !\n") in out
+    text = report.to_text()
+    assert "broadcast 1% of 10000 Mbit/s is written as 100000 kbps" in text
+    assert "storm control is not written" not in text and "spanning-tree port settings are not written" not in text
+    assert "IGMP snooping: skipped" not in text
+
+
+def test_bridge_domain_settings_read_back() -> None:
+    out, _ = convert(BRIDGE, "ios", "iosxr")
+    d = parse(out, "iosxr")
+    assert not d.unparsed
+    te, ge = d.interfaces["Ethernet0/0/0/0"], d.interfaces["Ethernet0/0/0/1"]
+    assert te.storm_control == {"broadcast": 1.0, "unknown-unicast": 0.5}
+    assert ge.storm_control == {"multicast": 5.0}
+    assert te.stp_portfast and te.stp_bpduguard and ge.stp_guard == "root" and ge.stp_cost == 200
+    assert d.stp.region == "REGION" and d.stp.revision == 3 and d.stp.instances == {1: list(range(100, 200))}
+    assert d.stp.priority == {0: 4096} and d.igmp_snooping and d.igmp_querier
+
+
+def test_storm_control_without_a_known_speed_is_reported() -> None:
+    text = ("interface Port-channel1\n switchport mode trunk\n storm-control broadcast level 5\n")
+    out, report = convert(text, "ios", "iosxr")
+    assert "storm-control" not in out
+    assert "the speed of the port is not known" in report.to_text()

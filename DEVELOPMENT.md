@@ -81,7 +81,7 @@ src/routershift/
                     vxlan.py, qos.py, ... including the "not supported on <platform>" reports
   <platform><area>.py
                     the larger platform-specific parts of a reader and writer, kept out of the main files:
-                    junosrouting.py, aoscxsec.py, nxosfabric.py, iosxrpolicy.py, ...
+                    junosrouting.py, aoscxsec.py, nxosfabric.py, iosxrpolicy.py, iosxrl2.py, ...
 tests/
   data/             sample configurations, at least one per platform
   helpers.py        sample() loads a file from data/

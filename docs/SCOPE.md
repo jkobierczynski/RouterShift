@@ -226,10 +226,18 @@ platform converts to and from all the others.
   listed (passive ones with `passive-interface`), and read back as their networks. The DHCP server is a
   `pool vrf V ipv4 NAME` with `network` and `address-range`, and a `dhcp ipv4` server profile with the options,
   bound to the interfaces in the pool's network.
-* What IOS-XR does not have is reported instead of written: spanning tree, port security, DHCP snooping, 802.1X,
-  PoE, the voice VLAN, storm control, sFlow, NAT (only on a CGN service card), IPsec, VXLAN (EVPN runs over MPLS or
+* Policy-based routing is ACL-based forwarding: a PBR route map becomes the ACL `RS-ABF-NAME`, whose permit entries
+  carry the next hop of their route map entry (`nexthop1 vrf V ipv4 A`), applied as the interface's ingress ACL.
+  It is read back as the route map and its ACLs.
+* Bridge domains carry the layer 2 settings: storm control per port (`storm-control broadcast kbps N`, the
+  percentage turned into a rate by the port's speed), IGMP snooping (`igmp snooping profile RS-IGMP-SNOOPING`, or
+  `RS-IGMP-QUERIER` with `internal-querier`), and MST (`spanning-tree mst RS-MST` with the region, the instances
+  and every layer 2 port with its edge, BPDU guard, root guard, cost and priority). A per-VLAN spanning tree is
+  written as MST.
+* What IOS-XR does not have is reported instead of written: port security, DHCP snooping, 802.1X, loop guard and
+  BPDU filter, PoE, the voice VLAN, sFlow, NAT (only on a CGN service card), IPsec, VXLAN (EVPN runs over MPLS or
   SRv6), the switch pair (EVPN multihoming or MC-LAG over ICCP instead), MACsec, MAC ACLs, PTP, trunk groups, the
-  IGMP querier, queuing profiles, CoPP (LPTS), port trust and the DSCP map, NetFlow on layer 2 ports, ACLs on layer
+  IGMP querier's address and version, queuing profiles, CoPP (LPTS), port trust and the DSCP map, NetFlow on layer 2 ports, ACLs on layer
   2 ports. Each report says what IOS-XR uses instead, so nothing is left as "not written for IOS-XR yet".
 
 ## Access lists
