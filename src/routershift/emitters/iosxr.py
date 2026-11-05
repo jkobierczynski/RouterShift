@@ -14,7 +14,8 @@ servers.
 IOS-XR has no VLANs or switchports. A VLAN is written as a bridge domain ``VLANn`` (``VLANn-NAME`` when it has a
 name) in bridge group ``VLANS``, routed through ``BVIn`` when the VLAN has an SVI. An access port joins as a whole
 ``l2transport`` interface; a trunk gets one ``l2transport`` subinterface per VLAN with ``encapsulation dot1q n`` and
-the tag popped, and its native VLAN one with ``encapsulation untagged``. Spanning tree, port security, 802.1X, PoE and
+the tag popped, and its native VLAN one with ``encapsulation untagged``. Storm control, IGMP snooping and MST are
+written for the bridge domains (iosxrl2.py), PBR as ACL-based forwarding (iosxrabf.py). Port security, 802.1X, PoE and
 the other switch features have no IOS-XR form and are reported.
 """
 
@@ -29,6 +30,8 @@ from .. import bfd as bfd_text
 from .. import bgp as bgp_text
 from .. import fhrp
 from .. import hosts as hosts_text
+from .. import iosxrabf as abf
+from .. import iosxrl2 as l2
 from .. import iosxrpolicy as policy
 from .. import iosxrrouting as xrrouting
 from .. import iosxrservices as services
@@ -79,9 +82,6 @@ _PORT_NOTES: List[Tuple[Callable[[Interface], bool], str, str]] = [
     (lambda i: bool(i.crypto_map), "vpn",
      "the crypto map is not written: IOS-XR routers terminate no IPsec; move the VPN to a router or firewall"),
     (hosts_text.poe_stated, "poe", "IOS-XR ports supply no PoE; left out"),
-    (lambda i: bool(i.pbr), "pbr",
-     "policy-based routing is not written: IOS-XR forwards by ACL entries with a nexthop (ABF) applied ingress; set "
-     "it up by hand"),
     (lambda i: i.voice_vlan is not None, "voice", "IOS-XR has no voice VLAN; left out"),
     (lambda i: i.stp_guard == "loop" or i.stp_bpdufilter, "stp-guards",
      "loop guard and BPDU filter have no IOS-XR form; left out"),
@@ -116,6 +116,9 @@ class Writer:
         self.prefix_policies: Dict[str, List[str]] = {}  # policies written for prefix lists on BGP neighbors
         self.halves: Dict[str, bool] = {}
         self.domains: Dict[int, List[str]] = {}  # VLAN -> the l2transport interfaces in its bridge domain
+        self.members: Dict[str, Interface] = {}  # l2transport interface -> the port it belongs to
+        self.l2ports: Dict[str, Interface] = {}  # the layer 2 ports, by canonical name
+        self.abf: Dict[str, str] = {}  # PBR route map -> the ABF ACL written for it
         self.track_plan = tracking_text.Plan()
 
     def label(self, iface: Interface) -> str:
@@ -534,6 +537,8 @@ class Writer:
             lines = acl_text.cisco_lines(acl, self.report, label, "wildcard" if acl.family == 4 else "prefix",
                                          any_protocol=family, icmp6="icmpv6", icmp_names=True)
             self.out += [f"{family} access-list {name}"] + [IND + line for line in lines] + ["!"]
+        lines, self.abf = abf.lines(self.device, self.report, lambda name: self.device.interfaces[name].vrf)
+        self.out += lines
 
     def policies(self) -> List[str]:
         d = self.device
@@ -542,11 +547,7 @@ class Writer:
         out += policy.list_lines(d, self.report)
         pbr = set(bfd_text.pbr_only(d))
         for rm in d.route_maps.values():
-            if rm.name in pbr:
-                self.report.skip("policy", routemap_text.label(rm.name, "route-map"), "pbr",
-                                 "used for policy-based routing only: IOS-XR forwards by ACL entries with a nexthop "
-                                 "(ABF) instead; set it up by hand")
-            elif rm.entries:
+            if rm.name not in pbr and rm.entries:  # a PBR route map is written as an ABF ACL (iosxrabf)
                 out += policy.route_policy_lines(rm, self.halves, self.report)
         for lines in self.prefix_policies.values():
             out += lines
@@ -562,7 +563,7 @@ class Writer:
             self.report.skip("monitor", "sFlow", "sflow", "IOS-XR has no sFlow; sample with NetFlow instead")
 
     def interfaces(self) -> None:
-        self.domains = {}
+        self.domains, self.members, self.l2ports = {}, {}, {}
         for iface in self.device.interfaces.values():
             self.interface(iface)
 
@@ -607,7 +608,8 @@ class Writer:
                 ([f"{IND}receive disable"] if not iface.lldp_rx else [])
         if iface.cdp:
             common.append("cdp")
-        if stp_text.has_port_settings(iface) or iface.stp_portfast or iface.stp_bpduguard:
+        if (stp_text.has_port_settings(iface) or iface.stp_portfast or iface.stp_bpduguard) and not (
+                layer2 and l2.runs_mst(self.device)):
             add(Severity.REVIEW, "stp", "the spanning-tree port settings are not written: IOS-XR bridge domains run "
                                         "no spanning tree unless set up under spanning-tree mst; check for loops")
         common += services.interface_qos(self.device, iface, add) + services.interface_mirror(self.device, iface)
@@ -619,7 +621,7 @@ class Writer:
             add(Severity.REVIEW, "bfd", "the BFD timers are not written: IOS-XR sets them per protocol (router ospf, "
                                         "router bgp neighbor), and the interface runs no OSPF")
         for stated, code, message in _PORT_NOTES:
-            if stated(iface):
+            if stated(iface) and not (layer2 and code == "storm-control"):  # layer 2: in the bridge domain
                 add(Severity.REVIEW, code, message)
         if layer2:
             self.layer2(iface, name, common, add)
@@ -631,6 +633,7 @@ class Writer:
                      WRITTEN if not layer2 else WRITTEN - {"fhrp", "dhcp-relay"})
 
     def layer2(self, iface: Interface, name: str, common: List[str], add: fhrp.Add) -> None:
+        self.l2ports[iface.name] = iface
         down = ["shutdown"] if iface.shutdown else []
         acls = [a for a in (iface.acl_in, iface.acl_out, iface.acl6_in, iface.acl6_out) if a]
         if acls:
@@ -643,6 +646,7 @@ class Writer:
             vid = iface.access_vlan or 1
             self.out += [f"interface {name} l2transport"] + [IND + line for line in common + down] + ["!"]
             self.domains.setdefault(vid, []).append(name)
+            self.members[name] = iface
             add(Severity.APPROX, "l2transport",
                 f"written as an l2transport port in bridge domain {self.domain_name(vid)}; IOS-XR takes tagged "
                 "frames on it too")
@@ -670,6 +674,7 @@ class Writer:
                 [f"encapsulation dot1q {vid}", "rewrite ingress tag pop 1 symmetric"]
             self.out += [f"interface {sub} l2transport"] + [IND + line for line in encap] + ["!"]
             self.domains.setdefault(vid, []).append(sub)
+            self.members[sub] = iface
 
     def domain_name(self, vid: int) -> str:
         vlan = self.device.vlans.get(vid)
@@ -710,6 +715,17 @@ class Writer:
                 lines.append(f"{word} access-group {acl_text.safe_name(acl)} {direction}")
             elif acl:
                 add(Severity.REVIEW, "acl-missing", f"ACL {acl} is applied but not defined; left out")
+        if iface.pbr:
+            abf_acl = self.abf.get(iface.pbr)
+            if abf_acl is None:
+                add(Severity.REVIEW, "pbr", f"policy-based routing with route map {iface.pbr} is not written: no "
+                                            "entry of it could become ACL-based forwarding; set it up by hand")
+            elif iface.acl_in:
+                add(Severity.REVIEW, "pbr", f"the ABF ACL {abf_acl} for route map {iface.pbr} is not applied: IOS-XR "
+                                            f"takes one ingress ACL and the port already filters with {iface.acl_in}; "
+                                            "merge the two by hand")
+            else:
+                lines.append(f"ipv4 access-group {abf_acl} ingress")
         lines += services.interface_flow(self.device, iface)
         if iface.urpf:
             lines.append(f"ipv4 verify unicast source reachable-via {'rx' if iface.urpf == 'strict' else 'any'}")
@@ -1288,6 +1304,14 @@ class Writer:
         svis = {int(i.name[4:]) for i in d.interfaces.values() if i.kind == InterfaceKind.VLAN and i.name[4:].isdigit()}
         vids = sorted(set(d.vlans) | set(self.domains) | svis)
         body: List[str] = []
+        storm: Dict[str, List[str]] = {}
+        in_domain = {port.name for port in self.members.values()}
+        for port in self.l2ports.values():
+            storm[port.name] = l2.storm_lines(d, port, self.report, self.label(port))
+            if storm[port.name] and port.name not in in_domain:
+                self.report.add("interface", self.label(port), Severity.REVIEW, "storm-control",
+                                "the storm control is not written: the port is in no bridge domain")
+        profiles, snooping = l2.snooping_plan(d, vids, self.report)
         for vid in vids:
             self.report.item("vlan", str(vid))
             vlan = d.vlans.get(vid)
@@ -1295,21 +1319,22 @@ class Writer:
             if vlan is not None and vlan.name and not name.endswith(vlan.name):
                 self.report.add("vlan", str(vid), Severity.APPROX, "vlan-name",
                                 f"the name is shortened in the bridge domain name {name}")
-            lines = [f"interface {member}" for member in self.domains.get(vid, [])]
-            lines = [x for line in lines for x in (line, "!")]
+            lines = []
+            for member in self.domains.get(vid, []):
+                lines += [f"interface {member}"] + [IND + x for x in storm[self.members[member].name]] + ["!"]
+            if vid in snooping:
+                lines.append(f"igmp snooping profile {snooping[vid]}")
             if vid in svis:
                 lines.append(f"routed interface BVI{vid}")
             if vlan is not None and vlan.shutdown:
                 lines.append("shutdown")
             body += [f"bridge-domain {name}"] + [IND + line for line in lines] + ["!"]
+        self.out += profiles
         if body:
             self.out += ["l2vpn", f"{IND}bridge group {BRIDGE_GROUP}"] + [IND * 2 + b for b in body] + \
                 [f"{IND}!", "!"]
-        if d.stp_mode is not None or d.stp.priority or d.stp.vlan_priority:
-            self.report.item("system", "spanning-tree mode")
-            self.report.add("system", "spanning-tree mode", Severity.REVIEW, "stp",
-                            "spanning tree is not written: IOS-XR bridge domains run none unless 'spanning-tree mst' "
-                            "is set up for the ports; check the layer 2 design for loops")
+        ports = {port.name: port for port in self.members.values()}
+        self.out += l2.mst_lines(d, [(self.port(name), port) for name, port in ports.items()], self.report)
 
     def relay(self) -> None:
         profiles: Dict[Tuple[str, Tuple[str, ...]], str] = {}
@@ -1337,9 +1362,6 @@ class Writer:
 
     def multicast(self) -> None:
         d = self.device
-        if multicast_text.stated(d):
-            self.report.skip("vlan", multicast_text.LABEL, "igmp-snooping",
-                             "IGMP snooping is set per bridge domain on IOS-XR (igmp snooping profile); not written")
         if not multicast_text.uses_pim(d):
             return
         self.report.item("system", "multicast routing")
@@ -1483,10 +1505,6 @@ class Writer:
             if vlan.trunk_groups:
                 rep.add("vlan", str(vlan.vlan_id), Severity.APPROX, "trunk-groups",
                         "trunk groups have no IOS-XR form; the trunks carry the VLAN by their subinterfaces")
-        if d.igmp_querier_address or d.igmp_querier_version or any(
-                v.igmp_querier_address or v.igmp_querier_version for v in d.vlans.values()):
-            rep.add("vlan", multicast_text.LABEL, Severity.APPROX, "igmp-querier",
-                    "IOS-XR bridge domains have no IGMP snooping querier; the querier settings are left out")
         if d.qos_profiles or d.qos_dscp_tc or d.qos_tc_dscp:
             rep.skip("qos", "DSCP to traffic-class map", "queuing",
                      "the DSCP map and the queuing profiles are not written: IOS-XR classifies by an input policy-map "

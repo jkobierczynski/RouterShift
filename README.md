@@ -73,7 +73,8 @@ approximated, or leaves it out and reports it. The main gaps:
 * **AOS-CX:** no RIP, IS-IS, MPLS, NAT or IPsec.
 * **NX-OS:** no DHCP server, PoE or IPsec.
 * **Junos:** no NAT or IPsec on a switch, no RD per EVPN instance, no BFD slow timer.
-* **IOS-XR:** no switch features (spanning tree, port security, 802.1X, PoE, sFlow), VXLAN, MLAG, NAT or IPsec.
+* **IOS-XR:** no port security, 802.1X, PoE or sFlow, no VXLAN, MLAG, NAT or IPsec. Spanning tree, storm control
+  and IGMP snooping are written in the bridge domains, PBR as ACL-based forwarding.
 * **NetFlow and sFlow:** IOS has no sFlow, and EOS, AOS-CX and AOS-S NetFlow is reported, not written.
 
 ### What is reported, not converted
